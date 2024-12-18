@@ -45,8 +45,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: |
-            ghcr.io/${{ github.repository }}/debrid-media-manager:latest
-            ghcr.io/${{ github.repository }}/debrid-media-manager:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}/dmm:latest
+            ghcr.io/${{ github.repository }}/dmmr:${{ steps.version.outputs.version }}
+          outputs: |
+            type=image,name=target,annotation-index.org.opencontainers.image.title=Debrid Media Manager
+            type=image,name=target,annotation-index.org.opencontainers.image.description=Debrid Media Manager
+            type=image,name=target,annotation-index.org.opencontainers.image.source=https://github.com/${{ github.repository }}/dmm.git
+            type=image,name=target,annotation-index.org.opencontainers.image.version=${{ steps.version.outputs.version }}
           labels: |
             org.opencontainers.image.description=Debrid Media Manager
             org.opencontainers.image.title=Debrid Media Manager

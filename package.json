@@ -22,7 +22,7 @@
       "idb": "^8.0.0",
       "lodash": "^4.17.21",
       "lz-string": "^1.5.0",
-      "next": "^13.4.19",
+      "next": "^15.1.1",
       "next-pwa": "^5.6.0",
       "pg": "^8.11.3",
       "qs": "^6.11.1",
@@ -35,12 +35,13 @@
       "sqlite": "^5.1.1",
       "sqlite3": "^5.1.6",
       "stremio-addon-sdk": "^1.6.10",
-      "sweetalert2": "^11.10.0",
+      "sweetalert2": "^11.15.2",
       "user-agents": "^1.0.1444",
       "uuid": "^9.0.0"
    },
    "devDependencies": {
-      "@types/axios": "^0.14.0",
+      "@jridgewell/sourcemap-codec": "^1.5.0",
+      "@rollup/plugin-terser": "^0.4.4",
       "@types/bencode": "^2.0.2",
       "@types/file-saver": "^2.0.5",
       "@types/lodash": "^4.14.202",
@@ -64,5 +65,8 @@
       "ts-node": "10.7.0",
       "typescript": "^5.2.2",
       "vitest": "^0.34.6"
+   },
+   "overrides": {
+      "path-to-regexp": "^0.1.12"
    }
 }
