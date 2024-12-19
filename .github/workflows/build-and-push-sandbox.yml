@@ -9,7 +9,7 @@ on:
 
 jobs:
   build-and-push:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency: # Cancel redundant builds
       group: ${{ github.workflow }}-${{ github.ref }}
       cancel-in-progress: true
@@ -46,7 +46,7 @@ jobs:
           cache-to: type=gha,mode=max
           tags: |
             ghcr.io/${{ github.repository }}/dmm:latest
-            ghcr.io/${{ github.repository }}/dmmr:${{ steps.version.outputs.version }}
+            ghcr.io/${{ github.repository }}/dmm:${{ steps.version.outputs.version }}
           outputs: |
             type=image,name=target,annotation-index.org.opencontainers.image.title=Debrid Media Manager
             type=image,name=target,annotation-index.org.opencontainers.image.description=Debrid Media Manager
