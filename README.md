@@ -1,6 +1,6 @@
-![ChatGPT made this logo](./dmm-logo.svg)
-
 # Debrid Media Manager
+
+![ChatGPT made this logo](./dmm-logo.svg)
 
 Start building your media library with truly unlimited storage size!
 
@@ -32,7 +32,7 @@ You can share your whole collection or select specific items you want to share. 
 
 ## Setup
 
-0. Signup for a free tier plan at [PlanetScale](https://planetscale.com/) - this is a serverless MySQL database hosted in the cloud
+0. Signup for a free tier plan at [Avien](https://console.aiven.io/signup?referral_code=y43qqw0jci61b1ahfqo9)* - this is a serverless MySQL database hosted in the cloud
 1. Have Tor running at `127.0.0.1:9050` (needed for DHT search; if you don't need your own search database then refer to the secion `External Search API`)
 2. Clone this repository and go to the directory
 3. Create a copy of the `.env` file `cp .env .env.local` and fill in the details
@@ -42,13 +42,15 @@ You can share your whole collection or select specific items you want to share. 
 7. This is a Next.js project so either go with `npm run dev` or `npm run build && npm run start`
 8. Head to `localhost:3000` and login
 
+_*Referral link. Provides $100 USD credit for trial of non-free-tier features._
+
 ### External Search API
 
 If you don't want to build your own library, edit the config `EXTERNAL_SEARCH_API_HOSTNAME` in your `.env.local` and set it to `https://corsproxy.org/?https://debridmediamanager.com`
 
 ### Docker Swarm
 
-```
+```shell
 cp .env .env.local
 docker swarm init
 docker stack deploy -c docker-compose.yml
@@ -61,6 +63,7 @@ The website will be accessible at `http://localhost:3000`
 ### I just don't know where to start or why do I need this?
 
 [Read the guide here](https://docs.google.com/document/d/13enrfVXcGEEd0Yqb0PBTpGYrIvQpSfeIaAMZ_LiBDzM/edit). I highlighted my tested setup in green.
+
 ### But with Kodi and FEN and Stremio being available, why would I ever need this?
 
 If you want some level of curation on your library. I personally prefer watching only 100+ GB remux release. Don't ask me about -arr apps and/or Usenet. I also came from that setup and found it too much time consuming to maintain.
@@ -71,4 +74,4 @@ It doesn't do any sort of monitoring. It gets that information when you open the
 
 ### When I share my library, is it linked to my account's identity?
 
-No. It's completely anonymous. What's only shared are 3 things: filename, magnet hash, file size. It's not even stored in any database. The way it works is that all these data are compressed and stored in the URL. A "webpage" is then created over at https://hashlists.debridmediamanager.com that loads via iframe this (usually very long) list of magnet hashes.
+No. It's completely anonymous. What's only shared are 3 things: filename, magnet hash, file size. It's not even stored in any database. The way it works is that all these data are compressed and stored in the URL. A "webpage" is then created over at <https://hashlists.debridmediamanager.com> that loads via iframe this (usually very long) list of magnet hashes.
