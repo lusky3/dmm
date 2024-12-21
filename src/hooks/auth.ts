@@ -1,5 +1,6 @@
 import { getAllDebridUser } from '@/services/allDebrid';
 import { getCurrentUser as getRealDebridUser, getToken } from '@/services/realDebrid';
+import { getTorBoxUser } from '@/services/torbox';
 import { TraktUser, getTraktUser } from '@/services/trakt';
 import { clearRdKeys } from '@/utils/clearLocalStorage';
 import { useRouter } from 'next/router';
@@ -30,6 +31,22 @@ interface AllDebridUser {
 	fidelityPoints: number;
 }
 
+interface TorBoxUser {
+	id: number;
+	created_at: string;
+	updated_at: string;
+	email: string;
+	plan: 0 | 1 | 2 | 3;
+	total_downloaded: number;
+	customer: string;
+	is_subscribed: boolean;
+	premium_expires_at: string;
+	cooldown_until: string;
+	auth_id: string;
+	user_referral: string;
+	base_emai: string;
+}
+
 export const useDebridLogin = () => {
 	const router = useRouter();
 
@@ -41,9 +58,14 @@ export const useDebridLogin = () => {
 		await router.push('/alldebrid/login');
 	};
 
+	const loginWithTorBox = async  () => {
+		await router.push("/torbox/login");
+	}
+
 	return {
 		loginWithRealDebrid,
 		loginWithAllDebrid,
+		loginWithTorBox
 	};
 };
 
@@ -84,6 +106,11 @@ export const useAllDebridApiKey = () => {
 	return apiKey;
 };
 
+export const useTorBoxApiKey = () => {
+	const [apiKey] = useLocalStorage<string>("tb:apiKey");
+	return apiKey;
+}
+
 function removeToken(service: string) {
 	window.localStorage.removeItem(`${service}:accessToken`);
 	window.location.reload();
@@ -92,14 +119,17 @@ function removeToken(service: string) {
 export const useCurrentUser = () => {
 	const [rdUser, setRdUser] = useState<RealDebridUser | null>(null);
 	const [adUser, setAdUser] = useState<AllDebridUser | null>(null);
+	const [tbUser, setTbUser] = useState<TorBoxUser | null>(null);
 	const [traktUser, setTraktUser] = useState<TraktUser | null>(null);
 	const router = useRouter();
 	const [rdToken] = useLocalStorage<string>('rd:accessToken');
 	const [adToken] = useLocalStorage<string>('ad:apiKey');
+	const [tbToken] = useLocalStorage<string>('tb:apiKey');
 	const [traktToken] = useLocalStorage<string>('trakt:accessToken');
 	const [_, setTraktUserSlug] = useLocalStorage<string>('trakt:userSlug');
 	const [rdError, setRdError] = useState<Error | null>(null);
 	const [adError, setAdError] = useState<Error | null>(null);
+	const [tbError, setTbError] = useState<Error | null>(null);
 	const [traktError, setTraktError] = useState<Error | null>(null);
 
 	useEffect(() => {
@@ -121,6 +151,14 @@ export const useCurrentUser = () => {
 				setAdError(new Error(error));
 			}
 			try {
+				if (tbToken) {
+					const tbUserResponse = await getTorBoxUser(tbToken!);
+					if (tbUserResponse) setTbUser(<TorBoxUser>tbUserResponse);
+				}
+			} catch (error: any) {
+				setTbError(new Error(error));
+			}
+			try {
 				if (traktToken) {
 					const traktUserResponse = await getTraktUser(traktToken!);
 					if (traktUserResponse) {
@@ -133,7 +171,7 @@ export const useCurrentUser = () => {
 			}
 		})();
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [rdToken, adToken, traktToken, router]);
+	}, [rdToken, adToken, tbToken, traktToken, router]);
 
-	return { rdUser, rdError, adUser, adError, traktUser, traktError };
+	return { rdUser, rdError, adUser, adError, tbUser, tbError, traktUser, traktError };
 };

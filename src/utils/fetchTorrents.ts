@@ -1,5 +1,6 @@
 import { MagnetStatus, getMagnetStatus } from '@/services/allDebrid';
 import { UserTorrentResponse, getUserTorrentsList } from '@/services/realDebrid';
+import { getTorBoxTorrents } from '@/services/torbox';
 import { UserTorrent, UserTorrentStatus } from '@/torrent/userTorrent';
 import { ParsedFilename, filenameParse } from '@ctrl/video-filename-parser';
 import { every, some } from 'lodash';
@@ -128,7 +129,7 @@ export const fetchAllDebrid = async (
 				magnetInfo.filename = 'Magnet';
 			}
 			let mediaType = 'other';
-			let info = undefined;
+			let info = {} as ParsedFilename
 
 			const filenames = magnetInfo.links.map((f) => f.filename);
 			const torrentAndFiles = [magnetInfo.filename, ...filenames];
@@ -136,7 +137,7 @@ export const fetchAllDebrid = async (
 
 			if (every(torrentAndFiles, (f) => !isVideo({ path: f }))) {
 				mediaType = 'other';
-				info = undefined;
+				info = {} as ParsedFilename
 			} else if (
 				hasEpisodes ||
 				some(torrentAndFiles, (f) => /s\d\d\d?.?e\d\d\d?/i.test(f)) ||
@@ -195,6 +196,81 @@ export const fetchAllDebrid = async (
 	} catch (error) {
 		await callback([]);
 		toast.error('Error fetching AllDebrid torrents list', genericToastOptions);
+		console.error(error);
+	}
+};
+
+export const fetchTorBox = async (
+	tbKey: string,
+	callback: (torrents: UserTorrent[]) => Promise<void>
+) => {
+	try {
+		const magnets = (await getTorBoxTorrents(tbKey)).map((magnetInfo) => {
+			let mediaType = 'other';
+			let info = {} as ParsedFilename; 
+
+			const filenames = magnetInfo.files?.map((f) => f.short_name) ?? []
+			const torrentAndFiles = [magnetInfo.name, ...filenames];
+			const hasEpisodes = checkArithmeticSequenceInFilenames(filenames);
+
+			if (every(torrentAndFiles, (f) => !isVideo({ path: f }))) {
+				mediaType = 'other';
+				info = {} as ParsedFilename; 
+			} else if (
+				hasEpisodes ||
+				some(torrentAndFiles, (f) => /s\d\d\d?.?e\d\d\d?/i.test(f)) ||
+				some(torrentAndFiles, (f) => /season.?\d+/i.test(f)) ||
+				some(torrentAndFiles, (f) => /episodes?\s?\d+/i.test(f)) ||
+				some(torrentAndFiles, (f) => /\b[a-fA-F0-9]{8}\b/.test(f))
+			) {
+				mediaType = 'tv';
+				info = filenameParse(magnetInfo.name, true);
+			} else if (
+				!hasEpisodes &&
+				every(torrentAndFiles, (f) => !/s\d\d\d?.?e\d\d\d?/i.test(f)) &&
+				every(torrentAndFiles, (f) => !/season.?\d+/i.test(f)) &&
+				every(torrentAndFiles, (f) => !/episodes?\s?\d+/i.test(f)) &&
+				every(torrentAndFiles, (f) => !/\b[a-fA-F0-9]{8}\b/.test(f))
+			) {
+				mediaType = 'movie';
+				info = filenameParse(magnetInfo.name);
+			}
+
+			const date = new Date(magnetInfo.created_at);
+
+			if (magnetInfo.size === 0) magnetInfo.size = 1;
+			return {
+				// score: getReleaseTags(magnetInfo.filename, magnetInfo.size / ONE_GIGABYTE).score,
+				info,
+				mediaType,
+				title:
+					info && (mediaType === 'movie' || mediaType == 'tv')
+						? getMediaId(info, mediaType, false)
+						: magnetInfo.name,
+				id: `tb:${magnetInfo.id}`,
+				filename: magnetInfo.name,
+				hash: magnetInfo.hash,
+				bytes: magnetInfo.size,
+				seeders: magnetInfo.seeds,
+				progress: magnetInfo.progress * 100,
+				status: magnetInfo.download_state,
+				serviceStatus: 200,
+				added: date,
+				speed: magnetInfo.download_speed || 0,
+				links: magnetInfo.files ?? [],
+				tbData: magnetInfo,
+				selectedFiles: magnetInfo.files?.map((l, idx) => ({
+					fileId: idx++,
+					filename: l?.name || null,
+					filesize: l?.size || null,
+					link: null,
+				})),
+			};
+		}) as UserTorrent[];
+		await callback(magnets);
+	} catch (error) {
+		await callback([]);
+		toast.error('Error fetching TorBox torrents list', genericToastOptions);
 		console.error(error);
 	}
 };

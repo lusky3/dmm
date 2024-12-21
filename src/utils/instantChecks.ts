@@ -10,6 +10,7 @@ import { runConcurrentFunctions } from './batch';
 import { groupBy } from './groupBy';
 import { isVideo } from './selectable';
 import { searchToastOptions } from './toastOptions';
+import { tbInstantCheck } from '@/services/torbox'
 
 export const wrapLoading = async function (debrid: string, checkAvailability: Promise<number>) {
 	return await toast.promise(
@@ -253,6 +254,89 @@ export const instantCheckInAd = async (
 	return instantCount;
 };
 
+export const instantCheckInTb = async (
+	tbKey: string,
+	hashes: string[],
+	setTorrentList: Dispatch<SetStateAction<SearchResult[]>>
+): Promise<number> => {
+	let instantCount = 0;
+	const funcs = [];
+	for (const hashGroup of groupBy(100, hashes)) {
+		funcs.push(async () => {
+			const resp = await tbInstantCheck(tbKey, hashGroup);
+			
+			if (resp === null) {
+				return []
+			}
+
+			setTorrentList((prevSearchResults) => {
+				const newSearchResults = [...prevSearchResults];
+				for (const magnetData of resp) {
+					const masterHash = magnetData.hash;
+					const torrent = newSearchResults.find((r) => r.hash === masterHash);
+					if (!torrent) continue;
+					if (torrent.noVideos) continue;
+					if (!magnetData.files) continue;
+
+					const checkVideoInFiles = (files: MagnetFile[]): boolean => {
+						return files.reduce((noVideo: boolean, curr: MagnetFile) => {
+							if (!noVideo) return false; // If we've already found a video, no need to continue checking
+							if (!curr.n) return false; // If 'n' property doesn't exist, it's not a video
+							if (curr.e) {
+								// If 'e' property exists, check it recursively
+								return checkVideoInFiles(curr.e);
+							}
+							return !isVideo({ path: curr.n });
+						}, true);
+					};
+
+					let idx = 0;
+					torrent.files = magnetData.files
+						.map((file) => {
+							if (file.e && file.e.length > 0) {
+								return file.e.map((f) => {
+									return {
+										fileId: idx++,
+										filename: f.name,
+										filesize: f.size,
+									};
+								});
+							}
+							return {
+								fileId: idx++,
+								filename: file.name,
+								filesize: file.size,
+							};
+						})
+						.flat();
+
+					const videoFiles = torrent.files.filter((f) => isVideo({ path: f.filename }));
+					const sortedFileSizes = videoFiles
+						.map((f) => f.filesize / 1024 / 1024)
+						.sort((a, b) => a - b);
+					const mid = Math.floor(sortedFileSizes.length / 2);
+					torrent.medianFileSize =
+						torrent.medianFileSize ?? sortedFileSizes.length % 2 !== 0
+							? sortedFileSizes[mid]
+							: (sortedFileSizes[mid - 1] + sortedFileSizes[mid]) / 2;
+					torrent.biggestFileSize = sortedFileSizes[sortedFileSizes.length - 1];
+					torrent.videoCount = videoFiles.length;
+					torrent.noVideos = checkVideoInFiles(magnetData.files);
+					if (!torrent.noVideos) {
+						torrent.tbAvailable = true;
+						instantCount += 1;
+					} else {
+						torrent.tbAvailable = false;
+					}
+				}
+				return newSearchResults;
+			});
+		});
+	}
+	await runConcurrentFunctions(funcs, 5, 100);
+	return instantCount;
+};
+
 // for hashlists
 export const instantCheckInAd2 = async (
 	adKey: string,
@@ -310,6 +394,77 @@ export const instantCheckInAd2 = async (
 						instantCount += 1;
 					} else {
 						torrent.adAvailable = false;
+					}
+				}
+				return newSearchResults;
+			});
+		});
+	}
+	await runConcurrentFunctions(funcs, 5, 100);
+	return instantCount;
+};
+
+// for hashlists
+export const instantHashListCheckInTb = async (
+	tbKey: string,
+	hashes: string[],
+	setTorrentList: Dispatch<SetStateAction<EnrichedHashlistTorrent[]>>
+): Promise<number> => {
+	let instantCount = 0;
+	const funcs = [];
+	for (const hashGroup of groupBy(100, hashes)) {
+		funcs.push(async () => {
+			const resp = await tbInstantCheck(tbKey, hashGroup);
+			
+			if (resp === null) {
+				return []
+			}
+			setTorrentList((prevSearchResults) => {
+				const newSearchResults = [...prevSearchResults];
+				for (const magnetData of resp) {
+					const masterHash = magnetData.hash;
+					const torrent = newSearchResults.find((r) => r.hash === masterHash);
+					if (!torrent) continue;
+					if (torrent.noVideos) continue;
+					if (!magnetData.files) continue;
+
+					const checkVideoInFiles = (files: MagnetFile[]): boolean => {
+						return files.reduce((noVideo: boolean, curr: MagnetFile) => {
+							if (!noVideo) return false; // If we've already found a video, no need to continue checking
+							if (!curr.n) return false; // If 'n' property doesn't exist, it's not a video
+							if (curr.e) {
+								// If 'e' property exists, check it recursively
+								return checkVideoInFiles(curr.e);
+							}
+							return !isVideo({ path: curr.n });
+						}, true);
+					};
+
+					let idx = 0;
+					torrent.files = magnetData.files
+						.map((file) => {
+							if (file.e && file.e.length > 0) {
+								return file.e.map((f) => {
+									return {
+										fileId: idx++,
+										filename: f.name,
+										filesize: f.size,
+									};
+								});
+							}
+							return {
+								fileId: idx++,
+								filename: file.name,
+								filesize: file.size,
+							};
+						})
+						.flat();
+					torrent.noVideos = checkVideoInFiles(magnetData.files);
+					if (!torrent.noVideos && magnetData.instant) {
+						torrent.tbAvailable = true;
+						instantCount += 1;
+					} else {
+						torrent.tbAvailable = false;
 					}
 				}
 				return newSearchResults;

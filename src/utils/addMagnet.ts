@@ -1,5 +1,6 @@
 import { restartMagnet, uploadMagnet } from '@/services/allDebrid';
 import { addHashAsMagnet, getTorrentInfo, selectFiles } from '@/services/realDebrid';
+import { createTorBoxTorrent } from "@/services/torbox"
 import { UserTorrent } from '@/torrent/userTorrent';
 import toast from 'react-hot-toast';
 import { handleDeleteRdTorrent } from './deleteTorrent';
@@ -99,6 +100,36 @@ export const handleAddAsMagnetInAd = async (
 	}
 };
 
+export const handleAddAsMagnetInTb = async (
+	tbKey: string,
+	hash: string,
+	callback?: () => Promise<void>
+) => {
+	try {
+		await createTorBoxTorrent(tbKey, [hash]);
+		if (callback) await callback();
+		toast('Successfully added torrent to TorBox!', magnetToastOptions);
+	} catch (error) {
+		toast.error(error as any);
+		throw error;
+	}
+};
+
+export const handleAddMultipleHashesInTb = async (
+	tbKey: string,
+	hashes: string[],
+	callback?: () => Promise<void>
+) => {
+	try {
+		await createTorBoxTorrent(tbKey, hashes);
+		if (callback) await callback();
+		toast(`Successfully added ${hashes.length} hashes!`, magnetToastOptions);
+	} catch (error) {
+		toast.error(error as any);
+		throw error;
+	}
+};
+
 export const handleAddMultipleHashesInAd = async (
 	adKey: string,
 	hashes: string[],
@@ -126,6 +157,10 @@ export const handleRestartTorrent = async (adKey: string, id: string) => {
 		throw error;
 	}
 };
+
+export const handleRestartTorBoxTorrent = async (tbKey: string, id: string) => {
+	toast.error(`This function is not allowed by TorBox.`)
+}
 
 export async function handleCopyMagnet(hash: string) {
 	const magnet = `magnet:?xt=urn:btih:${hash}`;

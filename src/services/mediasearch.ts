@@ -18,6 +18,7 @@ export type SearchResult = {
 	rdAvailable: boolean;
 	files: FileData[];
 	adAvailable: boolean;
+	tbAvailable: boolean;
 	noVideos: boolean;
 	// for cached results in RD
 	medianFileSize: number;
@@ -39,6 +40,7 @@ export interface EnrichedHashlistTorrent extends HashlistTorrent {
 	noVideos: boolean;
 	rdAvailable: boolean;
 	adAvailable: boolean;
+	tbAvailable: boolean;
 	files: FileData[];
 }
 

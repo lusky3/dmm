@@ -1,15 +1,15 @@
 import Poster from '@/components/poster';
-import { useAllDebridApiKey, useRealDebridAccessToken } from '@/hooks/auth';
+import { useAllDebridApiKey, useRealDebridAccessToken, useTorBoxApiKey } from '@/hooks/auth';
 import { useCastToken } from '@/hooks/cast';
 import { SearchApiResponse, SearchResult } from '@/services/mediasearch';
 import { TorrentInfoResponse } from '@/services/realDebrid';
 import UserTorrentDB from '@/torrent/db';
 import { UserTorrent } from '@/torrent/userTorrent';
-import { handleAddAsMagnetInAd, handleAddAsMagnetInRd, handleCopyMagnet } from '@/utils/addMagnet';
+import { handleAddAsMagnetInAd, handleAddAsMagnetInRd, handleAddAsMagnetInTb, handleCopyMagnet } from '@/utils/addMagnet';
 import { handleCastTvShow } from '@/utils/cast';
-import { handleDeleteAdTorrent, handleDeleteRdTorrent } from '@/utils/deleteTorrent';
-import { fetchAllDebrid, fetchRealDebrid } from '@/utils/fetchTorrents';
-import { instantCheckInAd, instantCheckInRd, wrapLoading } from '@/utils/instantChecks';
+import { handleDeleteAdTorrent, handleDeleteRdTorrent, handleDeleteTbTorrent } from '@/utils/deleteTorrent';
+import { fetchAllDebrid, fetchRealDebrid, fetchTorBox } from '@/utils/fetchTorrents';
+import { instantCheckInAd, instantCheckInRd, wrapLoading, instantCheckInTb } from '@/utils/instantChecks';
 import { applyQuickSearch2 } from '@/utils/quickSearch';
 import { borderColor, btnColor, btnIcon, fileSize, sortByMedian } from '@/utils/results';
 import { isVideo } from '@/utils/selectable';
@@ -67,6 +67,7 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 	const [descLimit, setDescLimit] = useState(100);
 	const [rdKey] = useRealDebridAccessToken();
 	const adKey = useAllDebridApiKey();
+	const tbKey = useTorBoxApiKey();
 	const [onlyShowCached, setOnlyShowCached] = useState<boolean>(true);
 	const [uncachedCount, setUncachedCount] = useState<number>(0);
 	const dmmCastToken = useCastToken();
@@ -96,9 +97,9 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 		setUncachedCount(0);
 		try {
 			let path = `api/torrents/tv?imdbId=${imdbId}&seasonNum=${seasonNum}&dmmProblemKey=${tokenWithTimestamp}&solution=${tokenHash}&onlyTrusted=${onlyTrustedTorrents}`;
-			if (config.externalSearchApiHostname) {
-				path = encodeURIComponent(path);
-			}
+			// if (config.externalSearchApiHostname) {
+			// 	path = encodeURIComponent(path);
+			// }
 			let endpoint = `${config.externalSearchApiHostname || ''}/${path}`;
 			const response = await axios.get<SearchApiResponse>(endpoint);
 			if (response.status !== 200) {
@@ -114,6 +115,7 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 						...r,
 						rdAvailable: false,
 						adAvailable: false,
+						tbAvailable: false,
 						noVideos: false,
 						files: [],
 					}))
@@ -131,6 +133,11 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 					instantChecks.push(
 						wrapLoading('AD', instantCheckInAd(adKey, hashArr, setSearchResults))
 					);
+				if (tbKey) {
+					instantChecks.push(
+						wrapLoading('TorBox cache', instantCheckInTb(tbKey, hashArr, setSearchResults))
+					)
+				}
 				const counts = await Promise.all(instantChecks);
 				setSearchState('loaded');
 				setUncachedCount(hashArr.length - counts.reduce((acc, cur) => acc + cur, 0));
@@ -166,7 +173,7 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 		if (searchState === 'loading') return;
 		const tokens = new Map<string, number>();
 		// filter by cached
-		const toProcess = searchResults.filter((r) => r.rdAvailable || r.adAvailable);
+		const toProcess = searchResults.filter((r) => r.rdAvailable || r.adAvailable || r.tbAvailable);
 		toProcess.forEach((r) => {
 			r.title.split(/[ .\-\[\]]/).forEach((word) => {
 				if (word.length < 3) return;
@@ -253,6 +260,29 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 			setHashAndProgress((prev) => {
 				const newHashAndProgress = { ...prev };
 				delete newHashAndProgress[`ad:${hash}`];
+				return newHashAndProgress;
+			});
+		}
+	}
+
+	async function addTb(hash: string) {
+		await handleAddAsMagnetInTb(tbKey!, hash);
+		await fetchTorBox(
+			tbKey!,
+			async (torrents: UserTorrent[]) => await torrentDB.addAll(torrents)
+		)
+		await fetchHashAndProgress();
+	}
+
+	async function deleteTb(hash: string) {
+		const torrents = await torrentDB.getAllByHash(hash);
+		for (const t of torrents) {
+			if (!t.id.startsWith('tb:')) continue;
+			await handleDeleteTbTorrent(tbKey!, t.id);
+			await torrentDB.deleteByHash('tb', hash);
+			setHashAndProgress((prev) => {
+				const newHashAndProgress = { ...prev };
+				delete newHashAndProgress[`tb:${hash}`];
 				return newHashAndProgress;
 			});
 		}
@@ -461,11 +491,11 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 			{searchResults.length > 0 && (
 				<div className="mx-2 my-1 overflow-x-auto grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 gap-4">
 					{filteredResults.map((r: SearchResult, i: number) => {
-						const downloaded = isDownloaded('rd', r.hash) || isDownloaded('ad', r.hash);
+						const downloaded = isDownloaded('rd', r.hash) || isDownloaded('ad', r.hash) || isDownloaded('tb', r.hash)
 						const downloading =
-							isDownloading('rd', r.hash) || isDownloading('ad', r.hash);
+							isDownloading('rd', r.hash) || isDownloading('ad', r.hash) || isDownloading('tb', r.hash)
 						const inYourLibrary = downloaded || downloading;
-						if (onlyShowCached && !r.rdAvailable && !r.adAvailable && !inYourLibrary)
+						if (onlyShowCached && !r.rdAvailable && !r.adAvailable && !r.tbAvailable && !inYourLibrary)
 							return;
 						if (
 							episodeMaxSize !== '0' &&
@@ -552,7 +582,27 @@ const TvSearch: FunctionComponent<TvSearchProps> = ({
 											</button>
 										)}
 
-										{(r.rdAvailable || r.adAvailable) && (
+										{/* TB */}
+										{tbKey && inLibrary('tb', r.hash) && (
+											<button
+												className="bg-red-500 hover:bg-red-700 text-white text-xs rounded inline px-1"
+												onClick={() => deleteTb(r.hash)}
+											>
+												<FaTimes className="mr-2 inline" />
+												TB ({hashAndProgress[`tb:${r.hash}`] + '%'})
+											</button>
+										)}
+										{tbKey && notInLibrary('tb', r.hash) && (
+											<button
+												className={`bg-[#04BF8A] hover:bg-[#095842] text-white text-xs rounded inline px-1`}
+												onClick={() => addTb(r.hash)}
+											>
+												{btnIcon(r.tbAvailable)}
+												Add&nbsp;to&nbsp;TB&nbsp;library
+											</button>
+										)}
+
+										{(r.rdAvailable || r.adAvailable || r.tbAvailable) && (
 											<button
 												className="bg-sky-500 hover:bg-sky-700 text-white text-xs rounded inline px-1"
 												onClick={() => handleShowInfo(r)}
