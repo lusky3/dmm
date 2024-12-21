@@ -5,7 +5,7 @@ import { cleanSearchQuery, liteCleanSearchQuery } from './search';
 
 let dictionary: Set<string>;
 try {
-	let data = fs.readFileSync('./wordlist.txt', 'utf8');
+	let data = fs.readFileSync('./wordlists/wordlist.txt', 'utf8');
 	dictionary = new Set(data.toLowerCase().split('\n'));
 } catch (err) {
 	console.error('error loading wordlist', err);
@@ -13,7 +13,7 @@ try {
 
 let bannedWordSet: Set<string>;
 try {
-	let data = fs.readFileSync('./bannedwordlist.txt', 'utf8');
+	let data = fs.readFileSync('./wordlists/bannedwordlist.txt', 'utf8');
 	bannedWordSet = new Set(data.toLowerCase().split('\n'));
 } catch (err) {
 	console.error('error loading banned wordlist', err);
@@ -21,7 +21,7 @@ try {
 
 let bannedWordSet2: Array<string>;
 try {
-	let data = fs.readFileSync('./bannedwordlist2.txt', 'utf8');
+	let data = fs.readFileSync('./wordlists/bannedwordlist2.txt', 'utf8');
 	bannedWordSet2 = data.toLowerCase().split('\n');
 } catch (err) {
 	console.error('error loading banned wordlist 2', err);

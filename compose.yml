@@ -1,0 +1,43 @@
+services:
+  tor:
+    container_name: tor
+    hostname: tor
+    image: lusky3/tor:latest
+    restart: unless-stopped
+    networks:
+      - app-network
+
+  web:
+    container_name: debrid-media-manager
+    hostname: dmm
+    image: ghcr.io/lusky3/dmm/dmm:latest
+    ports:
+      - 3000:3000
+    env_file:
+      - .env
+      - .env.local
+    depends_on:
+      - tor
+    networks:
+      - app-network
+    restart: unless-stopped
+
+## Optional
+# prowlarr:
+#   image: lscr.io/linuxserver/prowlarr:latest
+#   container_name: prowlarr
+#   hostname: prowlarr
+#   environment:
+#     - PUID=1000
+#     - PGID=1000
+#     - TZ=UTC
+#   volumes:
+#     - ./config:/config
+#   restart: unless-stopped
+#   networks:
+#     - app-network
+
+networks:
+  app-network:
+    name: app-network
+    driver: bridge

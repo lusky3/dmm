@@ -27,7 +27,7 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Read version from package.json
@@ -44,5 +44,5 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           tags: |
-            debridmediamanager/debrid-media-manager:latest
-            debridmediamanager/debrid-media-manager:${{ steps.version.outputs.version }}
+            lusky3/debrid-media-manager:latest
+            lusky3/debrid-media-manager:${{ steps.version.outputs.version }}

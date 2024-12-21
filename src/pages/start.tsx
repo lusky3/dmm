@@ -30,7 +30,7 @@ export default function StartPage() {
 				<br />
 				<a
 					target="_blank"
-					href="https://github.com/debridmediamanager/debrid-media-manager"
+					href="https://dereferer.me/?https://github.com/lusky3/dmm"
 					className="text-lg underline decoration-dotted"
 				>
 					This website is open source and you can also run this on your own machine
@@ -52,7 +52,7 @@ export default function StartPage() {
 					</button>
 					<a
 						className="px-4 py-2 m-2 text-white bg-green-500 rounded hover:bg-green-600"
-						href="http://real-debrid.com/?id=9783846"
+						href="https://dereferer.me/?http://real-debrid.com/"
 						target="_blank"
 						rel="noopener noreferrer"
 					>
@@ -70,7 +70,7 @@ export default function StartPage() {
 					</button>
 					<a
 						className="px-4 py-2 m-2 text-white bg-green-500 rounded hover:bg-green-600"
-						href="https://alldebrid.com/?uid=1kk5i&lang=en"
+						href="https://dereferer.me/?https://alldebrid.com/"
 						target="_blank"
 						rel="noopener noreferrer"
 					>
@@ -88,7 +88,7 @@ export default function StartPage() {
 					</button>
 					<a
 						className="px-4 py-2 m-2 text-white bg-green-500 rounded hover:bg-green-600"
-						href="https://torbox.app/login"
+						href="https://dereferer.me/?https://torbox.app/login"
 						target="_blank"
 						rel="noopener noreferrer"
 					>
