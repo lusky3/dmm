@@ -1,23 +1,54 @@
-import { PlanetScaleCache } from '@/services/planetscale';
-import axios from 'axios';
+import { repository as db } from '@/services/repository';
 import { distance } from 'fastest-levenshtein';
+import Redis from 'ioredis';
 import _ from 'lodash';
 import { NextApiHandler } from 'next';
-import UserAgent from 'user-agents';
 
-const omdbKey = process.env.OMDB_KEY;
-const mdbKey = process.env.MDBLIST_KEY;
-const searchOmdb = (keyword: string, year?: number, mediaType?: string) =>
-	`https://www.omdbapi.com/?s=${keyword}&y=${year ?? ''}&apikey=${omdbKey}&type=${
-		mediaType ?? ''
-	}`;
-const searchMdb = (keyword: string, year?: number, mediaType?: string) =>
-	`https://mdblist.com/api/?apikey=${mdbKey}&s=${keyword}&y=${year ?? ''}&m=${mediaType ?? ''}`;
-const searchCinemetaSeries = (keyword: string) =>
-	`https://v3-cinemeta.strem.io/catalog/series/top/search=${keyword}.json`;
-const searchCinemetaMovies = (keyword: string) =>
-	`https://v3-cinemeta.strem.io/catalog/movie/top/search=${keyword}.json`;
-const db = new PlanetScaleCache();
+// Every zurg without a sponsor key places its library by name through this route, so the same
+// titles arrive from many installs, and a miss costs dmmdb seconds. The IMDb tables are
+// re-imported daily: a half-day memo of the query's answer, Redis-backed and shared by the
+// Swarm's replicas, in memory when Redis is down.
+const MEMO_TTL_SECONDS = 12 * 60 * 60;
+const MEMO_MEMORY_MAX = 20_000;
+const memoMemory = new Map<string, { expiresAt: number; value: string }>();
+let memoRedis: Redis | null = null;
+let memoRedisAvailable = true;
+
+function memoClient(): Redis | null {
+	if (memoRedis) return memoRedis;
+	if (!process.env.REDIS_URL || !memoRedisAvailable) return null;
+	memoRedis = new Redis(process.env.REDIS_URL, {
+		maxRetriesPerRequest: 1,
+		retryStrategy: () => null,
+		connectTimeout: 2000,
+		commandTimeout: 1000,
+		lazyConnect: true,
+	});
+	memoRedis.on('error', () => {
+		memoRedisAvailable = false;
+	});
+	return memoRedis;
+}
+
+async function memoized<T>(key: string, load: () => Promise<T>): Promise<T> {
+	const now = Date.now();
+	const local = memoMemory.get(key);
+	if (local && local.expiresAt > now) return JSON.parse(local.value);
+	const redis = memoClient();
+	const shared = redis ? await redis.get(key).catch(() => null) : null;
+	if (shared !== null) return JSON.parse(shared);
+	const value = await load();
+	const text = JSON.stringify(value);
+	if (memoMemory.size >= MEMO_MEMORY_MAX) memoMemory.clear();
+	memoMemory.set(key, { expiresAt: now + MEMO_TTL_SECONDS * 1000, value: text });
+	if (redis) await redis.set(key, text, 'EX', MEMO_TTL_SECONDS).catch(() => undefined);
+	return value;
+}
+
+/** Forget the memo; tests only. */
+export function clearTitleSearchMemo() {
+	memoMemory.clear();
+}
 
 export type SearchResult = {
 	id: string;
@@ -29,23 +60,6 @@ export type SearchResult = {
 	score: number;
 	score_average: number;
 	searchTitle: string;
-};
-
-type OmdbSearchResult = {
-	Title: string;
-	Year: string;
-	imdbID: string;
-	Type: string;
-	Poster: string;
-};
-
-type CinemetaSearchResult = {
-	id: string;
-	imdb_id: string;
-	type: string;
-	name: string;
-	releaseInfo: string;
-	poster: string;
 };
 
 function parseQuery(searchQuery: string): [string, number?, string?] {
@@ -90,117 +104,15 @@ function parseQuery(searchQuery: string): [string, number?, string?] {
 	return [title, year, mediaType];
 }
 
-const currentYear = new Date().getFullYear() + 1;
-
-async function searchOmdbApi(
-	keyword: string,
-	year?: number,
-	mediaType?: string
-): Promise<SearchResult[]> {
-	const searchResponse = await axios.get(
-		searchOmdb(encodeURIComponent(keyword), year, mediaType)
-	);
-	if (searchResponse.data.Error || searchResponse.data.Response === 'False') {
-		return [];
-	}
-	// console.log('omdb search response', searchResponse.data);
-	const results: SearchResult[] = [...searchResponse.data.Search]
-		.filter(
-			(r: OmdbSearchResult) =>
-				r.imdbID?.startsWith('tt') &&
-				(r.Type === 'movie' || r.Type === 'series') &&
-				parseInt(r.Year, 10) <= currentYear &&
-				r.Poster !== 'N/A'
-		)
-		.map((r: OmdbSearchResult) => ({
-			id: r.imdbID,
-			type: r.Type === 'series' ? 'show' : 'movie',
-			year: parseInt(r.Year, 10),
-			title: r.Title,
-			imdbid: r.imdbID,
-			score: 1,
-			score_average: 1,
-			searchTitle: processSearchTitle(r.Title, articleRegex.test(keyword)),
-		}));
-	return results;
-}
-
-async function searchMdbApi(
-	keyword: string,
-	year?: number,
-	mediaType?: string
-): Promise<SearchResult[]> {
-	const searchResponse = await axios.get(searchMdb(encodeURIComponent(keyword), year, mediaType));
-	if (searchResponse.data.error || !searchResponse.data.response) {
-		return [];
-	}
-	// console.log('mdb search response', searchResponse.data);
-	const results: SearchResult[] = [...searchResponse.data.search].filter(
-		(r: SearchResult) =>
-			r.imdbid?.startsWith('tt') && r.year > 1888 && r.year <= currentYear && r.score > 0
-	);
-	// console.log('mdb results', results.map(r => `${r.title} ${r.year} =>> ${processSearchTitle(r.title, articleRegex.test(keyword))}`));
-	return results.map((r: SearchResult) => ({
-		...r,
-		searchTitle: processSearchTitle(r.title, articleRegex.test(keyword)),
-	}));
-}
-
-async function searchCinemeta(keyword: string, mediaType?: string): Promise<SearchResult[]> {
-	const promises = [];
-	const requestConfig = {
-		headers: {
-			accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-			'accept-language': 'en-US,en;q=0.5',
-			'accept-encoding': 'gzip, deflate, br',
-			connection: 'keep-alive',
-			'sec-fetch-dest': 'document',
-			'sec-fetch-mode': 'navigate',
-			'sec-fetch-site': 'same-origin',
-			'sec-fetch-user': '?1',
-			'upgrade-insecure-requests': '1',
-			'user-agent': new UserAgent().toString(),
-		},
-	};
-	if (!mediaType) {
-		promises.push(axios.get(searchCinemetaSeries(encodeURIComponent(keyword)), requestConfig));
-		promises.push(axios.get(searchCinemetaMovies(encodeURIComponent(keyword)), requestConfig));
-	} else if (mediaType === 'movie') {
-		promises.push(axios.get(searchCinemetaMovies(encodeURIComponent(keyword)), requestConfig));
-	} else {
-		promises.push(axios.get(searchCinemetaSeries(encodeURIComponent(keyword)), requestConfig));
-	}
-	const responses = await Promise.all(promises);
-	// console.log('cinemeta search responses', responses.map((r) => r.data));
-	const results: SearchResult[] = responses
-		.filter((r) => r.data && r.data.metas)
-		.map((r) => r.data.metas)
-		.flat()
-		.filter(
-			(r: CinemetaSearchResult) =>
-				r.imdb_id?.startsWith('tt') &&
-				(r.type === 'movie' || r.type === 'series') &&
-				parseInt(r.releaseInfo, 10) <= currentYear &&
-				r.poster?.startsWith('http')
-		)
-		.map((r: CinemetaSearchResult) => ({
-			id: r.id,
-			type: r.type === 'series' ? 'show' : 'movie',
-			year: parseInt(r.releaseInfo, 10),
-			title: r.name,
-			imdbid: r.imdb_id,
-			score: 1,
-			score_average: 1,
-			searchTitle: processSearchTitle(r.name, articleRegex.test(keyword)),
-		}));
-	return results;
-}
-
 function countSearchTerms(title: string, searchTerms: string[]): number {
 	return searchTerms.reduce(
 		(count, term) => (title.toLowerCase().includes(term) ? count + 1 : count),
 		0
 	);
+}
+
+function escapeRegex(str: string): string {
+	return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 const articleRegex = /^(the|a|an)\s+/i;
@@ -237,73 +149,72 @@ const handler: NextApiHandler = async (req, res) => {
 			.join(' ')
 			.trim()
 			.toLowerCase();
-		const searchResults = await db.getSearchResults<SearchResult[]>(
-			encodeURIComponent(cleanKeyword)
-		);
-		if (searchResults) {
-			res.status(200).json({ results: searchResults.filter((r) => r.imdbid) });
-			return;
-		}
 
 		const [title, year, mediaType] = parseQuery(cleanKeyword);
 		const searchQuery = title.toLowerCase();
-		const [omdbResults, mdbResults, cinemetaResults] = await Promise.all([
-			searchOmdbApi(searchQuery, year, mediaType),
-			searchMdbApi(searchQuery, year, mediaType),
-			searchCinemeta(searchQuery, mediaType),
-		]);
-		let queryTerms = searchQuery.split(/\W/).filter((w) => w);
-		if (queryTerms.length === 0) queryTerms = [searchQuery];
+		// Normalize query by removing leading articles (same as searchTitle processing)
+		const normalizedQuery = removeLeadingArticles(searchQuery);
 
-		// combine results and remove duplicates
-		let results = [
-			...mdbResults,
-			...omdbResults.filter((mdbResult) => !mdbResults.find((r) => r.id === mdbResult.id)),
-			...cinemetaResults.filter(
-				(mdbResult) =>
-					!mdbResults.find((r) => r.id === mdbResult.id) &&
-					!omdbResults.find((r) => r.id === mdbResult.id)
-			),
-		].map((result) => {
-			const lowercaseTitle = result.title.toLowerCase();
-			const distanceValue = distance(lowercaseTitle, searchQuery);
-			if (articleRegex.test(lowercaseTitle)) {
-				// whichever lower distance value is better
-				const distanceValue2 = distance(result.searchTitle, searchQuery);
-				if (distanceValue2 < distanceValue) {
-					return {
-						...result,
-						distance: distanceValue2,
-						matchCount: countSearchTerms(result.searchTitle, queryTerms),
-					};
-				}
-			}
+		// Search local IMDB database (fetch more to allow for filtering/ranking)
+		const imdbResults = await memoized(
+			`search:title:v1:${JSON.stringify([searchQuery, year ?? null, mediaType ?? null])}`,
+			() =>
+				db.searchImdbTitles(searchQuery, {
+					limit: 120,
+					year,
+					mediaType: mediaType as 'movie' | 'show' | undefined,
+				})
+		);
+
+		// Map IMDB results to SearchResult format with extended properties
+		type ExtendedResult = SearchResult & { distance?: number; matchCount?: number };
+		let results: ExtendedResult[] = imdbResults.map((r) => ({
+			id: r.imdbId,
+			type: r.type,
+			year: r.year ?? 0,
+			title: r.title,
+			imdbid: r.imdbId,
+			score: r.votes ? Math.min(100, Math.round(r.votes / 10000)) : 1,
+			score_average: r.rating ?? 1,
+			searchTitle: processSearchTitle(r.title, false),
+		}));
+
+		// Calculate distance and match count for sorting
+		// Use normalizedQuery (without leading articles) for fair comparison with searchTitle
+		let queryTerms = normalizedQuery.split(/\W/).filter((w) => w);
+		if (queryTerms.length === 0) queryTerms = [normalizedQuery];
+
+		results = results.map((result) => {
+			// Compare searchTitle (normalized) against normalizedQuery for consistency
+			const distanceValue = distance(result.searchTitle, normalizedQuery);
 			return {
 				...result,
 				distance: distanceValue,
 				matchCount: countSearchTerms(result.searchTitle, queryTerms),
 			};
 		});
-		// console.log('results', results);
-		// filter out results with less than 1/3 of the search terms
-		results = results.filter((result) => result.matchCount >= Math.ceil(queryTerms.length / 3));
 
-		// search for exact matches
-		let regex1 = new RegExp('^' + searchQuery + '$', 'i');
+		// Filter out results with less than 1/3 of the search terms
+		results = results.filter(
+			(result) => (result.matchCount ?? 0) >= Math.ceil(queryTerms.length / 3)
+		);
+
+		// Categorize matches (escape regex special characters to prevent injection)
+		// Use normalizedQuery for matching against normalized searchTitle
+		const escapedQuery = escapeRegex(normalizedQuery);
+		let regex1 = new RegExp('^' + escapedQuery + '$', 'i');
 		let exactMatches = results.filter((result) => regex1.test(result.searchTitle));
 		results = results.filter((result) => !regex1.test(result.searchTitle));
 
-		// search for start matches
-		let regex2 = new RegExp('^' + searchQuery, 'i');
+		let regex2 = new RegExp('^' + escapedQuery, 'i');
 		let startMatches = results.filter((result) => regex2.test(result.searchTitle));
 		results = results.filter((result) => !regex2.test(result.searchTitle));
 
-		// search for near matches
-		let regex3 = new RegExp(searchQuery, 'i');
+		let regex3 = new RegExp(escapedQuery, 'i');
 		let nearMatches = results.filter((result) => regex3.test(result.searchTitle));
 		results = results.filter((result) => !regex3.test(result.searchTitle));
 
-		// sort results by score
+		// Sort each category
 		exactMatches.sort(
 			(a, b) =>
 				(b.score_average * b.score) / 4 + b.year - (a.score_average * a.score) / 4 + a.year
@@ -330,18 +241,22 @@ const handler: NextApiHandler = async (req, res) => {
 			return (b.matchCount ?? 0) - (a.matchCount ?? 0);
 		});
 
-		results = [...exactMatches, ...startMatches, ...nearMatches, ...results].filter(
-			(r) => r.type === 'movie' || r.type === 'show' || r.type === 'series'
-		);
+		const finalResults: SearchResult[] = [
+			...exactMatches,
+			...startMatches,
+			...nearMatches,
+			...results,
+		]
+			.filter((r) => r.type === 'movie' || r.type === 'show')
+			.slice(0, 80); // Limit to 80 results
 
-		if (results.length > 0 && results[0].title.toLowerCase().indexOf(searchQuery) >= 0) {
-			await db.saveSearchResults(keyword.toString().trim(), results);
-		}
-
-		res.status(200).json({ results });
+		res.status(200).json({ results: finalResults });
 	} catch (error: any) {
-		console.error('encountered a search issue', error);
-		res.status(500).json({ status: 'error', errorMessage: error.message });
+		console.error(
+			'Encountered a search issue:',
+			error instanceof Error ? error.message : 'Unknown error'
+		);
+		res.status(500).json({ status: 'error', errorMessage: 'An internal error occurred' });
 	}
 };
 

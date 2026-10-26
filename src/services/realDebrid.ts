@@ -1,171 +1,599 @@
-import axios from 'axios';
+import { recordRdOperationEvent } from '@/lib/observability/rdOperationalStats';
+import { isRdBlockedName } from '@/utils/deInfringe';
+import { delay as delayWithMessageChannel } from '@/utils/delay';
+import { extractTorrentInputs, toMagnetUri } from '@/utils/extractHashes';
+import { isRdAddRefusal, RD_ADD_PAUSE_MS, RdNameRefusedError } from '@/utils/rdAddPause';
+import { readRdOAuthCredentials, writeAccessToken } from '@/utils/rdTokenStorage';
+import { torrentNameOf } from '@/utils/torrentFile';
+import axios, { InternalAxiosRequestConfig } from 'axios';
 import getConfig from 'next/config';
 import qs from 'qs';
+import { recordRdAddOutcome } from './rdAddOutcomes';
+import {
+	AccessTokenResponse,
+	CredentialsResponse,
+	DeviceCodeResponse,
+	TorrentInfoResponse,
+	UnrestrictResponse,
+	UserResponse,
+	UserTorrentResponse,
+	UserTorrentsResult,
+} from './types';
 
-const { publicRuntimeConfig: config } = getConfig();
+// Safely access Next.js runtime config in test/non-Next environments
+const fallbackRuntimeConfig = {
+	proxy: '',
+	authProxy: '',
+	realDebridHostname: 'https://app.real-debrid.com',
+	realDebridClientId: 'X245A4XAIBGVM',
+};
 
-interface DeviceCodeResponse {
-	device_code: string;
-	user_code: string;
-	verification_url: string;
-	expires_in: number;
-	interval: number;
-	direct_verification_url: string;
+const config = (() => {
+	try {
+		const cfg = (getConfig as any)?.();
+		return cfg?.publicRuntimeConfig ?? fallbackRuntimeConfig;
+	} catch {
+		return fallbackRuntimeConfig;
+	}
+})();
+
+// Constants for timeout and retry
+const REQUEST_TIMEOUT = 10000; // Increased from 5s to 10s
+const TORRENT_REQUEST_TIMEOUT = 60000; // 60s timeout for slow connections
+// Adjust rate limits to be compatible with the service worker cache timing
+// Service worker cache is 5 seconds, so we need to ensure requests are spaced
+// to avoid conflicting with cache invalidation
+const MIN_REQUEST_INTERVAL = (60 * 1000) / 250; // 240ms between requests
+const CACHE_BACKOFF_TIME = 6000; // Slightly longer than the service worker cache (5s)
+
+// Global rate limiter for all RealDebrid API requests
+// This implementation uses a Promise chain to serialize all requests and ensure
+// a minimum 240ms delay between ANY RealDebrid API call, preventing 429 errors
+let globalRequestQueue: Promise<void> = Promise.resolve();
+let globalLastRequestTime = 0;
+
+// Everything dmm knows about how hard RD is pushing back on one account's adds,
+// keyed by the access token the requests carry. RD scopes all of it to the
+// account (see `RD_ADDS_PER_MINUTE` below), and on the server this module is
+// shared by every user's requests, so none of it may be global: one user's
+// pause must never hold, or excuse, another user's add.
+type RdAddAccountState = {
+	/** Last HTTP 429 or RD `error_code` 34 on a request with this token. */
+	rateLimitedAt: number;
+	/** Adds attempted with this token in the last minute. */
+	addAttempts: number[];
+	/** Adds on this token wait until then; see `recordRdAddPause`. */
+	pausedUntil: number;
+};
+
+const rdAddAccounts = new Map<string, RdAddAccountState>();
+// A server sees many tokens; keep only those with something still live.
+const MAX_TRACKED_RD_ACCOUNTS = 256;
+
+// A 429 resets in ~10s; 30s covers it with room to spare.
+const RATE_LIMIT_WINDOW_MS = 30_000;
+
+function rdAddAccount(token: string): RdAddAccountState {
+	let state = rdAddAccounts.get(token);
+	if (!state) {
+		if (rdAddAccounts.size >= MAX_TRACKED_RD_ACCOUNTS) pruneRdAddAccounts();
+		state = { rateLimitedAt: 0, addAttempts: [], pausedUntil: 0 };
+		rdAddAccounts.set(token, state);
+	}
+	return state;
 }
 
-interface CredentialsResponse {
-	client_id: string;
-	client_secret: string;
+function pruneRdAddAccounts(): void {
+	const now = Date.now();
+	for (const [token, state] of rdAddAccounts) {
+		const live =
+			now - state.rateLimitedAt < RATE_LIMIT_WINDOW_MS ||
+			state.pausedUntil > now ||
+			state.addAttempts.some((at) => now - at < ADD_RATE_WINDOW_MS);
+		if (!live) rdAddAccounts.delete(token);
+	}
 }
 
-interface AccessTokenResponse {
-	access_token: string;
-	expires_in: number;
-	refresh_token: string;
-	token_type: string;
+/** The token a request was sent with, for keying what its answer says. */
+function bearerTokenOf(config?: { headers?: unknown }): string {
+	const headers = config?.headers as
+		| { get?: (name: string) => unknown; Authorization?: unknown; authorization?: unknown }
+		| undefined;
+	const value =
+		typeof headers?.get === 'function'
+			? headers.get('Authorization')
+			: (headers?.Authorization ?? headers?.authorization);
+	return typeof value === 'string' ? value.replace(/^Bearer\s+/i, '') : '';
 }
 
-export interface UserResponse {
-	id: number;
-	username: string;
-	email: string;
-	points: number;
-	locale: string;
-	avatar: string;
-	type: string;
-	premium: number;
-	expiration: string;
+/** RD answered a request on this token with a rate limit (429 or `error_code` 34). */
+export function recordRdRateLimit(token: string): void {
+	if (!token) return;
+	rdAddAccount(token).rateLimitedAt = Date.now();
 }
 
-export interface UserTorrentResponse {
-	id: string;
-	filename: string;
-	hash: string;
-	bytes: number;
-	host: string;
-	split: number;
-	progress: number;
-	speed: number;
-	status: string;
-	added: string;
-	links: string[];
-	ended: string;
-	seeders: number;
+export function hasRecentRdRateLimits(token: string): boolean {
+	const state = rdAddAccounts.get(token);
+	return !!state && Date.now() - state.rateLimitedAt < RATE_LIMIT_WINDOW_MS;
 }
 
-export interface DownloadResponse {
-	id: string;
-	filename: string;
-	mimeType: string;
-	filesize: number;
-	link: string;
-	host: string;
-	host_icon: string;
-	chunks: number;
-	download: string;
-	streamable: number;
-	generated: string;
+// `addMagnet` has a budget of its own, far tighter than the 250 requests a
+// minute RD publishes for the API as a whole, and it is scoped to the
+// **account**, not the caller's address. Measured 2026-09-17 against two test
+// accounts: bursting one of them from one host earned `429 too_many_requests`
+// after 25 to 31 adds and then settled at roughly 30 accepted a minute, while
+// an idle token from that very same address kept getting 201 and the burned
+// token was refused from a completely different host. So dmm cannot spend its
+// way out of this by moving egress around, and a client that has not issued
+// anything like 30 adds in the last minute has no business blaming a throttle.
+export const RD_ADDS_PER_MINUTE = 30;
+/** Spacing that keeps a bulk add inside `RD_ADDS_PER_MINUTE`. */
+export const RD_ADD_MIN_SPACING_MS = 60_000 / RD_ADDS_PER_MINUTE;
+const ADD_RATE_WINDOW_MS = 60_000;
+
+/** One attempted add on this token, whatever it answered: RD counts refusals too. */
+export function recordRdAddAttempt(token: string): void {
+	if (!token) return;
+	const state = rdAddAccount(token);
+	const now = Date.now();
+	state.addAttempts = state.addAttempts.filter((at) => now - at < ADD_RATE_WINDOW_MS);
+	state.addAttempts.push(now);
 }
 
-export interface UnrestrictResponse {
-	id: string;
-	filename: string;
-	mimeType: string;
-	filesize: number;
-	link: string;
-	host: string;
-	chunks: number;
-	crc: number;
-	download: string;
-	streamable: number;
+/**
+ * Whether this token has added fast enough in the last minute to have
+ * plausibly earned RD's add penalty.
+ */
+export function hasRecentRdAddBurst(token: string): boolean {
+	const state = rdAddAccounts.get(token);
+	if (!state) return false;
+	const now = Date.now();
+	state.addAttempts = state.addAttempts.filter((at) => now - at < ADD_RATE_WINDOW_MS);
+	return state.addAttempts.length >= RD_ADDS_PER_MINUTE;
 }
 
-export interface TorrentInfoResponse {
-	id: string;
-	filename: string;
-	original_filename: string;
-	hash: string;
-	bytes: number;
-	original_bytes: number;
-	host: string;
-	split: number;
-	progress: number;
-	status: string;
-	added: string;
-	files: {
-		id: number;
-		path: string;
-		bytes: number;
-		selected: number;
-	}[];
-	links: string[];
-	ended: string;
-	speed: number;
-	seeders: number;
-	fake: boolean;
+/**
+ * Hold this account's adds for `RD_ADD_PAUSE_MS`, after a 451 its name does
+ * not explain.
+ *
+ * RD answers such a 451 when it refuses every add on the account for a while
+ * (21 s to about 5 minutes, measured 2026-10-04/05; see `rdAddPause.ts`), and
+ * an add fired into that pause is refused too, whatever it is. Holding them is
+ * the difference between one refused add and a row of them. A refused add
+ * during a pause was not seen to lengthen it, so a later 451 only ever extends
+ * the hold to 30 s from then; an add a user is watching asks for longer holds
+ * as it keeps being refused (`RD_ADD_INTERACTIVE_HOLDS_MS`).
+ */
+export function recordRdAddPause(token: string, ms: number = RD_ADD_PAUSE_MS): void {
+	if (!token) return;
+	const state = rdAddAccount(token);
+	state.pausedUntil = Math.max(state.pausedUntil, Date.now() + ms);
 }
 
-interface FileData {
-	filename: string;
-	filesize: number;
+/** How long adds on this token still have to wait, 0 when they need not. */
+export function rdAddPauseRemainingMs(token: string): number {
+	const state = rdAddAccounts.get(token);
+	return state ? Math.max(0, state.pausedUntil - Date.now()) : 0;
 }
 
-interface SelectionVariant {
-	[fileId: number]: FileData;
+/**
+ * Waits until adds on this token are no longer held. Loops because another
+ * 451 can extend the hold while this one waits. Resolves with how long it
+ * waited.
+ */
+export async function waitOutRdAddPause(token: string): Promise<number> {
+	const started = Date.now();
+	for (let remaining = rdAddPauseRemainingMs(token); remaining > 0;) {
+		await delayWithMessageChannel(remaining);
+		remaining = rdAddPauseRemainingMs(token);
+	}
+	return Date.now() - started;
 }
 
-interface HosterHash {
-	[hoster: string]: SelectionVariant[];
+/**
+ * Whether RD is refusing this account's adds right now, on evidence rather
+ * than on a guess: a real rate-limit answer (HTTP 429, or `error_code` 34),
+ * this token having just burst past the add budget, or a 451 its name did not
+ * explain within the last `RD_ADD_PAUSE_MS`. A probe that failed while this is
+ * true was not answered; it must not read as "not cached".
+ */
+export function isRdThrottling(token: string): boolean {
+	return (
+		hasRecentRdRateLimits(token) ||
+		hasRecentRdAddBurst(token) ||
+		rdAddPauseRemainingMs(token) > 0
+	);
 }
 
-interface MasterHash {
-	[hash: string]: HosterHash;
+/** Test seam: forget every account's add state between cases. */
+export function resetRdThrottleTracking(): void {
+	rdAddAccounts.clear();
 }
 
-interface UnrestrictCheckResponse {
-	host: string;
-	link: string;
-	filename: string;
-	filesize: number;
-	supported: number;
+// Shared rate limiting function that serializes all requests
+async function enforceRateLimit(): Promise<void> {
+	// Chain onto the global queue to ensure serialization
+	globalRequestQueue = globalRequestQueue.then(async () => {
+		const now = Date.now();
+		const timeSinceLastRequest = now - globalLastRequestTime;
+
+		if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+			await delayWithMessageChannel(MIN_REQUEST_INTERVAL - timeSinceLastRequest);
+		}
+
+		globalLastRequestTime = Date.now();
+	});
+
+	// Wait for our turn in the queue
+	await globalRequestQueue;
 }
 
-export interface RdInstantAvailabilityResponse extends MasterHash {}
-
-export interface AddMagnetResponse {
-	id: string;
-	uri: string;
+// Add a cache-aware ID generator to ensure unique cache entries for retries
+// This prevents retry requests from hitting stale cached errors
+let requestCount = 0;
+function getUniqueRequestId() {
+	return `req-${Date.now()}-${requestCount++}`;
 }
+
+function getProxyUrl(baseUrl: string): string {
+	return baseUrl.replace('#num#', Math.floor(Math.random() * 1000).toString());
+}
+
+// Validate SHA40 hash format
+function isValidSHA40Hash(hash: string): boolean {
+	const hashRegex = /^[a-f0-9]{40}$/i;
+	return hashRegex.test(hash);
+}
+
+// Extend the Axios request config type to include our custom properties
+interface ExtendedAxiosRequestConfig extends InternalAxiosRequestConfig {
+	__isRetryRequest?: boolean;
+	__retryCount?: number;
+	/** set once a 401 on this request has already triggered a token renewal */
+	__didRefreshAuth?: boolean;
+}
+
+let inflightStorageRefresh: Promise<string | null> | null = null;
+let lastRefreshFailureAt = 0;
+// After a failed renewal, let a burst of 401s settle rather than asking again
+// for every single one of them
+const REFRESH_FAILURE_COOLDOWN_MS = 30_000;
+
+/**
+ * Renew the stored access token from the saved OAuth credentials.
+ * Returns null when the user signed in with a plain API token (no credentials
+ * to refresh with) or when the refresh itself fails.
+ */
+async function refreshAccessTokenFromStorage(): Promise<string | null> {
+	const credentials = readRdOAuthCredentials();
+	if (!credentials) return null;
+	if (Date.now() - lastRefreshFailureAt < REFRESH_FAILURE_COOLDOWN_MS) return null;
+	// Several requests can 401 at once - they all wait on the same renewal
+	if (inflightStorageRefresh) return inflightStorageRefresh;
+
+	inflightStorageRefresh = (async () => {
+		try {
+			const { access_token, expires_in } = await getToken(
+				credentials.clientId,
+				credentials.clientSecret,
+				credentials.refreshToken
+			);
+			writeAccessToken(access_token, expires_in);
+			return access_token;
+		} catch (error) {
+			lastRefreshFailureAt = Date.now();
+			console.error('[RD] token refresh after 401 failed', error);
+			return null;
+		} finally {
+			inflightStorageRefresh = null;
+		}
+	})();
+
+	return inflightStorageRefresh;
+}
+
+// Helper function to calculate exponential backoff delay with jitter
+function calculateRetryDelay(retryCount: number): number {
+	// Base delay: 1s, doubled each attempt (1s, 2s, 4s, 8s, 16s)
+	const baseDelay = Math.pow(2, retryCount - 1) * 1000;
+
+	// Cap at 60s first
+	const cappedDelay = Math.min(baseDelay, 60000);
+
+	// Add ±20% jitter to prevent thundering herd
+	// Apply jitter AFTER capping so even at 60s we get variation (48s-72s)
+	const jitterFactor = 0.8 + Math.random() * 0.4; // Random between 0.8 and 1.2
+	const delayWithJitter = cappedDelay * jitterFactor;
+
+	return delayWithJitter;
+}
+
+// Create a global axios instance for RealDebrid API requests
+const realDebridAxios = axios.create({
+	// No default authorization header - will be passed per request
+	timeout: REQUEST_TIMEOUT,
+});
+
+// Add request interceptor for rate limiting and cache busting
+realDebridAxios.interceptors.request.use(async (config: ExtendedAxiosRequestConfig) => {
+	// Use global rate limiter
+	await enforceRateLimit();
+
+	// Add cache-busting parameter for retries to prevent hitting cached errors
+	if (config.__isRetryRequest && config.url) {
+		// Parse the URL to properly manage query parameters
+		const url = new URL(config.url, 'http://dummy-base.com'); // dummy base for relative URLs
+		// Replace any existing cache buster with a new one
+		url.searchParams.set('_cache_buster', getUniqueRequestId());
+		// Update the config URL, preserving relative vs absolute
+		config.url = config.url.startsWith('http') ? url.toString() : url.pathname + url.search;
+	}
+
+	return config;
+});
+
+// Add response interceptor for handling retries with exponential backoff
+realDebridAxios.interceptors.response.use(
+	(response) => response,
+	async (error) => {
+		const originalConfig = error.config as ExtendedAxiosRequestConfig;
+
+		// If config doesn't exist, reject
+		if (!originalConfig) {
+			return Promise.reject(error);
+		}
+
+		// Initialize retry count if not set
+		if (originalConfig.__retryCount === undefined) {
+			originalConfig.__retryCount = 0;
+		}
+
+		const status = error.response?.status;
+
+		// A 401 means the access token died before the scheduler renewed it - most
+		// often because the machine slept through the timer. Renew once and replay;
+		// getToken dedups concurrent callers, so a burst of 401s costs one request.
+		if (status === 401 && !originalConfig.__didRefreshAuth) {
+			originalConfig.__didRefreshAuth = true;
+			const refreshedToken = await refreshAccessTokenFromStorage();
+			if (refreshedToken) {
+				originalConfig.headers = {
+					...originalConfig.headers,
+					Authorization: `Bearer ${refreshedToken}`,
+				} as typeof originalConfig.headers;
+				return realDebridAxios(originalConfig);
+			}
+			return Promise.reject(error);
+		}
+
+		// Check if we've exceeded max retries
+		if (originalConfig.__retryCount >= 7) {
+			return Promise.reject(error);
+		}
+
+		// Retry on 5xx server errors OR 429 rate limit errors
+		const shouldRetry = (status >= 500 && status < 600) || status === 429;
+
+		if (!shouldRetry) {
+			return Promise.reject(error);
+		}
+
+		// Don't retry 503s with an error_code — these are RD application errors
+		// (e.g. hoster_unavailable, hoster_not_free) that won't resolve on retry
+		if (status === 503 && error.response?.data?.error_code) {
+			return Promise.reject(error);
+		}
+
+		// Increment retry count
+		originalConfig.__retryCount++;
+
+		// Set flag to avoid infinite retry loops
+		originalConfig.__isRetryRequest = true;
+
+		// Calculate delay with exponential backoff and jitter
+		const delay = calculateRetryDelay(originalConfig.__retryCount);
+
+		const errorType = error.response?.status === 429 ? 'rate limit' : 'server';
+		if (error.response?.status === 429) {
+			recordRdRateLimit(bearerTokenOf(originalConfig));
+		}
+		console.log(
+			`RealDebrid API request failed with ${error.response?.status} ${errorType} error. Retrying (attempt ${originalConfig.__retryCount}/7) after ${Math.round(delay)}ms delay...`
+		);
+
+		// Wait for the calculated delay (using MessageChannel to avoid background tab throttling)
+		await delayWithMessageChannel(delay);
+
+		try {
+			return await realDebridAxios.request(originalConfig);
+		} catch (retryError) {
+			// Pass along the retry error for the next iteration
+			return Promise.reject(retryError);
+		}
+	}
+);
+
+// Create a generic axios instance for non-authenticated requests
+const genericAxios = axios.create({
+	timeout: REQUEST_TIMEOUT,
+});
+
+// Function to get a configured generic axios instance with custom timeout
+function getGenericAxios(timeout: number = REQUEST_TIMEOUT) {
+	if (timeout === REQUEST_TIMEOUT) {
+		return genericAxios;
+	}
+
+	const customAxios = axios.create({
+		timeout: timeout,
+	});
+
+	// Add rate limiting interceptor to custom instance
+	customAxios.interceptors.request.use(async (config: ExtendedAxiosRequestConfig) => {
+		// Use global rate limiter
+		await enforceRateLimit();
+
+		return config;
+	});
+
+	// Add retry interceptor with same logic as genericAxios
+	customAxios.interceptors.response.use(
+		(response) => response,
+		async (error) => {
+			const originalConfig = error.config as ExtendedAxiosRequestConfig;
+
+			// If config doesn't exist, reject
+			if (!originalConfig) {
+				return Promise.reject(error);
+			}
+
+			// Initialize retry count if not set
+			if (originalConfig.__retryCount === undefined) {
+				originalConfig.__retryCount = 0;
+			}
+
+			// Check if we've exceeded max retries
+			if (originalConfig.__retryCount >= 7) {
+				return Promise.reject(error);
+			}
+
+			// Retry on 5xx server errors OR 429 rate limit errors
+			const status = error.response?.status;
+			const shouldRetry = (status >= 500 && status < 600) || status === 429;
+
+			if (!shouldRetry) {
+				return Promise.reject(error);
+			}
+
+			// Increment retry count
+			originalConfig.__retryCount++;
+
+			// Set flag to avoid infinite retry loops
+			originalConfig.__isRetryRequest = true;
+
+			// Calculate delay with exponential backoff and jitter
+			const delay = calculateRetryDelay(originalConfig.__retryCount);
+
+			const errorType = error.response?.status === 429 ? 'rate limit' : 'server';
+			console.log(
+				`Custom axios request failed with ${error.response?.status} ${errorType} error. Retrying (attempt ${originalConfig.__retryCount}/7) after ${Math.round(delay)}ms delay...`
+			);
+
+			// Wait for the calculated delay (using MessageChannel to avoid background tab throttling)
+			await delayWithMessageChannel(delay);
+
+			try {
+				// Add cache-busting parameter for retries
+				if (originalConfig.url) {
+					// Parse the URL to properly manage query parameters
+					const url = new URL(originalConfig.url, 'http://dummy-base.com'); // dummy base for relative URLs
+					// Replace any existing cache buster with a new one
+					url.searchParams.set('_cache_buster', getUniqueRequestId());
+					// Update the config URL, preserving relative vs absolute
+					originalConfig.url = originalConfig.url.startsWith('http')
+						? url.toString()
+						: url.pathname + url.search;
+				}
+				return await customAxios.request(originalConfig);
+			} catch (retryError) {
+				// Pass along the retry error for the next iteration
+				return Promise.reject(retryError);
+			}
+		}
+	);
+
+	return customAxios;
+}
+
+// Add request interceptor for rate limiting to generic axios
+genericAxios.interceptors.request.use(async (config: ExtendedAxiosRequestConfig) => {
+	// Use global rate limiter
+	await enforceRateLimit();
+
+	return config;
+});
+
+// Apply same retry logic to the generic axios instance
+genericAxios.interceptors.response.use(
+	(response) => response,
+	async (error) => {
+		const originalConfig = error.config as ExtendedAxiosRequestConfig;
+
+		// If config doesn't exist, reject
+		if (!originalConfig) {
+			return Promise.reject(error);
+		}
+
+		// Initialize retry count if not set
+		if (originalConfig.__retryCount === undefined) {
+			originalConfig.__retryCount = 0;
+		}
+
+		// Check if we've exceeded max retries
+		if (originalConfig.__retryCount >= 7) {
+			return Promise.reject(error);
+		}
+
+		// Retry on 5xx server errors OR 429 rate limit errors
+		const status = error.response?.status;
+		const shouldRetry = (status >= 500 && status < 600) || status === 429;
+
+		if (!shouldRetry) {
+			return Promise.reject(error);
+		}
+
+		// Increment retry count
+		originalConfig.__retryCount++;
+
+		// Set flag to avoid infinite retry loops
+		originalConfig.__isRetryRequest = true;
+
+		// Calculate delay with exponential backoff and jitter
+		const delay = calculateRetryDelay(originalConfig.__retryCount);
+
+		const errorType = error.response?.status === 429 ? 'rate limit' : 'server';
+		console.log(
+			`Generic API request failed with ${error.response?.status} ${errorType} error. Retrying (attempt ${originalConfig.__retryCount}/7) after ${Math.round(delay)}ms delay...`
+		);
+
+		// Wait for the calculated delay (using MessageChannel to avoid background tab throttling)
+		await delayWithMessageChannel(delay);
+
+		try {
+			// Add cache-busting parameter for retries
+			if (originalConfig.url) {
+				// Parse the URL to properly manage query parameters
+				const url = new URL(originalConfig.url, 'http://dummy-base.com'); // dummy base for relative URLs
+				// Replace any existing cache buster with a new one
+				url.searchParams.set('_cache_buster', getUniqueRequestId());
+				// Update the config URL, preserving relative vs absolute
+				originalConfig.url = originalConfig.url.startsWith('http')
+					? url.toString()
+					: url.pathname + url.search;
+			}
+			return await genericAxios.request(originalConfig);
+		} catch (retryError) {
+			// Pass along the retry error for the next iteration
+			return Promise.reject(retryError);
+		}
+	}
+);
 
 export const getDeviceCode = async () => {
 	try {
-		const response = await axios.get<DeviceCodeResponse>(
-			`${config.realDebridHostname}/oauth/v2/device/code`,
-			{
-				params: {
-					client_id: config.realDebridClientId,
-					new_credentials: 'yes',
-				},
-			}
-		);
+		const url = `${getProxyUrl(config.proxy)}${config.realDebridHostname}/oauth/v2/device/code?client_id=${config.realDebridClientId}&new_credentials=yes`;
+		const response = await genericAxios.get<DeviceCodeResponse>(url);
 		return response.data;
-	} catch (error) {
-		console.error('Error fetching device code:', (error as any).message);
+	} catch (error: any) {
+		console.error('Error fetching device code:', error.message);
 		throw error;
 	}
 };
 
 export const getCredentials = async (deviceCode: string) => {
 	try {
-		const response = await axios.get<CredentialsResponse>(
-			`${config.realDebridHostname}/oauth/v2/device/credentials`,
-			{
-				params: {
-					client_id: config.realDebridClientId,
-					code: deviceCode,
-				},
-			}
-		);
+		const url = `${getProxyUrl(config.proxy)}${config.realDebridHostname}/oauth/v2/device/credentials?client_id=${config.realDebridClientId}&code=${deviceCode}`;
+		const response = await genericAxios.get<CredentialsResponse>(url);
 		return response.data;
 	} catch (error: any) {
 		console.error('Error fetching credentials:', error.message);
@@ -173,208 +601,338 @@ export const getCredentials = async (deviceCode: string) => {
 	}
 };
 
-export const getToken = async (clientId: string, clientSecret: string, code: string) => {
-	try {
-		const params = new URLSearchParams();
-		params.append('client_id', clientId);
-		params.append('client_secret', clientSecret);
-		params.append('code', code);
-		params.append('grant_type', 'http://oauth.net/grant_type/device/1.0');
+// In-memory access token cache keyed by clientId (unique per user)
+// Stores either a valid token or a 403 "dead" marker to avoid retrying revoked tokens.
+// The marker names the refresh token that was refused: signing in again keeps the
+// client id and brings a new refresh token, which must not inherit the refusal.
+const accessTokenCache = new Map<
+	string,
+	| { data: AccessTokenResponse; expiresAt: number }
+	| { dead: true; refreshToken: string; expiresAt: number }
+>();
+// Dedup concurrent token requests for the same user
+const inflightTokenRequests = new Map<string, Promise<AccessTokenResponse>>();
 
-		const headers = {
-			'Content-Type': 'application/x-www-form-urlencoded',
-		};
+/**
+ * Drops the access token cached for a client, so the next `getToken` mints a
+ * fresh one. For a token Real-Debrid has just refused with a 401 while the
+ * cache still holds it as good.
+ */
+export function forgetAccessToken(clientId: string): void {
+	const cached = accessTokenCache.get(clientId);
+	if (cached && !('dead' in cached)) accessTokenCache.delete(clientId);
+}
 
-		const response = await axios.post<AccessTokenResponse>(
-			`${config.realDebridHostname}/oauth/v2/token`,
-			params.toString(),
-			{ headers }
+export class RdTokenExpiredError extends Error {
+	constructor(clientId: string) {
+		super(
+			`Real-Debrid authorization expired or revoked for client ${clientId.substring(0, 6)}...`
 		);
-		return response.data;
-	} catch (error: any) {
-		console.error('Error fetching access token:', error.message);
-		throw error;
+		this.name = 'RdTokenExpiredError';
 	}
+}
+
+export const getToken = async (
+	clientId: string,
+	clientSecret: string,
+	refreshToken: string,
+	bare: boolean = false
+): Promise<AccessTokenResponse> => {
+	// Return cached token if still valid, or throw immediately if token is known-dead
+	const cached = accessTokenCache.get(clientId);
+	if (cached && cached.expiresAt > Date.now()) {
+		if (!('dead' in cached)) return cached.data;
+		if (cached.refreshToken === refreshToken) throw new RdTokenExpiredError(clientId);
+	}
+
+	// Dedup concurrent requests for the same user
+	const inflight = inflightTokenRequests.get(clientId);
+	if (inflight) return inflight;
+
+	const fetchPromise = (async (): Promise<AccessTokenResponse> => {
+		try {
+			const params = new URLSearchParams();
+			params.append('client_id', clientId);
+			params.append('client_secret', clientSecret);
+			params.append('code', refreshToken);
+			params.append('grant_type', 'http://oauth.net/grant_type/device/1.0');
+
+			const baseUrl = bare
+				? 'https://app.real-debrid.com'
+				: `${getProxyUrl(config.proxy)}${config.realDebridHostname}`;
+			const response = await genericAxios.post<AccessTokenResponse>(
+				`${baseUrl}/oauth/v2/token`,
+				params.toString(),
+				{
+					headers: {
+						'Content-Type': 'application/x-www-form-urlencoded',
+					},
+				}
+			);
+
+			// Cache with 5 minute safety margin before expiry
+			const expiresIn = response.data.expires_in || 3600;
+			accessTokenCache.set(clientId, {
+				data: response.data,
+				expiresAt: Date.now() + Math.max(expiresIn - 300, 60) * 1000,
+			});
+
+			return response.data;
+		} catch (error: any) {
+			const status = error?.response?.status;
+			if (status === 403) {
+				// Token revoked/expired — cache as dead for 1 hour to stop retrying
+				accessTokenCache.set(clientId, {
+					dead: true,
+					refreshToken,
+					expiresAt: Date.now() + 3600 * 1000,
+				});
+				console.error('RD token expired/revoked for client:', clientId.substring(0, 6));
+				throw new RdTokenExpiredError(clientId);
+			}
+			// For other errors (429, network), clear cache so next request retries
+			accessTokenCache.delete(clientId);
+			console.error('Error fetching access token:', error.message);
+			throw error;
+		} finally {
+			inflightTokenRequests.delete(clientId);
+		}
+	})();
+
+	inflightTokenRequests.set(clientId, fetchPromise);
+	return fetchPromise;
+};
+
+// Simple promise cache to prevent duplicate requests
+const userRequestCache = new Map<string, Promise<UserResponse>>();
+// Cache for time ISO requests - cache for 10 seconds to prevent duplicate calls
+const timeISOCache: { promise: Promise<string> | null; timestamp: number } = {
+	promise: null,
+	timestamp: 0,
 };
 
 export const getCurrentUser = async (accessToken: string) => {
-	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-		};
-
-		const response = await axios.get<UserResponse>(
-			`${config.realDebridHostname}/rest/1.0/user`,
-			{ headers }
-		);
-		return response.data;
-	} catch (error: any) {
-		console.error('Error fetching user information:', error.message);
-		throw error;
+	// Check if we already have a pending request for this token
+	const cached = userRequestCache.get(accessToken);
+	if (cached) {
+		return cached;
 	}
-};
 
-interface UserTorrentsResult {
-	data: UserTorrentResponse[];
-	totalCount: number | null;
-}
+	// Create the promise and cache it
+	const promise = (async () => {
+		try {
+			const response = await realDebridAxios.get<UserResponse>(
+				`${getProxyUrl(config.authProxy)}${config.realDebridHostname}/rest/1.0/user`,
+				{
+					headers: {
+						Authorization: `Bearer ${accessToken}`,
+					},
+				}
+			);
+			recordRdOperationEvent('GET /user', response.status);
+			return response.data;
+		} catch (error: any) {
+			const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+			recordRdOperationEvent('GET /user', status);
+			console.error('Error fetching user information:', error.message);
+			throw error;
+		} finally {
+			// Clean up cache after request completes (success or error)
+			setTimeout(() => userRequestCache.delete(accessToken), 100);
+		}
+	})();
+
+	userRequestCache.set(accessToken, promise);
+	return promise;
+};
 
 export async function getUserTorrentsList(
 	accessToken: string,
-	limit: number = 0,
-	page: number = 1
+	limit: number = 1,
+	page: number = 1,
+	bare: boolean = false
 ): Promise<UserTorrentsResult> {
-	const headers = {
-		Authorization: `Bearer ${accessToken}`,
-	};
+	const apiStart = Date.now();
+	try {
+		// Add a cache-aware parameter to ensure fresh results for all requests
+		// This helps avoid conflicts with the service worker cache
+		const cacheParam = `&_fresh=${Date.now()}`;
 
-	const response = await axios.get<UserTorrentResponse[]>(
-		`${config.realDebridHostname}/rest/1.0/torrents`,
-		{ headers, params: { page, limit } }
-	);
+		const response = await realDebridAxios.get<UserTorrentResponse[]>(
+			`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/torrents?page=${page}&limit=${limit}${cacheParam}`,
+			{
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+				},
+				timeout: TORRENT_REQUEST_TIMEOUT,
+			}
+		);
+		recordRdOperationEvent('GET /torrents', response.status);
+		console.log(
+			`[${new Date().toISOString()}]     RD API call (page=${page}, limit=${limit}): ${Date.now() - apiStart}ms`
+		);
 
-	const {
-		data,
-		headers: { 'x-total-count': totalCount },
-	} = response;
+		const {
+			data,
+			headers: { 'x-total-count': totalCount },
+		} = response;
 
-	// Parse the totalCount from the headers
-	let totalCountValue: number | null = null;
-	if (totalCount) {
-		totalCountValue = parseInt(totalCount, 10);
-		if (isNaN(totalCountValue)) {
-			totalCountValue = null;
+		// Parse the totalCount from the headers
+		let totalCountValue: number | null = null;
+		if (totalCount) {
+			totalCountValue = parseInt(totalCount, 10);
+			if (isNaN(totalCountValue)) {
+				totalCountValue = null;
+			}
 		}
-	}
 
-	return { data, totalCount: totalCountValue };
+		// RD occasionally returns a non-array body (e.g. empty object) on 200.
+		// Normalize to an empty array so callers can safely iterate.
+		const safeData = Array.isArray(data) ? data : [];
+
+		return { data: safeData, totalCount: totalCountValue };
+	} catch (error: any) {
+		const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+		recordRdOperationEvent('GET /torrents', status);
+		console.error('Error fetching user torrents list:', error.message);
+		throw error;
+	}
 }
 
-export const getDownloads = async (accessToken: string): Promise<DownloadResponse[]> => {
-	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-		};
-
-		let downloads: DownloadResponse[] = [];
-		let page = 1;
-		let limit = 2500;
-
-		while (true) {
-			const response = await axios.get<DownloadResponse[]>(
-				`${config.realDebridHostname}/rest/1.0/downloads`,
-				{ headers, params: { page, limit } }
-			);
-
-			const {
-				data,
-				headers: { 'x-total-count': totalCount },
-			} = response;
-			downloads = downloads.concat(data);
-
-			if (data.length < limit || !totalCount) {
-				break;
-			}
-
-			const totalCountValue = parseInt(totalCount, 10);
-			if (isNaN(totalCountValue)) {
-				break;
-			}
-
-			if (data.length >= totalCountValue) {
-				break;
-			}
-
-			page++;
-		}
-
-		return downloads;
-	} catch (error: any) {
-		console.error('Error fetching downloads list:', error.message);
-		throw error;
-	}
-};
-
-export const getTorrentInfo = async (accessToken: string, id: string, bare: boolean = false) => {
-	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-		};
-
-		const response = await axios.get<TorrentInfoResponse>(
-			`${
-				bare ? 'https://api.real-debrid.com' : config.realDebridHostname
-			}/rest/1.0/torrents/info/${id}`,
-			{ headers }
-		);
-		return response.data;
-	} catch (error: any) {
-		console.error('Error fetching torrent information:', error.message);
-		throw error;
-	}
-};
-
-export const rdInstantCheck = async (
+export const getTorrentInfo = async (
 	accessToken: string,
-	hashes: string[]
-): Promise<RdInstantAvailabilityResponse> => {
-	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-		};
-
-		const response = await axios.get<RdInstantAvailabilityResponse>(
-			`${config.realDebridHostname}/rest/1.0/torrents/instantAvailability/${hashes.join(
-				'/'
-			)}`,
-			{ headers }
-		);
-		return response.data;
-	} catch (error: any) {
-		console.error('Error fetching torrent information:', error.message);
-		throw error;
-	}
-};
-
-export const addMagnet = async (
-	accessToken: string,
-	magnet: string,
+	id: string,
 	bare: boolean = false
-): Promise<string> => {
+): Promise<TorrentInfoResponse> => {
 	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-			'Content-Type': 'application/x-www-form-urlencoded',
-		};
-		const data = { magnet };
-		const formData = qs.stringify(data);
-
-		const response = await axios.post<AddMagnetResponse>(
-			`${
-				bare ? 'https://api.real-debrid.com' : config.realDebridHostname
-			}/rest/1.0/torrents/addMagnet`,
-			formData,
+		const response = await realDebridAxios.get<TorrentInfoResponse>(
+			`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/torrents/info/${id}`,
 			{
-				headers,
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+				},
 			}
 		);
-		return response.data.id;
+		recordRdOperationEvent('GET /torrents/info/{id}', response.status);
+		return response.data;
 	} catch (error: any) {
-		console.error('Error adding magnet:', error.message);
+		const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+		recordRdOperationEvent('GET /torrents/info/{id}', status);
+		console.error('Error fetching torrent information:', error.message);
 		throw error;
 	}
 };
+
+/** What the caller knows about an add that RD cannot be asked. */
+export type RdAddOptions = {
+	/**
+	 * Every name the caller knows this release by: the torrent's own name, the
+	 * title DMM shows for it, its file names. When one is a name RD blocks
+	 * (`isRdBlockedName`), a 451 is RD refusing the release and says nothing
+	 * about the account: it must not hold the account's other adds or earn a
+	 * retry. A magnet's `dn` and a .torrent's own name are read here, so a
+	 * caller with nothing but the hash passes the names DMM stores for it.
+	 */
+	names?: readonly (string | null | undefined)[];
+};
+
+/**
+ * Bookkeeping every RD add shares, whichever endpoint it uses: wait out a
+ * pause the account is in, count the attempt, put the account on pause when
+ * RD answers with a 451 the name does not explain, and log the answer so a
+ * refusal that has lasted hours is not called a pause (`rdAddOutcomes.ts`).
+ * A 451 the name does explain becomes `RdNameRefusedError`.
+ */
+async function sendRdAdd<T>(
+	accessToken: string,
+	names: readonly (string | null | undefined)[],
+	send: () => Promise<T>
+): Promise<T> {
+	const nameIsBlocked = names.some((name) => !!name && isRdBlockedName(name));
+	await waitOutRdAddPause(accessToken);
+	// Counted before the call, and counted whatever comes back: RD's budget is
+	// spent by refused requests too, so a burst that is already being turned away
+	// still has to read as a burst.
+	recordRdAddAttempt(accessToken);
+	let result: T;
+	try {
+		result = await send();
+	} catch (error) {
+		if (isRdAddRefusal(error)) {
+			if (nameIsBlocked) throw new RdNameRefusedError(error);
+			recordRdAddPause(accessToken);
+			recordRdAddOutcome(accessToken, false);
+		}
+		throw error;
+	}
+	recordRdAddOutcome(accessToken, true);
+	return result;
+}
 
 export const addHashAsMagnet = async (
 	accessToken: string,
-	hash: string,
-	bare: boolean = false
+	hashOrMagnet: string,
+	bare: boolean = false,
+	options: RdAddOptions = {}
 ): Promise<string> => {
-	return await addMagnet(
-		accessToken,
-		`magnet:?xt=urn:btih:${hash}&tr=udp%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=http%3A%2F%2Ftracker.opentrackr.org%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.demonii.com%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.stealth.si%3A80%2Fannounce&tr=udp%3A%2F%2Fexodus.desync.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.torrent.eu.org%3A451%2Fannounce&tr=udp%3A%2F%2Ftracker1.bt.moack.co.kr%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.tiny-vps.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.theoks.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.bittor.pw%3A1337%2Fannounce&tr=udp%3A%2F%2Fopen.free-tracker.ga%3A6969%2Fannounce&tr=udp%3A%2F%2Fisk.richardsw.club%3A6969%2Fannounce&tr=udp%3A%2F%2Fexplodie.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fbt1.archive.org%3A6969%2Fannounce&tr=https%3A%2F%2Ftracker.tamersunion.org%3A443%2Fannounce&tr=http%3A%2F%2Ftracker1.bt.moack.co.kr%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker1.myporn.club%3A9337%2Fannounce&tr=udp%3A%2F%2Ftracker.dump.cl%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftamas3.ynh.fr%3A6969%2Fannounce&tr=udp%3A%2F%2Fryjer.com%3A6969%2Fannounce&tr=udp%3A%2F%2Fretracker01-msk-virt.corbina.net%3A80%2Fannounce&tr=udp%3A%2F%2Fpublic.tracker.vraphim.com%3A6969%2Fannounce&tr=udp%3A%2F%2Fopentracker.io%3A6969%2Fannounce&tr=udp%3A%2F%2Fnew-line.net%3A6969%2Fannounce&tr=udp%3A%2F%2Fmoonburrow.club%3A6969%2Fannounce&tr=udp%3A%2F%2Fepider.me%3A6969%2Fannounce&tr=udp%3A%2F%2F6ahddutb1ucc3cp.ru%3A6969%2Fannounce&tr=https%3A%2F%2Ftracker.renfei.net%3A443%2Fannounce&tr=http%3A%2F%2Ftracker.renfei.net%3A8080%2Fannounce&tr=http%3A%2F%2Ftracker.ipv6tracker.org%3A80%2Fannounce&tr=udp%3A%2F%2Fwepzone.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker2.dler.org%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.tryhackx.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.therarbg.to%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.therarbg.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.t-rb.org%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.qu.ax%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.publictracker.xyz%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.fnix.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.filemail.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.farted.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.edkj.club%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.ccp.ovh%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.0x7c0.com%3A6969%2Fannounce&tr=udp%3A%2F%2Fsu-data.com%3A6969%2Fannounce&tr=udp%3A%2F%2Frun.publictracker.xyz%3A6969%2Fannounce&tr=udp%3A%2F%2Frun-2.publictracker.xyz%3A6969%2Fannounce&tr=udp%3A%2F%2Fpublic.publictracker.xyz%3A6969%2Fannounce&tr=udp%3A%2F%2Fopen.xxtor.com%3A3074%2Fannounce&tr=udp%3A%2F%2Fopen.u-p.pw%3A6969%2Fannounce&tr=udp%3A%2F%2Foh.fuuuuuck.com%3A6969%2Fannounce&tr=udp%3A%2F%2Finferno.demonoid.is%3A3391%2Fannounce&tr=udp%3A%2F%2Ffree.publictracker.xyz%3A6969%2Fannounce&tr=udp%3A%2F%2Fbubu.mapfactor.com%3A6969%2Fannounce&tr=udp%3A%2F%2Fbt2.archive.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fbt.ktrackers.com%3A6666%2Fannounce&tr=udp%3A%2F%2F1c.premierzal.ru%3A6969%2Fannounce&tr=https%3A%2F%2Fwww.peckservers.com%3A9443%2Fannounce&tr=https%3A%2F%2Ftracker.yemekyedim.com%3A443%2Fannounce&tr=https%3A%2F%2Ftracker.loligirl.cn%3A443%2Fannounce&tr=https%3A%2F%2Ftracker.lilithraws.org%3A443%2Fannounce&tr=https%3A%2F%2Ftracker.ipfsscan.io%3A443%2Fannounce&tr=https%3A%2F%2Ftracker.gcrreen.xyz%3A443%2Fannounce&tr=https%3A%2F%2Ftr.burnabyhighstar.com%3A443%2Fannounce&tr=https%3A%2F%2Ft1.hloli.org%3A443%2Fannounce&tr=http%3A%2F%2Fwww.peckservers.com%3A9000%2Fannounce&tr=http%3A%2F%2Fwepzone.net%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker2.dler.org%3A80%2Fannounce&tr=http%3A%2F%2Ftracker.qu.ax%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.mywaifu.best%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.files.fm%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.edkj.club%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.dler.org%3A6969%2Fannounce&tr=http%3A%2F%2Ftracker.bt4g.com%3A2095%2Fannounce&tr=http%3A%2F%2Fopen.acgtracker.com%3A1096%2Fannounce&tr=http%3A%2F%2Fopen.acgnxtracker.com%3A80%2Fannounce&tr=http%3A%2F%2Fch3oh.ru%3A6969%2Fannounce&tr=http%3A%2F%2Fcanardscitrons.nohost.me%3A6969%2Fannounce&tr=http%3A%2F%2F1337.abcvg.info%3A80%2Fannounce&tr=udp%3A%2F%2Ftracker.srv00.com%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.ddunlimited.net%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker.anima.nz%3A6969%2Fannounce&tr=udp%3A%2F%2Ftracker-udp.gbitt.info%3A80%2Fannounce&tr=udp%3A%2F%2Ftorrents.artixlinux.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fipv4.rer.lol%3A2710%2Fannounce&tr=udp%3A%2F%2Ffh2.cmp-gaming.com%3A6969%2Fannounce&tr=udp%3A%2F%2Fevan.im%3A6969%2Fannounce&tr=udp%3A%2F%2Fconcen.org%3A6969%2Fannounce&tr=udp%3A%2F%2Fbittorrent-tracker.e-n-c-r-y-p-t.net%3A1337%2Fannounce&tr=udp%3A%2F%2Faegir.sexy%3A6969%2Fannounce&tr=https%3A%2F%2Ftracker.gbitt.info%3A443%2Fannounce&tr=https%3A%2F%2Ftracker.cloudit.top%3A443%2Fannounce&tr=http%3A%2F%2Ftracker1.itzmx.com%3A8080%2Fannounce&tr=http%3A%2F%2Ftracker.gbitt.info%3A80%2Fannounce&tr=http%3A%2F%2Fbvarf.tracker.sh%3A2086%2Fannounce&tr=http%3A%2F%2Fbittorrent-tracker.e-n-c-r-y-p-t.net%3A1337%2Fannounce`,
-		bare
-	);
+	const source = hashOrMagnet.trim();
+	const isMagnet = /^magnet:\?/i.test(source);
+	const magnetHash = isMagnet ? extractTorrentInputs(source)[0]?.hash : null;
+	if ((!isMagnet && !isValidSHA40Hash(source)) || (isMagnet && !magnetHash)) {
+		throw new Error(`Invalid SHA40 hash or v1 magnet: ${hashOrMagnet}`);
+	}
+	const magnet = toMagnetUri(source);
+	const dn = isMagnet ? new URLSearchParams(source.slice('magnet:?'.length)).get('dn') : null;
+
+	return sendRdAdd(accessToken, [...(options.names ?? []), dn], async () => {
+		try {
+			const response = await realDebridAxios.post(
+				`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/torrents/addMagnet`,
+				qs.stringify({ magnet }),
+				{
+					headers: {
+						'Content-Type': 'application/x-www-form-urlencoded',
+						Authorization: `Bearer ${accessToken}`,
+					},
+				}
+			);
+			if (response.status !== 201) {
+				recordRdOperationEvent('POST /torrents/addMagnet', response.status);
+				throw new Error('Failed to add magnet, status: ' + response.status);
+			}
+			recordRdOperationEvent('POST /torrents/addMagnet', response.status);
+			return response.data.id;
+		} catch (error: any) {
+			const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+			recordRdOperationEvent('POST /torrents/addMagnet', status);
+			throw error;
+		}
+	});
+};
+
+export const addTorrentFile = async (
+	accessToken: string,
+	file: File,
+	bare: boolean = false // Use proxy by default
+): Promise<string> => {
+	const arrayBuffer = await file.arrayBuffer();
+	// The torrent's own name is the one RD judges the add on.
+	return sendRdAdd(accessToken, [torrentNameOf(arrayBuffer)], async () => {
+		const response = await realDebridAxios.put(
+			`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/torrents/addTorrent`,
+			arrayBuffer,
+			{
+				headers: {
+					'Content-Type': 'application/octet-stream',
+					Authorization: `Bearer ${accessToken}`,
+				},
+			}
+		);
+		if (response.status !== 201) {
+			throw new Error('Failed to add torrent file, status: ' + response.status);
+		}
+		return response.data.id;
+	});
 };
 
 export const selectFiles = async (
@@ -382,67 +940,66 @@ export const selectFiles = async (
 	id: string,
 	files: string[],
 	bare: boolean = false
-) => {
+): Promise<void> => {
 	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-			'Content-Type': 'application/x-www-form-urlencoded',
-		};
-		const formData = qs.stringify({ files: files.join(',') });
-
-		await axios.post(
-			`${
-				bare ? 'https://api.real-debrid.com' : config.realDebridHostname
-			}/rest/1.0/torrents/selectFiles/${id}`,
-			formData,
-			{ headers }
+		const response = await realDebridAxios.post(
+			`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/torrents/selectFiles/${id}`,
+			qs.stringify({ files: files.join(',') }),
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${accessToken}`,
+				},
+			}
 		);
+		recordRdOperationEvent('POST /torrents/selectFiles/{id}', response.status);
 	} catch (error: any) {
+		const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+		recordRdOperationEvent('POST /torrents/selectFiles/{id}', status);
 		console.error('Error selecting files:', error.message);
 		throw error;
 	}
 };
 
-export const deleteTorrent = async (accessToken: string, id: string, bare: boolean = false) => {
+export const deleteTorrent = async (
+	accessToken: string,
+	id: string,
+	bare: boolean = false
+): Promise<void> => {
 	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-		};
-
-		await axios.delete(
-			`${
-				bare ? 'https://api.real-debrid.com' : config.realDebridHostname
-			}/rest/1.0/torrents/delete/${id}`,
+		const response = await realDebridAxios.delete(
+			`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/torrents/delete/${id}`,
 			{
-				headers,
+				headers: {
+					Authorization: `Bearer ${accessToken}`,
+				},
 			}
 		);
+		recordRdOperationEvent('DELETE /torrents/delete/{id}', response.status);
 	} catch (error: any) {
+		const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+		recordRdOperationEvent('DELETE /torrents/delete/{id}', status);
 		console.error('Error deleting torrent:', error.message);
 		throw error;
 	}
 };
 
-export const deleteDownload = async (accessToken: string, id: string) => {
-	try {
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-		};
-
-		await axios.delete(`${config.realDebridHostname}/rest/1.0/downloads/delete/${id}`, {
-			headers,
-		});
-	} catch (error: any) {
-		console.error('Error deleting download:', error.message);
-		throw error;
+// Normalize RD link ID to 13 characters
+function normalizeRdLink(link: string): string {
+	const match = link.match(/^(https:\/\/real-debrid\.com\/d\/)([A-Z0-9]+)$/i);
+	if (match) {
+		const [, base, id] = match;
+		return base + id.substring(0, 13);
 	}
-};
+	return link;
+}
 
 export const unrestrictLink = async (
 	accessToken: string,
 	link: string,
 	ipAddress: string,
-	bare: boolean = false
+	bare: boolean = false,
+	password?: string
 ): Promise<UnrestrictResponse> => {
 	try {
 		const params = new URLSearchParams();
@@ -452,99 +1009,105 @@ export const unrestrictLink = async (
 			!ipAddress.startsWith('10.') &&
 			!ipAddress.startsWith('127.') &&
 			!ipAddress.startsWith('169.254')
-		)
+		) {
 			params.append('ip', ipAddress);
+		}
+		params.append('link', normalizeRdLink(link));
+		if (password) {
+			params.append('password', password);
+		}
 
-		params.append('link', link);
-		const headers = {
-			Authorization: `Bearer ${accessToken}`,
-			'Content-Type': 'application/x-www-form-urlencoded',
-		};
-
-		const response = await axios.post<UnrestrictResponse>(
-			`${
-				bare ? 'https://api.real-debrid.com' : config.realDebridHostname
-			}/rest/1.0/unrestrict/link`,
+		const response = await realDebridAxios.post<UnrestrictResponse>(
+			`${bare ? 'https://app.real-debrid.com' : getProxyUrl(config.authProxy) + config.realDebridHostname}/rest/1.0/unrestrict/link`,
 			params.toString(),
-			{ headers }
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${accessToken}`,
+				},
+			}
 		);
-
+		recordRdOperationEvent('POST /unrestrict/link', response.status);
 		return response.data;
 	} catch (error: any) {
+		const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+		recordRdOperationEvent('POST /unrestrict/link', status);
 		console.error('Error checking unrestrict:', error.message);
 		throw error;
 	}
 };
 
-export interface MediaInfoVideoDetails {
-	stream: string;
-	lang: string;
-	lang_iso: string;
-	codec: string;
-	colorspace: string;
-	width: number;
-	height: number;
-}
-
-export interface MediaInfoAudioDetails {
-	stream: string;
-	lang: string;
-	lang_iso: string;
-	codec: string;
-	sampling: number;
-	channels: number;
-}
-
-export interface MediaInfoSubtitlesDetails {
-	stream: string;
-	lang: string;
-	lang_iso: string;
-	type: string;
-}
-
-export interface MediaInfoDetails {
-	video: { [key: string]: MediaInfoVideoDetails };
-	audio: { [key: string]: MediaInfoAudioDetails };
-	subtitles: { [key: string]: MediaInfoSubtitlesDetails };
-}
-
-export interface MediaInfoResponse {
-	filename: string;
-	hoster: string;
-	link: string;
-	type: string;
-	season: string | null;
-	episode: string | null;
-	year: string | null;
-	duration: number;
-	bitrate: number;
-	size: number;
-	details: MediaInfoDetails;
-	poster_path: string;
-	audio_image: string;
-	backdrop_path: string;
-}
-
-export const getMediaInfo = async (
+export const proxyUnrestrictLink = async (
 	accessToken: string,
-	downloadId: string,
-	bare: boolean = false
-): Promise<MediaInfoResponse> => {
+	link: string
+): Promise<UnrestrictResponse> => {
 	try {
+		const body = JSON.stringify({ link });
 		const headers = {
+			'Content-Type': 'application/json',
 			Authorization: `Bearer ${accessToken}`,
 		};
 
-		const response = await axios.get<MediaInfoResponse>(
-			`${
-				bare ? 'https://api.real-debrid.com' : config.realDebridHostname
-			}/rest/1.0/streaming/mediaInfos/${downloadId}`,
+		const response = await genericAxios.post<UnrestrictResponse>(
+			`https://unrestrict.debridmediamanager.com/`,
+			body,
 			{ headers }
 		);
 
+		recordRdOperationEvent('POST /unrestrict/link', response.status);
 		return response.data;
 	} catch (error: any) {
-		console.error('Error fetching media info:', error.message);
+		const status = axios.isAxiosError(error) ? (error.response?.status ?? 500) : 500;
+		recordRdOperationEvent('POST /unrestrict/link', status);
+		console.error('Error checking unrestrict:', error.message);
 		throw error;
 	}
+};
+
+export const getTimeISO = async (): Promise<string> => {
+	const now = Date.now();
+	const CACHE_DURATION = 10000; // 10 seconds
+
+	// Check if we have a valid cached response
+	if (timeISOCache.promise && now - timeISOCache.timestamp < CACHE_DURATION) {
+		return timeISOCache.promise;
+	}
+
+	// Create new promise and cache it
+	const promise = (async () => {
+		try {
+			const response = await genericAxios.get<string>(
+				`${getProxyUrl(config.proxy)}${config.realDebridHostname}/rest/1.0/time/iso`
+			);
+			return response.data;
+		} catch (error: any) {
+			console.error('Error fetching time:', error.message);
+			// Clear cache on error so next call will retry
+			timeISOCache.promise = null;
+			timeISOCache.timestamp = 0;
+			throw error;
+		}
+	})();
+
+	// Update cache
+	timeISOCache.promise = promise;
+	timeISOCache.timestamp = now;
+
+	return promise;
+};
+
+export const __testing = {
+	realDebridAxios,
+	genericAxios,
+	clearUserRequestCache: () => {
+		userRequestCache.clear();
+	},
+	resetTimeISOCache: () => {
+		timeISOCache.promise = null;
+		timeISOCache.timestamp = 0;
+	},
+	clearAccessTokenCache: () => {
+		accessTokenCache.clear();
+		inflightTokenRequests.clear();
+	},
 };

@@ -1,40 +1,75 @@
-import * as crypto from 'crypto';
+// Client-side handle on the availability token.
+//
+// This file used to compute the token *and* its signature in the browser, from a
+// hardcoded salt — which meant the salt shipped in the bundle and anyone could
+// forge a valid token offline, leaving the `Available` table's writes and
+// deletes open to unauthenticated callers. Signing now happens server-side in
+// `GET /api/challenge`; this is just a cache in front of it.
+//
+// `generateTokenAndHash()` keeps its exact signature so all ~20 call sites in the
+// hooks and pages are unchanged. It is also cheaper than what it replaces: the
+// old version fetched a Real-Debrid timestamp (`getTimeISO`) on every single
+// call, once per row per service during a sweep.
 
-export async function generateTokenAndHash(): Promise<[string, string]> {
-	const token = generateRandomToken(); // Generate a secure random token
-	const timestamp = Math.floor(Date.now() / 1000); // UNIX timestamp in seconds
-	const tokenWithTimestamp = `${token}-${timestamp}`;
-	const tokenHash = await generateHash(tokenWithTimestamp); // Hash the token with the timestamp
-	return [tokenWithTimestamp, tokenHash]; // Return both the token with embedded timestamp and its hash
+interface CachedToken {
+	token: string;
+	hash: string;
+	expiresAt: number;
 }
 
-function generateRandomToken(): string {
-	const array = new Uint32Array(1);
-	window.crypto.getRandomValues(array);
-	return array[0].toString(16);
-}
+// Held for well under the server's 5-minute TTL so that a token handed out here
+// always has a wide margin left when the request carrying it actually lands. The
+// margin is what matters: reusing for the near-full TTL would hand a caller a
+// token with seconds to live, and a slow sweep on a large library would start
+// silently collecting 403s. It also bounds how long a stale token can linger if
+// the signing secret is ever rotated under a running tab.
+const TOKEN_REUSE_MS = 2 * 60 * 1000;
 
-async function generateHash(input: string): Promise<string> {
-	// Encode the input string as a Uint8Array
-	const encoder = new TextEncoder();
-	const data = encoder.encode(input);
-	// Hash the data using SHA-256
-	const hashBuffer = await window.crypto.subtle.digest('SHA-256', data);
-	// Convert the hash to a hexadecimal string
-	const hashArray = Array.from(new Uint8Array(hashBuffer));
-	const hashHex = hashArray.map((b) => b.toString(16).padStart(2, '0')).join('');
-	return hashHex;
-}
+let cached: CachedToken | null = null;
+let inFlight: Promise<[string, string]> | null = null;
 
-export function validateTokenWithHash(tokenWithTimestamp: string, receivedHash: string): boolean {
-	const [token, timestampStr] = tokenWithTimestamp.split('-');
-	const timestamp = parseInt(timestampStr, 10);
-	const currentTimestamp = Math.floor(Date.now() / 1000);
-	// Check time validity (5 minutes = 60 seconds)
-	if (Math.abs(currentTimestamp - timestamp) > 60) {
-		return false; // Token expired
+async function fetchToken(): Promise<[string, string]> {
+	const response = await fetch('/api/challenge');
+	if (!response.ok) {
+		throw new Error(`Failed to obtain an availability token: ${response.status}`);
 	}
-	// Recreate the hash with the received tokenWithTimestamp and compare
-	const hash = crypto.createHash('sha256').update(tokenWithTimestamp).digest('hex');
-	return hash === receivedHash;
+
+	const payload = await response.json();
+	if (typeof payload?.token !== 'string' || typeof payload?.hash !== 'string') {
+		throw new Error('Malformed availability token response');
+	}
+
+	cached = {
+		token: payload.token,
+		hash: payload.hash,
+		expiresAt: Date.now() + TOKEN_REUSE_MS,
+	};
+
+	return [payload.token, payload.hash];
+}
+
+/**
+ * A token/signature pair to send as `dmmProblemKey` + `solution`.
+ *
+ * Concurrent callers share one in-flight request: a page that starts several
+ * sweeps at once should cost one mint, not one per sweep.
+ */
+export async function generateTokenAndHash(): Promise<[string, string]> {
+	if (cached && Date.now() < cached.expiresAt) {
+		return [cached.token, cached.hash];
+	}
+
+	if (!inFlight) {
+		inFlight = fetchToken().finally(() => {
+			inFlight = null;
+		});
+	}
+
+	return inFlight;
+}
+
+/** Test seam: drops the cached token and any in-flight mint. */
+export function resetTokenCache(): void {
+	cached = null;
+	inFlight = null;
 }

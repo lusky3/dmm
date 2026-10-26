@@ -1,0 +1,193 @@
+import rdNameFilterProbe from '@/test/fixtures/realdebrid/rd-name-filter-2026-10-14.json';
+import { describe, expect, it } from 'vitest';
+import { deInfringe, isRdBlockedName } from './deInfringe';
+
+describe('isRdBlockedName', () => {
+	// Names RD refuses on the first request, every time.
+	it.each([
+		'Show.S01E01.1080p.WEB-DL.DDP5.1.H.265-NTb',
+		'Show.S01E01.720p.HDTV.x264-GROUP',
+		'Show.S01E01.HDTV.XviD-AFG',
+		'Show.S01E01.1080p.WEB.x264-GROUP',
+		'Show.S01E01.1080p.WEB.H264-GROUP',
+		// In any case, measured 2026-10-14.
+		'Show.S01E01.720p.hdtv.x264-GROUP',
+		'Show.S01E01.480p.HDTV.XVID-GROUP',
+		'Show.S01E01.1080p.webrip.x265-GROUP',
+		'Movie.2015.1080p.bluray.x264-GROUP',
+		'Movie.2015.1080P.BLURAY.DTS.x265-GROUP',
+		// RD took these on 2026-10-03 and refused them again on 2026-10-10:
+		// the rip family, `BluRay.x264`, and `p.BluRay.DTS` (refused 2026-08-25).
+		'Show.S01E01.1080p.WEBRip.x265-RARBG',
+		'Movie.2019.720p.BDRip.x264-GROUP',
+		'Movie.2019.720p.HDRip.XviD-GROUP',
+		'Movie.1999.DVDRip.XviD-GROUP',
+		'Movie.2015.1080p.BluRay.x264-GROUP',
+		'Beautiful.Creatures.2013.1080p.BluRay.DTS.x264-EbP',
+		'Movie.2015.1080p.BluRay.DTS.x265-GROUP',
+	])('flags %s', (name) => {
+		expect(isRdBlockedName(name)).toBe(true);
+	});
+
+	// Names RD accepts. Each separator variant matters: RD keys on the exact
+	// substring, so `WEB.DL` passing while `WEB-DL` is refused is the whole
+	// reason `deInfringe`'s rewrite works.
+	it.each([
+		// The WEB tags count only in exactly this case since 2026-10-14; RD took
+		// both How to Train Your Dragon releases from a sponsor's retest.
+		'Show.S01E01.1080p.WEB.h264-GROUP',
+		'How.to.Train.Your.Dragon.2025.1080p.WEB.h264-ETHEL',
+		'Show.S01E01.1080p.web-dl.x265-GROUP',
+		'How To Train Your Dragon 2025 1080P Web-Dl Hybrid H265 Dv Hdr Ddp Atmos 5 1-CAPTCHA',
+		'Show.S01E01.1080p.WEB.X264-GROUP',
+		'Show.S01E01.1080p.Web.H264-GROUP',
+		'Show.S01E01.1080p.WEB.DL.DDP5.1.H.265-NTb',
+		'Show.S01E01.1080p.WEBDL.H265-NTb',
+		'Show.S01E01.1080p.WEB-Rip.x265-GROUP',
+		'Movie.2015.1080p.BluRay-x264-GROUP',
+		'Movie.2015.1080p.Blu-Ray.x264-GROUP',
+		'Movie.2015.1080p.BluRay.x265-GROUP',
+		'Show.S01E01.1080p.WEB.x265-GROUP',
+		'Show.S01E01.1080p.HEVC.x265-MeGusta',
+		'Show.S01E01.480p.x264-mSD',
+		'Show.S01E01.XviD-AFG',
+		// Near-misses of `BluRay.DTS` that RD took in the same run — a different
+		// audio tag, a hyphenated source, and the form `deInfringe` emits.
+		'Movie.2015.1080p.BluRay.AC3.x264-GROUP',
+		'Movie.2015.1080p.BluRay.DD5.1.x264-GROUP',
+		'Movie.2015.1080p.Blu-Ray.DTS.x264-GROUP',
+		'Movie.2015.1080p.BluRay-DTS.x264-GROUP',
+		// `DTS` blocks only right after `BluRay` (2026-10-10).
+		'Movie.2015.1080p.DTS.x264-GROUP',
+		'Movie.2015.1080p.WEB.DTS.x265-GROUP',
+		// And `BluRay.DTS` only right after a `p` (2026-10-10 afternoon): a user
+		// reported these FraMeSToR remuxes flagged, and RD added and unrestricted them.
+		'Phone.Booth.2002.BluRay.DTS-HD.MA.5.1.MPEG-2.REMUX-FraMeSToR.mkv',
+		'Cashback.2006.BluRay.DTS-HD.MA.5.1.AVC.REMUX-FraMeSToR.mkv',
+		'jOBS.2013.BluRay.DTS-HD.MA.5.1.VC-1.REMUX-FraMeSToR.mkv',
+	])('passes %s', (name) => {
+		expect(isRdBlockedName(name)).toBe(false);
+	});
+
+	// RD's own answers from a recorded probe: a fresh webseed torrent per name,
+	// so the names alone decided each one. An add is judged on the root name
+	// alone, which the multi-file entries prove by carrying file names RD took
+	// anyway; an unrestrict is judged on the file's own name.
+	it.each(rdNameFilterProbe.add)("gives RD's add answer for $name", ({ name, status }) => {
+		expect(isRdBlockedName(name)).toBe(status === 451);
+	});
+	it.each(rdNameFilterProbe.unrestrict)(
+		"gives RD's unrestrict answer for $name",
+		({ name, status }) => {
+			expect(isRdBlockedName(name)).toBe(status === 451);
+		}
+	);
+
+	// Measured 2026-08-23: RD downloaded both `HDTV.H264-FTP` releases of
+	// Would.I.Lie.To.You.S19E10 to 100%, so this pair is not on its blocklist —
+	// even though `deInfringe` rewrites it. Gating a deletion on `deInfringe`
+	// would have evicted two working availability rows.
+	it('does not flag HDTV.H264, which deInfringe still rewrites', () => {
+		const name = 'Would.I.Lie.To.You.S19E10.1080p.HDTV.H264-FTP';
+		expect(isRdBlockedName(name)).toBe(false);
+		expect(deInfringe(name)).not.toBe(name);
+	});
+
+	it('matches mid-name, and in any case only where RD does', () => {
+		expect(isRdBlockedName('pack/Movie.2019.1080p.WEB-DL.x265/file.mkv')).toBe(true);
+		expect(isRdBlockedName('pack/Movie.2019.1080p.web-dl.x265/file.mkv')).toBe(false);
+		expect(isRdBlockedName('pack/Movie.2019.1080p.webrip.x265/file.mkv')).toBe(true);
+		expect(isRdBlockedName('pack/Movie.2019.1080p.WEB.DL.x265/file.mkv')).toBe(false);
+		expect(isRdBlockedName('')).toBe(false);
+	});
+
+	// Measured 2026-09-03 on `25f9ffaf…`, the release that exposed this. RD
+	// refused it on request #1 between two accepted controls — a real block — but
+	// the only name DMM held was the space-separated display title, which reads
+	// clean. The dots the block keys on survive only in the path inside the
+	// torrent, which TorBox's `checkcached` reports in full. RD refused that
+	// release for `WEB.h264`, which it takes again since 2026-10-14, so the case
+	// below carries the `WEB.H264` it still refuses.
+	it('takes the GRACE release itself since 2026-10-14', () => {
+		expect(
+			isRdBlockedName(
+				'Soul Power The Legend of the American Basketball Association S01E04 1080p WEB h264-GRACE',
+				[
+					'Soul.Power.The.Legend.of.the.American.Basketball.Association.S01E04.1080p.WEB.h264-GRACE[EZTVx.to]/' +
+						'Soul.Power.The.Legend.of.the.American.Basketball.Association.S01E04.1080p.WEB.h264-GRACE[EZTVx.to].mkv',
+				]
+			)
+		).toBe(false);
+	});
+
+	describe('a torrent whose block lives in its filenames', () => {
+		const title =
+			'Soul Power The Legend of the American Basketball Association S01E04 1080p WEB H264-GRACE';
+		const path =
+			'Soul.Power.The.Legend.of.the.American.Basketball.Association.S01E04.1080p.WEB.H264-GRACE[EZTVx.to]/' +
+			'Soul.Power.The.Legend.of.the.American.Basketball.Association.S01E04.1080p.WEB.H264-GRACE[EZTVx.to].mkv';
+
+		it('reads the title alone as clean', () => {
+			expect(isRdBlockedName(title)).toBe(false);
+		});
+
+		it('flags it once the filenames are supplied', () => {
+			expect(isRdBlockedName(title, [path])).toBe(true);
+		});
+
+		// The uploader's rewrite of this very release is in RD and downloaded to
+		// 100% under a space-separated name, so widening the pattern to treat a
+		// space as a separator would condemn content RD demonstrably accepts.
+		it('still clears the space-separated rewrite RD accepted', () => {
+			expect(isRdBlockedName(title, [`${title} {imdb-tt38638035}.mkv`])).toBe(false);
+		});
+
+		it('leaves the answer to the title when no filenames are known', () => {
+			expect(isRdBlockedName('Movie.2019.1080p.WEB-DL.x264', [])).toBe(true);
+			expect(isRdBlockedName('Movie.2019.1080p.BluRay.x265', [])).toBe(false);
+		});
+	});
+});
+
+describe('deInfringe', () => {
+	// Every name RD refused on 2026-10-14, rewritten. The debrid and nzb2rd
+	// uploaders run this same expression before building a torrent.
+	it.each(rdNameFilterProbe.add.filter(({ status }) => status === 451))(
+		'rewrites $name into a name RD takes',
+		({ name }) => {
+			expect(isRdBlockedName(deInfringe(name))).toBe(false);
+		}
+	);
+
+	it('breaks every blocked pattern it rewrites', () => {
+		const rewritten = [
+			'Show.S01E01.1080p.WEB-DL.H265',
+			'Show.S01E01.1080p.WEBRip.x265',
+			'Movie.720p.BDRip.x264',
+			'Movie.720p.HDRip.XviD',
+			'Movie.DVDRip.XviD',
+			'Movie.1080p.BluRay.x264',
+			'Show.720p.HDTV.x264',
+			'Show.HDTV.XviD',
+			'Show.1080p.WEB.x264',
+			'Show.1080p.WEB.h264',
+			'Movie.1080p.BluRay.DTS.x264',
+			'Movie.1080p.BluRay.DTS-HD.MA.5.1.x264',
+		].map(deInfringe);
+		for (const name of rewritten) {
+			expect(isRdBlockedName(name)).toBe(false);
+		}
+	});
+
+	it('leaves names RD accepts alone', () => {
+		for (const name of [
+			'Movie.2015.1080p.BluRay.x265-GROUP',
+			'Show.S01E01.1080p.WEB.x265-GROUP',
+			'Show.S01E01.480p.x264-mSD',
+			'Movie.2015.1080p.BluRay.AC3.x264-GROUP',
+			'Movie.2015.1080p.BluRay.DD5.1.x264-GROUP',
+		]) {
+			expect(deInfringe(name)).toBe(name);
+		}
+	});
+});

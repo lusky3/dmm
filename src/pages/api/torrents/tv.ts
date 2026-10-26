@@ -1,13 +1,22 @@
 import { flattenAndRemoveDuplicates, sortByFileSize } from '@/services/mediasearch';
-import { PlanetScaleCache } from '@/services/planetscale';
-import { validateTokenWithHash } from '@/utils/token';
+import { RATE_LIMIT_CONFIGS, withIpRateLimit } from '@/services/rateLimit/withRateLimit';
+import { repository as db } from '@/services/repository';
+import {
+	cleanShowResultsInBackground,
+	withoutTrashedResults,
+} from '@/services/scrapedVerdicts/job';
+import { checkCanary, respondAsNeverScraped } from '@/utils/canaryGuard';
+import type { DebridioTarget } from '@/utils/debridioBackfill';
+import {
+	backfillFromDebridioNow,
+	refreshDebridioAvailabilityInBackground,
+} from '@/utils/debridioBackfill';
+import { validateProblemToken } from '@/utils/problemToken';
 import { NextApiHandler } from 'next';
-
-const db = new PlanetScaleCache();
 
 // returns scraped results or marks the imdb id as requested
 const handler: NextApiHandler = async (req, res) => {
-	const { imdbId, seasonNum, dmmProblemKey, solution, onlyTrusted } = req.query;
+	const { imdbId, seasonNum, dmmProblemKey, solution, onlyTrusted, maxSize, page } = req.query;
 
 	if (
 		!dmmProblemKey ||
@@ -15,15 +24,23 @@ const handler: NextApiHandler = async (req, res) => {
 		!solution ||
 		!(typeof solution === 'string')
 	) {
-		res.status(401).json({ errorMessage: 'Authentication not provided' });
+		res.status(403).json({ errorMessage: 'Authentication not provided' });
 		return;
-	} else if (!validateTokenWithHash(dmmProblemKey.toString(), solution.toString())) {
-		res.status(401).json({ errorMessage: 'Authentication error' });
+	} else if (!validateProblemToken(dmmProblemKey, solution)) {
+		res.status(403).json({ errorMessage: 'Authentication error' });
 		return;
 	}
 
 	if (!imdbId || !(typeof imdbId === 'string')) {
 		res.status(400).json({ errorMessage: 'Missing "imdbId" query parameter' });
+		return;
+	}
+
+	// Impossible titles: no browser session can produce these ids, so a hit is
+	// proof of enumeration rather than a signal to weigh. Answer exactly as a
+	// never-scraped title does and, crucially, do not queue a scrape for it.
+	if (await checkCanary(req, imdbId)) {
+		respondAsNeverScraped(res);
 		return;
 	}
 	if (!seasonNum || !(typeof seasonNum === 'string')) {
@@ -34,40 +51,108 @@ const handler: NextApiHandler = async (req, res) => {
 	}
 
 	try {
+		const maxSizeInGB = maxSize ? parseInt(maxSize.toString()) : 0;
+		const pageNum = page ? parseInt(page.toString()) : 0;
+
 		const promises = [
+			// A trusted release under its Russian title is this title's own, so the
+			// page shows it. The untrusted read below keeps dropping them.
 			db.getScrapedTrueResults<any[]>(
-				`tv:${imdbId.toString().trim()}:${parseInt(seasonNum.toString().trim(), 10)}`
+				`tv:${imdbId.toString().trim()}:${parseInt(seasonNum.toString().trim(), 10)}`,
+				maxSizeInGB,
+				pageNum,
+				{ showCyrillicLed: true }
 			),
 		];
 		if (onlyTrusted !== 'true') {
 			promises.push(
 				db.getScrapedResults<any[]>(
-					`tv:${imdbId.toString().trim()}:${parseInt(seasonNum.toString().trim(), 10)}`
+					`tv:${imdbId.toString().trim()}:${parseInt(seasonNum.toString().trim(), 10)}`,
+					maxSizeInGB,
+					pageNum
 				)
 			);
 		}
 		const results = await Promise.all(promises);
 		// should contain both results
-		const searchResults = [...(results[0] || []), ...(results[1] || [])];
-		if (searchResults) {
+		let searchResults = [...(results[0] || []), ...(results[1] || [])];
+
+		// An empty page only means "never scraped" when nothing narrowed the query.
+		// Later pages run out by design, and maxSize/onlyTrusted can filter a
+		// well-scraped season down to nothing - neither should queue a scrape.
+		const isUnfilteredFirstPage = pageNum === 0 && maxSizeInGB === 0 && onlyTrusted !== 'true';
+
+		const trimmedImdbId = imdbId.toString().trim();
+		const trimmedSeasonNum = parseInt(seasonNum.toString().trim(), 10);
+		const debridioTarget = {
+			imdbId: trimmedImdbId,
+			key: `tv:${trimmedImdbId}:${trimmedSeasonNum}`,
+			kind: 'series',
+			season: trimmedSeasonNum,
+		} satisfies DebridioTarget;
+
+		if (searchResults.length === 0 && isUnfilteredFirstPage) {
+			// Debridio answers in about a second what the heavy scrapers queue
+			// for minutes, so a first view fills the table on this very request.
+			// An empty result (disabled, already in flight, unknown title) falls
+			// through to the request queue exactly as before.
+			searchResults = await backfillFromDebridioNow(debridioTarget);
+			if (searchResults.length > 0) {
+				// The heavy scrapers still deepen coverage afterwards.
+				await db.saveScrapedResults(`requested:${trimmedImdbId}`, []);
+			} else {
+				const isProcessing = await db.keyExists(`processing:${trimmedImdbId}`);
+				if (isProcessing) {
+					res.setHeader('status', 'processing').status(204).end();
+					return;
+				}
+
+				await db.saveScrapedResults(`requested:${trimmedImdbId}`, []);
+				res.setHeader('status', 'requested').status(204).end();
+				return;
+			}
+		}
+
+		try {
+			// Get reported hashes to filter out
+			const reportedHashes = await db.getReportedHashes(imdbId.toString().trim());
+
+			// Filter out reported torrents before any processing
+			const unreported = searchResults.filter((torrent) => {
+				if (!torrent.hash) return true; // Keep torrents without hash (shouldn't happen, but safe fallback)
+				const isReported = reportedHashes.includes(torrent.hash);
+				return !isReported;
+			});
+			// Results judged to be another title, until the background pass below
+			// has moved them off the page.
+			const filteredResults = await withoutTrashedResults(trimmedImdbId, unreported);
+
+			// Process the filtered results
+			let processedResults = flattenAndRemoveDuplicates(filteredResults);
+			processedResults = sortByFileSize(processedResults);
+			// Keeps the debridio ⚡ availability markers for this season fresh
+			// without holding the response; no-ops inside its TTL.
+			void refreshDebridioAvailabilityInBackground(debridioTarget);
+			// Judges whatever is new on this page so the next visit is clean.
+			void cleanShowResultsInBackground(trimmedImdbId, trimmedSeasonNum);
+			res.status(200).json({ results: processedResults });
+		} catch (error: any) {
+			console.error(
+				'Error filtering reported hashes:',
+				error instanceof Error ? error.message : 'Unknown error'
+			);
+			// If filtering fails, continue with unfiltered results
 			let processedResults = flattenAndRemoveDuplicates(searchResults);
 			processedResults = sortByFileSize(processedResults);
 			res.status(200).json({ results: processedResults });
-			return;
 		}
-
-		const isProcessing = await db.keyExists(`processing:${imdbId.toString().trim()}`);
-		if (isProcessing) {
-			res.setHeader('status', 'processing').status(204).json(null);
-			return;
-		}
-
-		await db.saveScrapedResults(`requested:${imdbId.toString().trim()}`, []);
-		res.setHeader('status', 'requested').status(204).json(null);
 	} catch (error: any) {
-		console.error('encountered a db issue', error);
-		res.status(500).json({ errorMessage: error.message });
+		console.error(
+			'Encountered a database issue:',
+			error instanceof Error ? error.message : 'Unknown error'
+		);
+		res.status(500).json({ errorMessage: 'An internal error occurred' });
 	}
 };
 
-export default handler;
+export default withIpRateLimit(handler, RATE_LIMIT_CONFIGS.torrents);

@@ -1,0 +1,234 @@
+import { checkCachedStatus } from '@/services/torbox';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+	checkAvailability,
+	checkAvailabilityAd,
+	checkAvailabilityAdByHashes,
+} from './availability';
+import {
+	checkDatabaseAvailabilityAd,
+	checkDatabaseAvailabilityRd,
+	checkDatabaseAvailabilityTb,
+} from './instantChecks';
+
+// Kept out of instantChecks.test.ts on purpose: the RD rate limiter keeps
+// module-level timestamps, and that file already runs at its 10-requests-per-10s
+// budget. A separate file gets a fresh module registry.
+
+vi.mock('./availability', () => ({
+	checkAvailabilityByHashes: vi.fn(),
+	checkAvailability: vi.fn(),
+	checkAvailabilityAd: vi.fn(),
+	checkAvailabilityAdByHashes: vi.fn(),
+}));
+
+vi.mock('@/services/torbox', () => ({
+	checkCachedStatus: vi.fn(),
+}));
+
+vi.mock('react-hot-toast', () => ({
+	toast: {
+		promise: vi.fn((p) => p),
+		success: vi.fn(),
+		loading: vi.fn(() => 'toast-id'),
+		error: vi.fn(),
+	},
+}));
+
+vi.mock('@/utils/selectable', () => ({
+	isVideo: ({ path }: { path: string }) => path.endsWith('.mkv'),
+}));
+
+const mockCheckAvailability = vi.mocked(checkAvailability);
+const mockCheckAvailabilityAd = vi.mocked(checkAvailabilityAd);
+const mockCheckAvailabilityAdByHashes = vi.mocked(checkAvailabilityAdByHashes);
+const mockCheckCachedStatus = vi.mocked(checkCachedStatus);
+
+const createStateHarness = <T extends { hash: string }>(initial: T[]) => {
+	let state = [...initial];
+	const setter = vi.fn((updater: ((prev: T[]) => T[]) | T[]) => {
+		state = typeof updater === 'function' ? updater(state) : updater;
+		return state;
+	});
+	return { getState: () => state, setter };
+};
+
+const identity = (r: any[]) => r;
+const MB = 1024 * 1024;
+
+describe('missing fileSize backfill', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it('fills in fileSize from RD file bytes when the reported size is 0', async () => {
+		mockCheckAvailability.mockResolvedValue({
+			available: [
+				{
+					hash: 'hash-zero-rd',
+					files: [
+						{ file_id: 1, path: 'Movie.mkv', bytes: 8 * MB },
+						{ file_id: 2, path: 'Movie.srt', bytes: 2 * MB },
+					],
+				},
+			],
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-zero-rd',
+				noVideos: false,
+				rdAvailable: false,
+				files: [],
+				fileSize: 0,
+				medianFileSize: 0,
+				biggestFileSize: 0,
+			},
+		] as any[]);
+
+		await checkDatabaseAvailabilityRd(
+			'problem',
+			'solution',
+			'tt1234567',
+			['hash-zero-rd'],
+			setter,
+			identity
+		);
+
+		// every file counts toward the total, not just the video ones
+		expect(getState()[0].fileSize).toBe(10);
+	});
+
+	it('leaves a known fileSize untouched', async () => {
+		mockCheckAvailability.mockResolvedValue({
+			available: [
+				{
+					hash: 'hash-known',
+					files: [{ file_id: 1, path: 'Movie.mkv', bytes: 8 * MB }],
+				},
+			],
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-known',
+				noVideos: false,
+				rdAvailable: false,
+				files: [],
+				fileSize: 1234,
+				medianFileSize: 0,
+				biggestFileSize: 0,
+			},
+		] as any[]);
+
+		await checkDatabaseAvailabilityRd(
+			'problem',
+			'solution',
+			'tt1234567',
+			['hash-known'],
+			setter,
+			identity
+		);
+
+		expect(getState()[0].fileSize).toBe(1234);
+	});
+
+	it('fills in fileSize from AD file bytes when the reported size is 0', async () => {
+		mockCheckAvailabilityAd.mockResolvedValue({
+			available: [
+				{
+					hash: 'hash-zero-ad',
+					files: [{ file_id: 1, path: 'Movie.mkv', bytes: 5 * MB }],
+				},
+			],
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-zero-ad',
+				noVideos: false,
+				adAvailable: false,
+				files: [],
+				fileSize: 0,
+				medianFileSize: 0,
+				biggestFileSize: 0,
+			},
+		] as any[]);
+
+		await checkDatabaseAvailabilityAd(
+			'problem',
+			'solution',
+			'tt1234567',
+			['hash-zero-ad'],
+			setter,
+			identity
+		);
+
+		expect(getState()[0].fileSize).toBe(5);
+	});
+
+	it('fills in fileSize from TB file bytes when the reported size is 0', async () => {
+		mockCheckCachedStatus.mockResolvedValue({
+			success: true,
+			data: {
+				'hash-zero-tb': {
+					files: [{ name: 'Show.mkv', size: 3 * MB }],
+				},
+			},
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-zero-tb',
+				noVideos: false,
+				tbAvailable: false,
+				files: [],
+				fileSize: 0,
+				medianFileSize: 0,
+				biggestFileSize: 0,
+			},
+		] as any[]);
+
+		await checkDatabaseAvailabilityTb('tb-key', ['hash-zero-tb'], setter, identity);
+
+		expect(getState()[0].fileSize).toBe(3);
+	});
+
+	// The show page ranks cached rows on the mean, so it has to be the mean of the
+	// video files - distinct from both the median and the biggest
+	it('records the mean of the video files, ignoring non-video ones', async () => {
+		mockCheckAvailability.mockResolvedValue({
+			available: [
+				{
+					hash: 'hash-mean',
+					files: [
+						{ file_id: 1, path: 'Episode.1.mkv', bytes: 6 * MB },
+						{ file_id: 2, path: 'Episode.2.mkv', bytes: 10 * MB },
+						{ file_id: 3, path: 'Episode.3.mkv', bytes: 20 * MB },
+						{ file_id: 4, path: 'Subs.srt', bytes: 60 * MB },
+					],
+				},
+			],
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-mean',
+				noVideos: false,
+				rdAvailable: false,
+				files: [],
+				fileSize: 96,
+				medianFileSize: 0,
+				biggestFileSize: 0,
+			},
+		] as any[]);
+
+		await checkDatabaseAvailabilityRd(
+			'problem',
+			'solution',
+			'tt1234567',
+			['hash-mean'],
+			setter,
+			identity
+		);
+
+		expect(getState()[0].meanFileSize).toBe(12);
+		expect(getState()[0].medianFileSize).toBe(10);
+		expect(getState()[0].biggestFileSize).toBe(20);
+	});
+});

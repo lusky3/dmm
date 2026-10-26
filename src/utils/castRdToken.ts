@@ -1,0 +1,52 @@
+import { forgetAccessToken, getToken } from '@/services/realDebrid';
+import { retryDroppedConnection } from './castAddonFailure';
+
+/**
+ * The Real-Debrid half of a cast profile: either the OAuth triple or a pasted
+ * API key. Exactly one of the two is stored, so every field is optional.
+ */
+export interface RdCastCredentials {
+	clientId?: string | null;
+	clientSecret?: string | null;
+	refreshToken?: string | null;
+	apiKey?: string | null;
+}
+
+/**
+ * The access token to call Real-Debrid with on this profile's behalf.
+ *
+ * A pasted API key is already a bearer token for the same REST API the device
+ * flow ends at, and it has no expiry - there is nothing to renew, so it is
+ * returned as-is. The OAuth triple still mints a fresh 24h token per call,
+ * because a stored access token would be stale long before the addon is next
+ * opened.
+ *
+ * Returns null when the profile carries neither, rather than calling `getToken`
+ * with empty strings and reading Real-Debrid's 400 as an expired grant.
+ * `RdTokenExpiredError` from the refresh is left to propagate: callers turn it
+ * into their own "re-authenticate" response.
+ *
+ * Real-Debrid's token endpoint drops connections now and then ("socket hang
+ * up", repeatedly in dmm-01's logs on 2026-10-03), and nothing below this
+ * retries a request that got no answer at all. Minting a token is safe
+ * to repeat, so one dropped connection costs a second try, not the request.
+ */
+export async function castAccessToken(profile: RdCastCredentials): Promise<string | null> {
+	if (profile.apiKey) return profile.apiKey;
+	const { clientId, clientSecret, refreshToken } = profile;
+	if (!clientId || !clientSecret || !refreshToken) return null;
+	const token = await retryDroppedConnection(() =>
+		getToken(clientId, clientSecret, refreshToken, true)
+	);
+	return token?.access_token ?? null;
+}
+
+/**
+ * Forgets the access token minted for this profile, and says whether there was
+ * one to forget. A pasted API key has nothing to renew: a 401 on it is final.
+ */
+export function forgetCastAccessToken(profile: RdCastCredentials): boolean {
+	if (profile.apiKey || !profile.clientId) return false;
+	forgetAccessToken(profile.clientId);
+	return true;
+}

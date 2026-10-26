@@ -1,0 +1,745 @@
+import type { SearchResult } from '@/services/mediasearch';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import React from 'react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import MovieSearchResults from './MovieSearchResults';
+
+const downloadSpy = vi.fn();
+
+vi.mock('@/utils/downloadMagnet', () => ({
+	downloadMagnetFile: (...args: any[]) => downloadSpy(...args),
+}));
+
+vi.mock('./ReportButton', () => ({
+	default: () => <div data-testid="report-button" />,
+}));
+
+const openWatchSpy = vi.fn();
+vi.mock('@/utils/watchService', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/utils/watchService')>();
+	return { ...actual, openWatch: (...args: any[]) => openWatchSpy(...args) };
+});
+
+const baseResult: SearchResult = {
+	title: 'Sample Movie',
+	fileSize: 1024 * 10,
+	hash: 'hash1',
+	rdAvailable: false,
+	adAvailable: false,
+	tbAvailable: false,
+	pmAvailable: false,
+	ocAvailable: false,
+	dlAvailable: false,
+	files: [{ fileId: 1, filename: 'Sample.mkv', filesize: 1024 * 10 }],
+	noVideos: false,
+	medianFileSize: 10,
+	biggestFileSize: 10,
+	videoCount: 1,
+	imdbId: 'tt123',
+};
+
+const renderComponent = (override?: Partial<React.ComponentProps<typeof MovieSearchResults>>) => {
+	const props: React.ComponentProps<typeof MovieSearchResults> = {
+		filteredResults: [baseResult],
+		onlyShowCached: false,
+		movieMaxSize: '20',
+		rdKey: 'rd-key',
+		adKey: null,
+		torboxKey: null,
+		premiumizeKey: null,
+		offcloudKey: null,
+		debridLinkKey: null,
+		player: '',
+		hashAndProgress: {},
+		handleShowInfo: vi.fn(),
+		handleCast: vi.fn().mockResolvedValue(undefined),
+		handleCopyMagnet: vi.fn(),
+		checkServiceAvailability: vi.fn().mockResolvedValue(undefined),
+		addRd: vi.fn().mockResolvedValue(undefined),
+		addAd: vi.fn().mockResolvedValue(undefined),
+		addTb: vi.fn().mockResolvedValue(undefined),
+		addPm: vi.fn().mockResolvedValue(undefined),
+		addOc: vi.fn().mockResolvedValue(undefined),
+		addDl: vi.fn().mockResolvedValue(undefined),
+		deleteRd: vi.fn().mockResolvedValue(undefined),
+		deleteAd: vi.fn().mockResolvedValue(undefined),
+		deleteTb: vi.fn().mockResolvedValue(undefined),
+		deletePm: vi.fn().mockResolvedValue(undefined),
+		deleteOc: vi.fn().mockResolvedValue(undefined),
+		deleteDl: vi.fn().mockResolvedValue(undefined),
+		imdbId: 'tt123',
+		isHashServiceChecking: () => false,
+		...override,
+	};
+
+	return {
+		...render(<MovieSearchResults {...props} />),
+		props,
+	};
+};
+
+describe('MovieSearchResults', () => {
+	beforeEach(() => {
+		localStorage.clear();
+		downloadSpy.mockReset();
+	});
+
+	afterEach(() => {
+		cleanup();
+	});
+
+	it('adds torrents to RD and copies magnet links by default', async () => {
+		const { props } = renderComponent();
+
+		await userEvent.click(screen.getByRole('button', { name: /DL with RD/i }));
+		await waitFor(() => expect(props.addRd).toHaveBeenCalledWith('hash1'));
+
+		await userEvent.click(screen.getByRole('button', { name: /Copy/i }));
+		expect(props.handleCopyMagnet).toHaveBeenCalledWith('hash1');
+		expect(downloadSpy).not.toHaveBeenCalled();
+	});
+
+	it('removes torrents from RD and triggers availability checks', async () => {
+		const resultInLibrary: SearchResult = {
+			...baseResult,
+			hash: 'hash2',
+		};
+		const hashAndProgress = { 'rd:hash2': 75 };
+		const { props } = renderComponent({
+			filteredResults: [resultInLibrary],
+			hashAndProgress,
+		});
+
+		await userEvent.click(screen.getByRole('button', { name: /RD \(75%\)/i }));
+		await waitFor(() => expect(props.deleteRd).toHaveBeenCalledWith('hash2'));
+
+		await userEvent.click(screen.getByRole('button', { name: /Check RD/i }));
+		await waitFor(() => expect(props.checkServiceAvailability).toHaveBeenCalled());
+	});
+
+	it('downloads magnets when the setting is enabled', async () => {
+		localStorage.setItem('settings:downloadMagnets', 'true');
+		renderComponent();
+
+		await userEvent.click(screen.getByRole('button', { name: /Download/i }));
+		expect(downloadSpy).toHaveBeenCalledWith('hash1');
+	});
+
+	describe('TB → RD button', () => {
+		const tbCachedResult: SearchResult = {
+			...baseResult,
+			tbAvailable: true,
+			pmAvailable: false,
+			rdAvailable: false,
+		};
+
+		it('shows when logged into both services and the result is TB-cached but not RD-cached', async () => {
+			const sendTbToRd = vi.fn().mockResolvedValue(undefined);
+			renderComponent({
+				torboxKey: 'tb-key',
+				sendTbToRd,
+				filteredResults: [tbCachedResult],
+			});
+
+			await userEvent.click(screen.getByRole('button', { name: /TB → RD/i }));
+			await waitFor(() => expect(sendTbToRd).toHaveBeenCalledWith('hash1'));
+		});
+
+		it('is hidden without a TorBox login', () => {
+			renderComponent({
+				torboxKey: null,
+				sendTbToRd: vi.fn(),
+				filteredResults: [tbCachedResult],
+			});
+
+			expect(screen.queryByRole('button', { name: /TB → RD/i })).toBeNull();
+		});
+
+		it('is hidden when the result is already RD-cached', () => {
+			renderComponent({
+				torboxKey: 'tb-key',
+				sendTbToRd: vi.fn(),
+				filteredResults: [{ ...tbCachedResult, rdAvailable: true }],
+			});
+
+			expect(screen.queryByRole('button', { name: /TB → RD/i })).toBeNull();
+		});
+
+		it('is hidden when the torrent is already in the RD library', () => {
+			renderComponent({
+				torboxKey: 'tb-key',
+				sendTbToRd: vi.fn(),
+				filteredResults: [tbCachedResult],
+				hashAndProgress: { 'rd:hash1': 100 },
+			});
+
+			expect(screen.queryByRole('button', { name: /TB → RD/i })).toBeNull();
+		});
+
+		it('still shows on an RD-blocked (infringing) name — the transfer de-infringes it', async () => {
+			const sendTbToRd = vi.fn().mockResolvedValue(undefined);
+			renderComponent({
+				torboxKey: 'tb-key',
+				sendTbToRd,
+				filteredResults: [
+					{ ...tbCachedResult, title: 'Some.Movie.2024.1080p.WEB-DL.x264-GRP' },
+				],
+			});
+
+			await userEvent.click(screen.getByRole('button', { name: /TB → RD/i }));
+			await waitFor(() => expect(sendTbToRd).toHaveBeenCalledWith('hash1'));
+		});
+	});
+
+	// AllDebrid is withdrawn as a transfer source. It answers `NO_SERVER` to the
+	// uploader hosts' addresses — debrid02 has 0 AllDebrid completions across its
+	// whole history — and `AUTH_BLOCKED` to most submitters' keys, which only the
+	// account owner can clear from an email they receive. Every transfer started
+	// here therefore failed, and failed as a terminal "uncached", which read as
+	// "this release does not exist".
+	describe('AD → RD button (withdrawn)', () => {
+		const adCachedResult: SearchResult = {
+			...baseResult,
+			adAvailable: true,
+			rdAvailable: false,
+		};
+
+		it('is gone even in the state that used to show it', () => {
+			renderComponent({
+				adKey: 'ad-key',
+				filteredResults: [adCachedResult],
+			});
+
+			expect(screen.queryByRole('button', { name: /AD → RD/i })).toBeNull();
+		});
+
+		it('leaves the TorBox transfer alone', () => {
+			renderComponent({
+				torboxKey: 'tb-key',
+				sendTbToRd: vi.fn(),
+				filteredResults: [{ ...baseResult, tbAvailable: true, rdAvailable: false }],
+			});
+
+			expect(screen.queryByRole('button', { name: /TB → RD/i })).not.toBeNull();
+		});
+	});
+
+	describe('size display', () => {
+		it('shows the debrid file size when the source reported none', () => {
+			// Peerflix-style result: filename as title, no size, then RD reports
+			// the real bytes via the availability check
+			renderComponent({
+				movieMaxSize: '0',
+				filteredResults: [
+					{
+						...baseResult,
+						title: 'Michael.2026.BDRemux.2160p.HDR-DV.mkv',
+						fileSize: 0,
+						rdAvailable: true,
+						videoCount: 1,
+						medianFileSize: 80 * 1024,
+						biggestFileSize: 80 * 1024,
+						files: [
+							{
+								fileId: 1,
+								filename: 'Michael.2026.BDRemux.2160p.HDR-DV.mkv',
+								filesize: 80 * 1024 * 1024 * 1024,
+							},
+						],
+					},
+				],
+			});
+
+			expect(screen.getByText(/80\.00 GB/)).toBeTruthy();
+			expect(screen.queryByText(/^0\.00 GB/)).toBeNull();
+		});
+
+		it('still shows 0.00 GB when nothing at all is known', () => {
+			renderComponent({
+				movieMaxSize: '0',
+				filteredResults: [
+					{
+						...baseResult,
+						fileSize: 0,
+						videoCount: 1,
+						medianFileSize: 0,
+						biggestFileSize: 0,
+						files: [],
+					},
+				],
+			});
+
+			expect(screen.getByText(/^0\.00 GB/)).toBeTruthy();
+		});
+	});
+
+	// The size line says each number once; the old wording stays in the tooltip.
+	describe('size line', () => {
+		it('shows a release with extras as biggest of total and keeps the wording in a tooltip', () => {
+			renderComponent({
+				movieMaxSize: '0',
+				filteredResults: [
+					{
+						...baseResult,
+						fileSize: 60 * 1024,
+						videoCount: 4,
+						biggestFileSize: 50 * 1024,
+					},
+				],
+			});
+
+			const chip = screen.getByText('4 videos').closest('span')!;
+			expect(chip).toHaveAttribute('title', 'With extras: 4 video files');
+			const size = screen.getByText('50.00 of 60.00 GB');
+			expect(size).toHaveAttribute('title', 'Total: 60.00 GB; Biggest: 50.00 GB');
+		});
+
+		it('shows a single-video release as one size', () => {
+			renderComponent({
+				movieMaxSize: '0',
+				filteredResults: [
+					{ ...baseResult, fileSize: 8 * 1024, videoCount: 1, biggestFileSize: 8 * 1024 },
+				],
+			});
+
+			expect(screen.getByText('1 video').closest('span')).toHaveAttribute(
+				'title',
+				'Single: one video file'
+			);
+			expect(screen.getByText('8.00 GB')).toHaveAttribute('title', 'Total: 8.00 GB');
+		});
+	});
+
+	// The action row reads left to right as "what each service can do", then the
+	// things that are not tied to a service. Watch used to sit inside the RD
+	// group, which made it look like an RD action when it picks its own service.
+	describe('action row grouping', () => {
+		const everywhere = {
+			...baseResult,
+			rdAvailable: false,
+			adAvailable: true,
+			tbAvailable: true,
+			pmAvailable: false,
+		};
+
+		const labelsInOrder = (container: HTMLElement) =>
+			Array.from(container.querySelectorAll('button')).map((b) =>
+				(b.textContent || '').replace(/\s+/g, ' ').trim()
+			);
+
+		const indexOfLabel = (labels: string[], needle: string) =>
+			labels.findIndex((l) => l.includes(needle));
+
+		it('orders provider buttons RD then AD then TB, ahead of the shared actions', () => {
+			const { container } = renderComponent({
+				rdKey: 'rd-key',
+				adKey: 'ad-key',
+				torboxKey: 'tb-key',
+				player: 'windows/vlc',
+				filteredResults: [everywhere],
+				sendTbToRd: vi.fn(),
+				handleCastAllDebrid: vi.fn(),
+				handleCastTorBox: vi.fn(),
+			});
+
+			const labels = labelsInOrder(container);
+			const rd = indexOfLabel(labels, 'Check RD');
+			const ad = indexOfLabel(labels, 'Instant AD');
+			const tb = indexOfLabel(labels, 'Instant TB');
+			const tbToRd = indexOfLabel(labels, 'TB \u2192 RD');
+			const watch = indexOfLabel(labels, 'Watch');
+			const copy = indexOfLabel(labels, 'Copy');
+
+			expect([rd, ad, tb, tbToRd, watch, copy].every((i) => i >= 0)).toBe(true);
+			// RD group, then AD group, then TB group
+			expect(rd).toBeLessThan(ad);
+			expect(ad).toBeLessThan(tb);
+			expect(tb).toBeLessThan(watch);
+			expect(tbToRd).toBeLessThan(watch);
+			// then the service-agnostic tail
+			expect(watch).toBeLessThan(copy);
+		});
+
+		// Each service's buttons sit in one group that wraps as a unit, so a
+		// service never splits across lines; the shared actions follow in the
+		// same row instead of under a rule.
+		it('groups each service and lets the shared actions follow in the same row', () => {
+			const { container } = renderComponent({
+				rdKey: 'rd-key',
+				adKey: 'ad-key',
+				torboxKey: 'tb-key',
+				player: 'windows/vlc',
+				filteredResults: [everywhere],
+				sendTbToRd: vi.fn(),
+				handleCastAllDebrid: vi.fn(),
+				handleCastTorBox: vi.fn(),
+			});
+
+			const groups = Array.from(container.querySelectorAll('[data-action-group]'));
+			expect(groups.map((g) => g.getAttribute('data-action-group'))).toEqual([
+				'rd',
+				'ad',
+				'tb',
+			]);
+			expect(groups[0].textContent).toContain('RD');
+			expect(groups[1].textContent).toContain('AD');
+			expect(groups[2].textContent).toContain('TB');
+			for (const g of groups) expect(g).toHaveClass('inline-flex');
+
+			const row = groups[0].parentElement!;
+			expect(row).toHaveClass('flex', 'flex-wrap');
+			const watch = screen.getByText('Watch').closest('button')!;
+			expect(watch.parentElement).toBe(row);
+			expect(Array.from(row.children).indexOf(watch)).toBeGreaterThan(
+				Array.from(row.children).indexOf(groups[2])
+			);
+		});
+
+		it('renders a group only for a service that is logged in', () => {
+			const { container } = renderComponent({
+				rdKey: 'rd-key',
+				adKey: null,
+				torboxKey: 'tb-key',
+				player: 'windows/vlc',
+				filteredResults: [everywhere],
+				sendTbToRd: vi.fn(),
+				handleCastTorBox: vi.fn(),
+			});
+
+			const groups = Array.from(container.querySelectorAll('[data-action-group]'));
+			expect(groups.map((g) => g.getAttribute('data-action-group'))).toEqual(['rd', 'tb']);
+		});
+
+		it('renders no service group when no service is logged in', () => {
+			const { container } = renderComponent({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				player: 'windows/vlc',
+				filteredResults: [everywhere],
+			});
+
+			expect(container.querySelector('[data-action-group]')).toBeNull();
+			expect(screen.getByText('Copy')).toBeTruthy();
+		});
+	});
+
+	describe('Premiumize watch', () => {
+		it('hands the Premiumize key to openWatch for a PM-cached result', async () => {
+			// The render-time and click-time service picks are two separate calls;
+			// leaving the key out of the second silently does nothing on click.
+			openWatchSpy.mockClear();
+			renderComponent({
+				rdKey: null,
+				premiumizeKey: 'pm-key',
+				player: 'windows/vlc',
+				filteredResults: [{ ...baseResult, rdAvailable: false, pmAvailable: true }],
+			});
+
+			await userEvent.click(screen.getByTitle('Watch via Premiumize'));
+
+			await waitFor(() => expect(openWatchSpy).toHaveBeenCalledTimes(1));
+			expect(openWatchSpy.mock.calls[0][0]).toMatchObject({
+				service: 'pm',
+				keys: expect.objectContaining({ premiumizeKey: 'pm-key' }),
+			});
+		});
+
+		it('offers no per-row Premiumize check button', () => {
+			// Page load already probes PM for every row with the same
+			// `cache/check` call a per-row button would repeat, so there is
+			// nothing left for it to find. RD has no such probe - its load-time
+			// answer is DMM's database - so its check button stays.
+			renderComponent({
+				rdKey: 'rd-key',
+				premiumizeKey: 'pm-key',
+				filteredResults: [{ ...baseResult, rdAvailable: false, pmAvailable: false }],
+			});
+
+			expect(screen.queryByRole('button', { name: /Check PM/i })).toBeNull();
+			expect(screen.getByRole('button', { name: /Check RD/i })).toBeTruthy();
+		});
+
+		it('offers no watch button when the user has no Premiumize key', () => {
+			renderComponent({
+				rdKey: null,
+				premiumizeKey: null,
+				player: 'windows/vlc',
+				filteredResults: [{ ...baseResult, rdAvailable: false, pmAvailable: true }],
+			});
+
+			expect(screen.queryByTitle('Watch via Premiumize')).toBeNull();
+		});
+	});
+	describe('Offcloud', () => {
+		it('adds and removes through the Offcloud handlers', async () => {
+			const { props } = renderComponent({
+				offcloudKey: 'oc-key',
+				filteredResults: [{ ...baseResult, ocAvailable: true }],
+			});
+
+			await userEvent.click(screen.getByRole('button', { name: /Instant OC/i }));
+			await waitFor(() => expect(props.addOc).toHaveBeenCalledWith('hash1'));
+		});
+
+		it('offers RM instead of add once the row is in the Offcloud library', async () => {
+			const { props } = renderComponent({
+				offcloudKey: 'oc-key',
+				hashAndProgress: { 'oc:hash1': 100 },
+			});
+
+			expect(screen.queryByRole('button', { name: /DL with OC/i })).toBeNull();
+			await userEvent.click(screen.getByRole('button', { name: /OC \(100%\)/i }));
+			await waitFor(() => expect(props.deleteOc).toHaveBeenCalledWith('hash1'));
+		});
+
+		it('styles the add button with a literal class, never an assembled one', () => {
+			// Tailwind drops `bg-${color}-900/30` from the build silently, so the
+			// three states are written out in full.
+			renderComponent({
+				offcloudKey: 'oc-key',
+				filteredResults: [{ ...baseResult, ocAvailable: true }],
+			});
+
+			const button = screen.getByRole('button', { name: /Instant OC/i });
+			expect(button.className).toContain('border-green-500');
+			expect(button.className).not.toContain('${');
+		});
+
+		it('offers no per-row Offcloud check button', () => {
+			// Page load already probes OC for every row with the same `/cache`
+			// call a per-row button would repeat, so there is nothing left for it
+			// to find - the same reason Premiumize's was removed in d3d6dd49.
+			renderComponent({
+				rdKey: 'rd-key',
+				offcloudKey: 'oc-key',
+				filteredResults: [{ ...baseResult, rdAvailable: false, ocAvailable: false }],
+			});
+
+			expect(screen.queryByRole('button', { name: /Check OC/i })).toBeNull();
+			expect(screen.getByRole('button', { name: /Check RD/i })).toBeTruthy();
+		});
+
+		it('hands the Offcloud key to openWatch for an OC-cached result', async () => {
+			// The render-time and click-time service picks are two separate calls;
+			// leaving the key out of the second silently does nothing on click.
+			openWatchSpy.mockClear();
+			renderComponent({
+				rdKey: null,
+				offcloudKey: 'oc-key',
+				player: 'windows/vlc',
+				filteredResults: [{ ...baseResult, rdAvailable: false, ocAvailable: true }],
+			});
+
+			await userEvent.click(screen.getByTitle('Watch via Offcloud'));
+
+			await waitFor(() => expect(openWatchSpy).toHaveBeenCalledTimes(1));
+			expect(openWatchSpy.mock.calls[0][0]).toMatchObject({
+				service: 'oc',
+				keys: expect.objectContaining({ offcloudKey: 'oc-key' }),
+			});
+		});
+
+		it('offers no watch button when the user has no Offcloud key', () => {
+			renderComponent({
+				rdKey: null,
+				offcloudKey: null,
+				player: 'windows/vlc',
+				filteredResults: [{ ...baseResult, rdAvailable: false, ocAvailable: true }],
+			});
+
+			expect(screen.queryByTitle('Watch via Offcloud')).toBeNull();
+		});
+
+		it('keeps an OC-only cached row when "only cached" is on', () => {
+			renderComponent({
+				onlyShowCached: true,
+				offcloudKey: 'oc-key',
+				filteredResults: [{ ...baseResult, rdAvailable: false, ocAvailable: true }],
+			});
+
+			expect(screen.getByText('Sample Movie')).toBeTruthy();
+		});
+	});
+
+	describe('Debrid-Link', () => {
+		it('offers the add button on a row with no availability flag set anywhere', async () => {
+			// The add button is offered whether or not the sweep marked the row:
+			// an unmarked row is one Debrid-Link was never asked about, or could
+			// not answer for, and adding it is still the user's call.
+			const { props } = renderComponent({
+				debridLinkKey: 'dl-key',
+				filteredResults: [{ ...baseResult }],
+			});
+
+			await userEvent.click(screen.getByRole('button', { name: /Add to DL/i }));
+			await waitFor(() => expect(props.addDl).toHaveBeenCalledWith('hash1'));
+		});
+
+		it('offers Check DL, because the probe mutates like RD and AD do', async () => {
+			// Debrid-Link's probe is a bare-hash add, so a hit puts the torrent
+			// in the user's library. That is why it is a button and not part of
+			// the page sweep: Premiumize's and Offcloud's probes add nothing and
+			// can run across every row, this one cannot.
+			const { props } = renderComponent({
+				rdKey: 'rd-key',
+				debridLinkKey: 'dl-key',
+				filteredResults: [{ ...baseResult, rdAvailable: false }],
+			});
+
+			await userEvent.click(screen.getByRole('button', { name: /Check DL/i }));
+			await waitFor(() =>
+				expect(props.checkServiceAvailability).toHaveBeenCalledWith(
+					expect.objectContaining({ hash: 'hash1' }),
+					['DL']
+				)
+			);
+		});
+
+		it('drops the check once the row is known cached, and shows Instant DL', () => {
+			renderComponent({
+				debridLinkKey: 'dl-key',
+				filteredResults: [{ ...baseResult, dlAvailable: true }],
+			});
+
+			expect(screen.queryByRole('button', { name: /Check DL/i })).toBeNull();
+			expect(screen.getByRole('button', { name: /Instant DL/i })).toBeTruthy();
+		});
+
+		it('offers RM instead of add once the row is in the Debrid-Link library', async () => {
+			const { props } = renderComponent({
+				debridLinkKey: 'dl-key',
+				hashAndProgress: { 'dl:hash1': 100 },
+			});
+
+			expect(screen.queryByRole('button', { name: /Add to DL/i })).toBeNull();
+			await userEvent.click(screen.getByRole('button', { name: /DL \(100%\)/i }));
+			await waitFor(() => expect(props.deleteDl).toHaveBeenCalledWith('hash1'));
+		});
+
+		it('styles the add button with a literal class, never an assembled one', () => {
+			// Tailwind drops `bg-${color}` from the build silently.
+			renderComponent({
+				debridLinkKey: 'dl-key',
+				filteredResults: [{ ...baseResult }],
+			});
+
+			const button = screen.getByRole('button', { name: /Add to DL/i });
+			expect(button.className).toContain('border-blue-500');
+			expect(button.className).not.toContain('${');
+		});
+
+		it('hands the Debrid-Link credential to openWatch for a row in its library', async () => {
+			// `pickWatchService` can never choose 'dl' - there is no flag - so the
+			// watch button is its own, gated on the row being in the account.
+			openWatchSpy.mockClear();
+			renderComponent({
+				rdKey: null,
+				debridLinkKey: 'dl-key',
+				player: 'windows/vlc',
+				hashAndProgress: { 'dl:hash1': 100 },
+			});
+
+			await userEvent.click(screen.getByTitle('Watch via Debrid-Link'));
+
+			await waitFor(() => expect(openWatchSpy).toHaveBeenCalledTimes(1));
+			expect(openWatchSpy.mock.calls[0][0]).toMatchObject({
+				service: 'dl',
+				keys: expect.objectContaining({ debridLinkKey: 'dl-key' }),
+			});
+		});
+
+		it('offers no watch button for a row Debrid-Link does not hold', () => {
+			renderComponent({
+				rdKey: null,
+				debridLinkKey: 'dl-key',
+				player: 'windows/vlc',
+				filteredResults: [{ ...baseResult }],
+			});
+
+			expect(screen.queryByTitle('Watch via Debrid-Link')).toBeNull();
+		});
+
+		it('renders nothing at all without a Debrid-Link credential', () => {
+			renderComponent({
+				debridLinkKey: null,
+				hashAndProgress: { 'dl:hash1': 100 },
+			});
+
+			expect(screen.queryByRole('button', { name: /Add to DL/i })).toBeNull();
+			expect(screen.queryByRole('button', { name: /DL \(100%\)/i })).toBeNull();
+		});
+
+		it('keeps a DL-only row visible when "only cached" is on', () => {
+			// It is in the user's Debrid-Link account, which is the only sense in
+			// which Debrid-Link can say a row is playable.
+			renderComponent({
+				onlyShowCached: true,
+				rdKey: null,
+				debridLinkKey: 'dl-key',
+				hashAndProgress: { 'dl:hash1': 100 },
+			});
+
+			expect(screen.getByText('Sample Movie')).toBeTruthy();
+		});
+	});
+
+	// A completed TB → RD transfer puts the content in RD under a *rewritten*
+	// hash: de-infringed filenames plus a per-attempt salt. This row's own hash
+	// still carries the blocked release name, so its Add button can only ever
+	// answer `451 infringing_file`. The badge that marks the transfer used to be
+	// an inert <span> telling people to "use its Instant RD result", which is how
+	// a working transfer read as a broken one.
+	describe('a row with a completed TB → RD transfer', () => {
+		const transferred: SearchResult = {
+			...baseResult,
+			tbAvailable: true,
+			tbTransferred: true,
+			tbTransferredHash: 'rewritten1',
+		};
+
+		it('adds the rewritten hash, never the row’s own blocked one', async () => {
+			const { props } = renderComponent({
+				filteredResults: [transferred],
+				torboxKey: 'tb-key',
+			});
+
+			await userEvent.click(screen.getByRole('button', { name: /Instant RD/i }));
+
+			await waitFor(() => expect(props.addRd).toHaveBeenCalledWith('rewritten1'));
+			expect(props.addRd).not.toHaveBeenCalledWith('hash1');
+		});
+
+		it('hides the redundant TB → RD button', () => {
+			renderComponent({ filteredResults: [transferred], torboxKey: 'tb-key' });
+
+			expect(screen.queryByRole('button', { name: /TB → RD/i })).toBeNull();
+		});
+
+		// Once the transferred copy is in the library there is nothing left to add,
+		// and the library state belongs to the rewritten hash, not to this row.
+		it('falls back to a static badge once the rewritten hash is in the library', () => {
+			renderComponent({
+				filteredResults: [transferred],
+				torboxKey: 'tb-key',
+				hashAndProgress: { 'rd:rewritten1': 100 },
+			});
+
+			expect(screen.queryByRole('button', { name: /Instant RD/i })).toBeNull();
+			expect(screen.getByText('In RD')).toBeTruthy();
+		});
+
+		// An older mapping recorded before the rewritten hash was carried through
+		// still marks the row; it must not render a button that adds `undefined`.
+		it('stays a static badge when no rewritten hash is known', () => {
+			renderComponent({
+				filteredResults: [{ ...transferred, tbTransferredHash: undefined }],
+				torboxKey: 'tb-key',
+			});
+
+			expect(screen.queryByRole('button', { name: /Instant RD/i })).toBeNull();
+			expect(screen.getByText('In RD')).toBeTruthy();
+		});
+	});
+});

@@ -1,0 +1,370 @@
+import { DatabaseClient } from './client';
+
+/**
+ * A Usenet → RD transfer produces a torrent that exists nowhere but Real-Debrid:
+ * nzb2rd builds it around a webseed, so it has no announce and no DHT presence,
+ * and its info hash cannot be known before the job finishes. There is no
+ * original torrent hash to key on either — the release only ever existed as an
+ * NZB — so transfers are keyed by the *indexer release id*, which is stable and
+ * unique per posting.
+ *
+ * That mapping lets any user (not just the browser that started the job) see
+ * that a release has already been fetched, and jump to the registered RD result
+ * instead of paying for the same Usenet download twice.
+ *
+ * Stored in the generic `Cache` KV table under an `nzbrd:` prefix, mirroring how
+ * DebridUploaderMapService stores TB → RD transfers — no migration needed.
+ */
+export type Nzb2rdTransferStatus = 'pending' | 'completed' | 'failed';
+
+export interface Nzb2rdTransferRecord {
+	releaseId: string;
+	jobId: string;
+	imdbId: string;
+	status: Nzb2rdTransferStatus;
+	/** The built torrent's hash. Only known once the job completes. */
+	infoHash?: string;
+	/**
+	 * Why the job failed, as nzb2rd reported it. Carried so the row can say what
+	 * went wrong rather than offering a bare Retry the user has no reason to
+	 * trust — most of these are actionable ("reconnect Real-Debrid"), and a
+	 * retry that repeats the same failure is worse than no button.
+	 */
+	error?: string;
+	title?: string;
+	updatedAt: number;
+}
+
+const KEY_PREFIX = 'nzbrd:';
+const keyFor = (releaseId: string) => `${KEY_PREFIX}${releaseId.toLowerCase()}`;
+
+/** Users waiting on someone else's in-flight job for this release. */
+const WAIT_PREFIX = 'nzbwait:';
+const waitKeyFor = (releaseId: string) => `${WAIT_PREFIX}${releaseId.toLowerCase()}`;
+
+export interface Nzb2rdWaiter {
+	/**
+	 * Real-Debrid access token, held only until the job completes.
+	 *
+	 * On its own this is not enough to deliver with: RD expires it 24 hours after
+	 * login and the job being waited on routinely takes days, so by the time
+	 * `takeWaiters` runs it is usually dead — and the delivery failure is caught
+	 * and logged, so the waiter silently receives nothing. Kept as the fallback
+	 * for entries queued before `oauth` existed.
+	 */
+	rdKey: string;
+	/** Long-lived credentials, so delivery can mint a token that actually works. */
+	oauth?: { clientId: string; clientSecret: string; refreshToken: string } | null;
+	imdbId: string;
+	queuedAt: number;
+}
+
+export class Nzb2rdMapService extends DatabaseClient {
+	async getTransfer(releaseId: string): Promise<Nzb2rdTransferRecord | null> {
+		const row = await this.prisma.cache.findUnique({ where: { key: keyFor(releaseId) } });
+		return row ? (row.value as unknown as Nzb2rdTransferRecord) : null;
+	}
+
+	async getTransfers(releaseIds: string[]): Promise<Nzb2rdTransferRecord[]> {
+		if (releaseIds.length === 0) return [];
+		const rows = await this.prisma.cache.findMany({
+			where: { key: { in: releaseIds.map(keyFor) } },
+		});
+		return rows.map((r) => r.value as unknown as Nzb2rdTransferRecord);
+	}
+
+	/**
+	 * Whether writing `next` would change what `existing` already says. Only
+	 * `updatedAt` is left out, since every write moves it.
+	 *
+	 * The transfers page is polled every 5 seconds and re-reports every failed
+	 * and completed Usenet row on the account each time, and the two recorders
+	 * used to write all of them back unchanged: 10,168 marker writes in ten
+	 * minutes on 2026-10-07, about 1,000 a minute, spread over 201 markers whose
+	 * status never moved.
+	 */
+	private static unchanged(
+		existing: Nzb2rdTransferRecord | null,
+		next: Nzb2rdTransferRecord
+	): boolean {
+		if (!existing) return false;
+		const fields: (keyof Nzb2rdTransferRecord)[] = [
+			'releaseId',
+			'jobId',
+			'imdbId',
+			'status',
+			'infoHash',
+			'error',
+			'title',
+		];
+		return fields.every((field) => (existing[field] ?? null) === (next[field] ?? null));
+	}
+
+	private async put(record: Nzb2rdTransferRecord): Promise<void> {
+		const value = { ...record, updatedAt: Date.now() } as unknown as object;
+		await this.prisma.cache.upsert({
+			where: { key: keyFor(record.releaseId) },
+			update: { value } as any,
+			create: { key: keyFor(record.releaseId), value } as any,
+		});
+	}
+
+	async recordPending(
+		releaseId: string,
+		jobId: string,
+		imdbId: string,
+		title?: string
+	): Promise<void> {
+		// Never downgrade a completed mapping back to pending.
+		const existing = await this.getTransfer(releaseId);
+		if (existing?.status === 'completed') return;
+		await this.put({
+			releaseId: releaseId.toLowerCase(),
+			jobId,
+			imdbId,
+			status: 'pending',
+			title,
+			updatedAt: Date.now(),
+		});
+	}
+
+	async recordCompleted(
+		releaseId: string,
+		jobId: string,
+		imdbId: string,
+		infoHash: string,
+		title?: string
+	): Promise<void> {
+		const next: Nzb2rdTransferRecord = {
+			releaseId: releaseId.toLowerCase(),
+			jobId,
+			imdbId,
+			status: 'completed',
+			infoHash: infoHash.toLowerCase(),
+			title,
+			updatedAt: Date.now(),
+		};
+		// Every poll of a completed row lands here again.
+		if (Nzb2rdMapService.unchanged(await this.getTransfer(releaseId), next)) return;
+		await this.put(next);
+	}
+
+	/**
+	 * Mark a release's job as failed, keeping the marker instead of dropping it.
+	 *
+	 * The marker used to be deleted here, which returned the row to a plain
+	 * "Send" — correct in that a resubmit is allowed (`isTransferStillValid`
+	 * answers false for a failed job), but it threw away the one thing worth
+	 * saying: this release was already tried and did not work. A `failed` marker
+	 * renders an enabled Retry carrying the reason, and never blocks the
+	 * resubmit, because every dedup path treats a non-`completed` marker as
+	 * something to re-check against nzb2rd rather than a veto.
+	 *
+	 * The waiter list still goes, exactly as `removeTransfer` drops it: those
+	 * accounts queued behind a job that will never deliver, and their stored
+	 * Real-Debrid credentials must not outlive it.
+	 *
+	 * Only a change is written. The transfers page re-reports a failed row every
+	 * 5 seconds for as long as it is listed, so an unchanged failure is the
+	 * common case, and so is a failure of a job the marker no longer follows: a
+	 * Retry records its new job here while the old failed row stays on the page.
+	 * Writing that one put the old failure back over the retry's `pending`
+	 * marker on every poll and dropped the retry's waiters with it. On
+	 * 2026-10-07, 11 releases read `failed` for an old job while their newest
+	 * job was still in nzb2rd's queue.
+	 */
+	async recordFailed(
+		releaseId: string,
+		jobId: string,
+		imdbId: string,
+		error?: string,
+		title?: string
+	): Promise<void> {
+		// A completed fetch stays completed: the content is in RD regardless of
+		// what a later job for the same release did.
+		const existing = await this.getTransfer(releaseId);
+		if (existing?.status === 'completed') return;
+		if (existing && existing.jobId !== jobId) return;
+		const next: Nzb2rdTransferRecord = {
+			releaseId: releaseId.toLowerCase(),
+			jobId,
+			// Callers that only ever handled the job (the poll route) know the id
+			// from nzb2rd's own record; the marker already holds it either way.
+			imdbId: imdbId || existing?.imdbId || '',
+			status: 'failed',
+			error,
+			title: title ?? existing?.title,
+			updatedAt: Date.now(),
+		};
+		if (Nzb2rdMapService.unchanged(existing, next)) return;
+		await this.put(next);
+		await this.clearWaiters(releaseId);
+	}
+
+	/**
+	 * Drop a release's marker and anyone waiting on it, when the marker follows
+	 * `jobId`.
+	 *
+	 * A marker that follows another job is left alone. A Retry records its new
+	 * job here while the old failed row stays on the Transfers page, and clearing
+	 * that row, usually seconds after the retry, used to delete the retry's
+	 * marker and its waiters: on 2026-10-10, 33 releases had a retry queued in
+	 * nzb2rd and no marker, so every account was offered a second fetch of it.
+	 *
+	 * `deleteMany`, not `delete`, here and in `clearWaiters`: finding nothing to
+	 * remove is the ordinary case (a cancel for a release that was never
+	 * recorded, a waiter list nobody joined), and `delete` answers that with
+	 * P2025, which Prisma prints from its own error log even when the caller
+	 * catches it. Re-recording failed rows on every 5-second transfers poll made
+	 * that about half of everything dmm_web logged on 2026-10-07. A real
+	 * database error still throws.
+	 */
+	async removeTransfer(releaseId: string, jobId: string): Promise<void> {
+		const existing = await this.getTransfer(releaseId);
+		if (existing && existing.jobId !== jobId) return;
+		await this.prisma.cache.deleteMany({ where: { key: keyFor(releaseId) } });
+		await this.clearWaiters(releaseId);
+	}
+
+	// --- waiters -------------------------------------------------------------
+	//
+	// A second user asking for a release that is already being fetched must not
+	// start a duplicate Usenet download, but they should still end up with the
+	// content. So they are parked here, and the completion path adds the finished
+	// torrent to each of their accounts — cheap, because by then Real-Debrid has
+	// it cached and the add resolves instantly.
+	//
+	// Their access token is what makes that possible, so it lives here until the
+	// job finishes and is deleted the moment it is used. Kept under a separate
+	// key so the transfer record's own writes can never clobber the list.
+
+	/** Bounded so a popular release cannot grow one row without limit. */
+	static readonly MAX_WAITERS = 50;
+
+	async addWaiter(
+		releaseId: string,
+		rdKey: string,
+		imdbId: string,
+		oauth?: Nzb2rdWaiter['oauth']
+	): Promise<void> {
+		const key = waitKeyFor(releaseId);
+		try {
+			const existing = await this.getWaiters(releaseId);
+			// One entry per account: re-asking should not queue a second add.
+			if (existing.some((w) => w.rdKey === rdKey)) return;
+			const waiters = [
+				...existing,
+				{ rdKey, oauth: oauth ?? null, imdbId, queuedAt: Date.now() },
+			].slice(-Nzb2rdMapService.MAX_WAITERS);
+			const value = { waiters } as unknown as object;
+			await this.prisma.cache.upsert({
+				where: { key },
+				update: { value } as any,
+				create: { key, value } as any,
+			});
+		} catch (error) {
+			console.error('Error queueing nzb2rd waiter:', error);
+		}
+	}
+
+	async getWaiters(releaseId: string): Promise<Nzb2rdWaiter[]> {
+		try {
+			const row = await this.prisma.cache.findUnique({
+				where: { key: waitKeyFor(releaseId) },
+			});
+			const value = row?.value as unknown as { waiters?: unknown } | undefined;
+			return Array.isArray(value?.waiters) ? (value!.waiters as Nzb2rdWaiter[]) : [];
+		} catch (error) {
+			console.error('Error reading nzb2rd waiters:', error);
+			return [];
+		}
+	}
+
+	async clearWaiters(releaseId: string): Promise<void> {
+		await this.prisma.cache.deleteMany({ where: { key: waitKeyFor(releaseId) } });
+	}
+
+	/**
+	 * Every waiter list, longest untouched first, for the cron to settle.
+	 *
+	 * There are only ever a handful (3 on 2026-10-07, against 8000 markers),
+	 * because a list exists only while a second account waits on a job in flight.
+	 * `updatedAt` is carried so a prune can tell whether someone joined since.
+	 */
+	async listWaiterLists(
+		limit: number
+	): Promise<{ releaseId: string; waiters: Nzb2rdWaiter[]; updatedAt: Date }[]> {
+		const rows = await this.prisma.cache.findMany({
+			where: { key: { startsWith: WAIT_PREFIX } },
+			orderBy: { updatedAt: 'asc' },
+			take: limit,
+		});
+		return rows.map((row) => {
+			const value = row.value as unknown as { waiters?: unknown } | null;
+			return {
+				releaseId: row.key.slice(WAIT_PREFIX.length),
+				waiters: Array.isArray(value?.waiters) ? (value!.waiters as Nzb2rdWaiter[]) : [],
+				updatedAt: row.updatedAt,
+			};
+		});
+	}
+
+	/**
+	 * Keep only `keep` of a release's waiters, if the list is still the one read
+	 * at `seen`. Answers false, changing nothing, when someone joined in between:
+	 * rewriting the list then would drop them, so the next tick decides instead.
+	 */
+	async pruneWaiters(releaseId: string, keep: Nzb2rdWaiter[], seen: Date): Promise<boolean> {
+		const where = { key: waitKeyFor(releaseId), updatedAt: seen };
+		const { count } =
+			keep.length === 0
+				? await this.prisma.cache.deleteMany({ where })
+				: await this.prisma.cache.updateMany({
+						where,
+						data: { value: { waiters: keep } as unknown as object },
+					});
+		return count > 0;
+	}
+
+	/**
+	 * A random handful of `pending` markers, for the cron to check against nzb2rd.
+	 *
+	 * Random rather than oldest-first: a marker whose job is still in line is left
+	 * exactly as it was, so an ordered read would hand the same live jobs to every
+	 * tick and never reach the stale ones behind them. On 2026-10-07 nzb2rd's
+	 * queue was 23 days deep and 450 of 942 `pending` markers were still live.
+	 */
+	async samplePendingMarkers(limit: number): Promise<Nzb2rdTransferRecord[]> {
+		const rows = await this.prisma.$queryRaw<{ key: string }[]>`
+			SELECT \`key\` FROM Cache
+			WHERE \`key\` LIKE 'nzbrd:%'
+			  AND JSON_UNQUOTE(JSON_EXTRACT(value, '$.status')) = 'pending'
+			ORDER BY RAND()
+			LIMIT ${limit}`;
+		if (rows.length === 0) return [];
+		const markers = await this.prisma.cache.findMany({
+			where: { key: { in: rows.map((row) => row.key) } },
+		});
+		return markers
+			.map((row) => row.value as unknown as Nzb2rdTransferRecord)
+			.filter((record) => record?.status === 'pending');
+	}
+
+	/**
+	 * Read the waiters and drop them in one step, so a second poll landing at the
+	 * same moment cannot add the same torrent to the same account twice.
+	 *
+	 * The delete is the claim. Two polls of a finished job can both read the list
+	 * before either drops it; both used to deliver, because the second delete's
+	 * P2025 was swallowed. Only the poll whose delete removed the row hands the
+	 * list out now.
+	 */
+	async takeWaiters(releaseId: string): Promise<Nzb2rdWaiter[]> {
+		const waiters = await this.getWaiters(releaseId);
+		if (waiters.length === 0) return [];
+		const { count } = await this.prisma.cache.deleteMany({
+			where: { key: waitKeyFor(releaseId) },
+		});
+		return count > 0 ? waiters : [];
+	}
+}

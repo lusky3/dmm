@@ -1,12 +1,23 @@
-import { getAllDebridUser } from '@/services/allDebrid';
-import { getCurrentUser as getRealDebridUser, getToken } from '@/services/realDebrid';
-import { TraktUser, getTraktUser } from '@/services/trakt';
-import { clearRdKeys } from '@/utils/clearLocalStorage';
 import { useRouter } from 'next/router';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { getAllDebridUser } from '../services/allDebrid';
+import {
+	BAD_TOKEN,
+	getDebridLinkAccountInfo,
+	type DebridLinkAccountInfo,
+} from '../services/debridLink';
+import { refreshDebridLinkToken } from '../services/debridLinkOAuth';
+import { getOffcloudAccountInfo, type OffcloudAccountInfo } from '../services/offcloud';
+import { getPremiumizeAccountInfo, type PremiumizeAccountInfo } from '../services/premiumize';
+import { getCurrentUser as getRealDebridUser, getToken } from '../services/realDebrid';
+import { TorBoxUser, getUserData } from '../services/torbox';
+import { TraktUser, getTraktUser } from '../services/trakt';
+import { clearDlKeys, clearRdKeys } from '../utils/clearLocalStorage';
+import { readStoredAccessToken } from '../utils/rdTokenStorage';
+import { getSafeRedirectPath } from '../utils/router';
 import useLocalStorage from './localStorage';
 
-interface RealDebridUser {
+export interface RealDebridUser {
 	id: number;
 	username: string;
 	email: string;
@@ -18,7 +29,30 @@ interface RealDebridUser {
 	expiration: string;
 }
 
-interface AllDebridUser {
+/**
+ * Premiumize has no profile endpoint - `account/info` is all there is, and it
+ * carries no username or email. `customer_id` is the only identifier, and it is
+ * also half of the WebDAV/NNTP credential pair, so it is shown but never
+ * treated as a secret (it is embedded in every CDN link the account mints).
+ */
+export type PremiumizeUser = PremiumizeAccountInfo;
+
+/**
+ * `account/info` is Offcloud's entire introspection surface: an email, a
+ * user id, `is_premium` and a `YYYY-MM-DD` expiry. No bandwidth counter, no
+ * quota, no plan name. The `user_id` is also the customer segment embedded in
+ * every CDN link the account mints, so it is shown rather than hidden.
+ */
+export type OffcloudUser = OffcloudAccountInfo;
+
+/**
+ * `account/infos` carries a real username and a masked email, plus
+ * `accountType` (0 free / 1 premium) and `premiumLeft` in **seconds** - not a
+ * timestamp, which is the one field here it is easy to render as 1970.
+ */
+export type DebridLinkUser = DebridLinkAccountInfo;
+
+export interface AllDebridUser {
 	username: string;
 	email: string;
 	isPremium: boolean;
@@ -30,53 +64,552 @@ interface AllDebridUser {
 	fidelityPoints: number;
 }
 
-export const useDebridLogin = () => {
-	const router = useRouter();
-
-	const loginWithRealDebrid = async () => {
-		await router.push('/realdebrid/login');
-	};
-
-	const loginWithAllDebrid = async () => {
-		await router.push('/alldebrid/login');
-	};
-
-	return {
-		loginWithRealDebrid,
-		loginWithAllDebrid,
-	};
+const initialRealDebridState = {
+	user: null as RealDebridUser | null,
+	error: null as Error | null,
+	loading: true,
+	hasAuth: false,
+	isInitialized: false,
+	isRefreshing: false,
+	subscribers: new Set<() => void>(),
+	/** shared across consumers so concurrent mounts await one auth, not one each */
+	inflight: null as Promise<void> | null,
+	refreshTimer: null as ReturnType<typeof setTimeout> | null,
 };
 
-export const useRealDebridAccessToken = (): [string | null, boolean] => {
+// Global singleton state for RealDebrid to prevent duplicate calls
+let globalRealDebridState = { ...initialRealDebridState };
+
+// Renew this long before the token actually expires
+const REFRESH_MARGIN_MS = 5 * 60 * 1000;
+// setTimeout is unreliable over very long waits, and a sleeping machine can
+// overshoot it entirely - re-check at least this often
+const MAX_REFRESH_DELAY_MS = 30 * 60 * 1000;
+// Floor, so a token whose whole lifetime is under the margin renews on a sane
+// cadence instead of rescheduling itself with no delay
+const MIN_REFRESH_DELAY_MS = 30 * 1000;
+
+const clearRefreshTimer = () => {
+	if (globalRealDebridState.refreshTimer) {
+		clearTimeout(globalRealDebridState.refreshTimer);
+		globalRealDebridState.refreshTimer = null;
+	}
+};
+
+// Simplified hook that handles RealDebrid auth
+const useRealDebrid = () => {
+	const [user, setUser] = useState<RealDebridUser | null>(globalRealDebridState.user);
+	const [error, setError] = useState<Error | null>(globalRealDebridState.error);
+	const [loading, setLoading] = useState(globalRealDebridState.loading);
+	const [isRefreshing, setIsRefreshing] = useState(globalRealDebridState.isRefreshing);
+	const [token, setToken] = useLocalStorage<string>('rd:accessToken');
 	const [clientId] = useLocalStorage<string>('rd:clientId');
 	const [clientSecret] = useLocalStorage<string>('rd:clientSecret');
 	const [refreshToken] = useLocalStorage<string>('rd:refreshToken');
-	const [accessToken, setAccessToken] = useLocalStorage<string>('rd:accessToken');
-	const [loading, setLoading] = useState<boolean>(true);
 
 	useEffect(() => {
-		(async () => {
-			if (!accessToken && refreshToken && clientId && clientSecret) {
+		const updateState = () => {
+			setUser(globalRealDebridState.user);
+			setError(globalRealDebridState.error);
+			setLoading(globalRealDebridState.loading);
+			setIsRefreshing(globalRealDebridState.isRefreshing);
+		};
+
+		// Subscribe to global state changes
+		globalRealDebridState.subscribers.add(updateState);
+		return () => {
+			globalRealDebridState.subscribers.delete(updateState);
+		};
+	}, []);
+
+	useEffect(() => {
+		let isMounted = true;
+		let retryTimeout: ReturnType<typeof setTimeout> | null = null;
+
+		const isAuthError = (e: unknown) => {
+			const status = (e as any)?.response?.status;
+			return status === 401 || status === 403;
+		};
+
+		/**
+		 * Renew the access token shortly before it expires. Without this the token
+		 * simply lapsed mid-session: the auth effect only depends on the OAuth
+		 * credentials, which never change, so nothing re-ran and every Real-Debrid
+		 * call failed until the page was reloaded.
+		 */
+		const scheduleRefresh = () => {
+			clearRefreshTimer();
+			const stored = readStoredAccessToken();
+			// no expiry recorded (plain API token) - nothing to renew
+			if (!stored?.expiry) return;
+
+			const untilExpiry = stored.expiry - Date.now();
+			// Short-lived tokens can't honour the full margin; renew halfway instead
+			const target =
+				untilExpiry > REFRESH_MARGIN_MS ? untilExpiry - REFRESH_MARGIN_MS : untilExpiry / 2;
+			const delay = Math.min(Math.max(target, MIN_REFRESH_DELAY_MS), MAX_REFRESH_DELAY_MS);
+
+			globalRealDebridState.refreshTimer = setTimeout(async () => {
+				globalRealDebridState.refreshTimer = null;
+				const current = readStoredAccessToken();
+				// still comfortably valid (long sleep, or another tab renewed it)
+				if (current?.expiry && current.expiry - Date.now() > REFRESH_MARGIN_MS) {
+					scheduleRefresh();
+					return;
+				}
+				if (!refreshToken || !clientId || !clientSecret) return;
 				try {
-					// Refresh token is available, so try to get new tokens
-					const response = await getToken(clientId, clientSecret, refreshToken);
-					if (response) {
-						// New tokens obtained, save them and return authenticated
-						const { access_token, expires_in } = response;
-						setAccessToken(access_token, expires_in);
-					} else {
-						throw new Error('Unable to get proper response');
+					const { access_token, expires_in } = await getToken(
+						clientId,
+						clientSecret,
+						refreshToken
+					);
+					setToken(access_token, expires_in);
+					globalRealDebridState.error = null;
+					globalRealDebridState.subscribers.forEach((fn) => fn());
+				} catch (e) {
+					console.error('[Auth] scheduled RealDebrid refresh failed', e);
+					if (isAuthError(e)) {
+						clearRdKeys();
+						return;
 					}
-				} catch (error) {
-					clearRdKeys();
+				}
+				scheduleRefresh();
+			}, delay);
+		};
+
+		const auth = async (attempt = 0): Promise<void> => {
+			// Prevent duplicate initialization globally, but allow retry if no user yet
+			if (globalRealDebridState.isInitialized && globalRealDebridState.user) {
+				return;
+			}
+
+			if (!refreshToken || !clientId || !clientSecret) {
+				clearRefreshTimer();
+
+				if (token) {
+					// A pasted API key is a complete login on its own: there are
+					// no OAuth credentials to exchange and nothing to renew, so
+					// the only open question is whether Real-Debrid still takes
+					// it. Without this branch the token worked everywhere that
+					// reads it directly while the profile stayed empty.
+					globalRealDebridState.isInitialized = true;
+					try {
+						const user = await getRealDebridUser(token);
+						if (!isMounted) return;
+						globalRealDebridState.user = user as RealDebridUser;
+						globalRealDebridState.error = null;
+						globalRealDebridState.hasAuth = true;
+					} catch (e) {
+						if (!isMounted) return;
+						console.error('RealDebrid auth error:', e);
+						if (isAuthError(e)) clearRdKeys();
+						globalRealDebridState.user = null;
+						globalRealDebridState.hasAuth = false;
+						globalRealDebridState.isInitialized = false;
+						globalRealDebridState.error = isAuthError(e) ? null : (e as Error);
+					}
+					globalRealDebridState.loading = false;
+					globalRealDebridState.subscribers.forEach((fn) => fn());
+					return;
+				}
+
+				// Credentials are gone (logout, or a switch to another account).
+				// The user object outlived them before, so useCurrentUser kept
+				// reporting the previous account until a full reload.
+				globalRealDebridState.user = null;
+				globalRealDebridState.hasAuth = false;
+				globalRealDebridState.isInitialized = false;
+				globalRealDebridState.error = null;
+				globalRealDebridState.loading = false;
+				globalRealDebridState.subscribers.forEach((fn) => fn());
+				return;
+			}
+
+			globalRealDebridState.isInitialized = true;
+
+			try {
+				// Try current token first
+				if (token) {
+					try {
+						const user = await getRealDebridUser(token);
+						if (isMounted) {
+							globalRealDebridState.user = user as RealDebridUser;
+							globalRealDebridState.error = null;
+							globalRealDebridState.loading = false;
+							globalRealDebridState.hasAuth = true;
+							globalRealDebridState.subscribers.forEach((fn) => fn());
+							scheduleRefresh();
+						}
+						return;
+					} catch {
+						// Token invalid, will refresh
+					}
+				}
+
+				// Get new token
+				globalRealDebridState.isRefreshing = true;
+				globalRealDebridState.subscribers.forEach((fn) => fn());
+
+				const { access_token, expires_in } = await getToken(
+					clientId,
+					clientSecret,
+					refreshToken
+				);
+
+				if (isMounted) {
+					setToken(access_token, expires_in);
+					const user = await getRealDebridUser(access_token);
+					globalRealDebridState.user = user as RealDebridUser;
+					globalRealDebridState.error = null;
+					globalRealDebridState.hasAuth = true;
+					globalRealDebridState.subscribers.forEach((fn) => fn());
+					scheduleRefresh();
+				}
+			} catch (e) {
+				if (isMounted) {
+					console.error('RealDebrid auth error:', e);
+					if (isAuthError(e)) {
+						clearRdKeys();
+					} else if (attempt < 3) {
+						// Retry with exponential backoff for transient errors
+						const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+						globalRealDebridState.isInitialized = false;
+						retryTimeout = setTimeout(() => {
+							if (isMounted) {
+								auth(attempt + 1);
+							}
+						}, delay);
+						return; // Keep loading/refreshing state active during retry
+					}
+					globalRealDebridState.error = e as Error;
+					globalRealDebridState.user = null;
+					globalRealDebridState.hasAuth = false;
+					globalRealDebridState.isInitialized = false;
 				}
 			}
-			setLoading(false);
-		})();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [clientId, clientSecret, refreshToken]);
 
-	return [accessToken, loading];
+			if (isMounted) {
+				globalRealDebridState.loading = false;
+				globalRealDebridState.isRefreshing = false;
+				globalRealDebridState.subscribers.forEach((fn) => fn());
+			}
+		};
+
+		// Consumers mount in the same commit, and the isInitialized guard only
+		// closes once `user` is set - i.e. after the first await - so each of them
+		// used to start its own auth. Share the in-flight run instead.
+		if (globalRealDebridState.inflight) {
+			void globalRealDebridState.inflight;
+		} else {
+			const run = auth().finally(() => {
+				globalRealDebridState.inflight = null;
+			});
+			globalRealDebridState.inflight = run;
+			void run;
+		}
+
+		return () => {
+			isMounted = false;
+			if (retryTimeout) clearTimeout(retryTimeout);
+		};
+		// `token` is watched for the API-key login, which writes nothing else:
+		// with only the OAuth credentials here, a pasted key sat unvalidated
+		// until the next full reload.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [refreshToken, clientId, clientSecret, token]);
+
+	return { user, error, loading, isRefreshing, hasAuth: !!token };
+};
+
+export const __resetRealDebridStateForTests = () => {
+	clearRefreshTimer();
+	globalRealDebridState = {
+		...initialRealDebridState,
+		subscribers: new Set(),
+	};
+};
+
+// Separate hooks for other services
+const useAllDebrid = () => {
+	const [user, setUser] = useState<AllDebridUser | null>(null);
+	const [error, setError] = useState<Error | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [token] = useLocalStorage<string>('ad:apiKey');
+
+	useEffect(() => {
+		if (!token) {
+			return;
+		}
+
+		let isMounted = true;
+		setLoading(true);
+		getAllDebridUser(token)
+			.then((user) => {
+				if (!isMounted) return;
+				setUser(user as AllDebridUser);
+				setError(null);
+				setLoading(false);
+			})
+			.catch((e) => {
+				if (!isMounted) return;
+				setError(e as Error);
+				setLoading(false);
+			});
+		return () => {
+			isMounted = false;
+		};
+	}, [token]);
+
+	return { user, error, hasAuth: !!token, loading };
+};
+
+const useTorBox = () => {
+	const [user, setUser] = useState<TorBoxUser | null>(null);
+	const [error, setError] = useState<Error | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [token] = useLocalStorage<string>('tb:apiKey');
+
+	useEffect(() => {
+		if (!token) {
+			return;
+		}
+
+		let isMounted = true;
+		setLoading(true);
+		getUserData(token)
+			.then((response) => {
+				if (!isMounted) return;
+				if (response.success) {
+					setUser(response.data);
+					setError(null);
+				} else {
+					// TorBox answers a rejected key with HTTP 200 and
+					// success:false, so this never reaches the catch. Leaving it
+					// unset left the hook neither loaded nor errored - a state
+					// the home page could not tell from "still loading".
+					setUser(null);
+					setError(new Error(response.detail || 'TorBox profile unavailable'));
+				}
+				setLoading(false);
+			})
+			.catch((e) => {
+				if (!isMounted) return;
+				setError(e as Error);
+				setLoading(false);
+			});
+		return () => {
+			isMounted = false;
+		};
+	}, [token]);
+
+	return { user, error, hasAuth: !!token, loading };
+};
+
+const usePremiumize = () => {
+	const [user, setUser] = useState<PremiumizeUser | null>(null);
+	const [error, setError] = useState<Error | null>(null);
+	const [loading, setLoading] = useState(false);
+	const token = usePremiumizeCredential();
+
+	useEffect(() => {
+		if (!token) {
+			return;
+		}
+
+		let isMounted = true;
+		setLoading(true);
+		getPremiumizeAccountInfo(token)
+			.then((info) => {
+				if (!isMounted) return;
+				setUser(info);
+				setError(null);
+				setLoading(false);
+			})
+			.catch((e) => {
+				if (!isMounted) return;
+				setError(e as Error);
+				setLoading(false);
+			});
+		return () => {
+			isMounted = false;
+		};
+	}, [token]);
+
+	return { user, error, hasAuth: !!token, loading };
+};
+
+const useOffcloud = () => {
+	const [user, setUser] = useState<OffcloudUser | null>(null);
+	const [error, setError] = useState<Error | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [token] = useLocalStorage<string>('oc:apiKey');
+
+	useEffect(() => {
+		if (!token) {
+			return;
+		}
+
+		let isMounted = true;
+		setLoading(true);
+		getOffcloudAccountInfo(token)
+			.then((info) => {
+				if (!isMounted) return;
+				setUser(info);
+				setError(null);
+				setLoading(false);
+			})
+			.catch((e) => {
+				if (!isMounted) return;
+				setError(e as Error);
+				setLoading(false);
+			});
+		return () => {
+			isMounted = false;
+		};
+	}, [token]);
+
+	return { user, error, hasAuth: !!token, loading };
+};
+
+/**
+ * How close to expiry a stored Debrid-Link access token has to be before it is
+ * renewed. Wide on purpose: the renewal is a single call made once per mount,
+ * so being early costs one request and being late costs the session.
+ */
+const DL_REFRESH_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+const useDebridLink = () => {
+	const [user, setUser] = useState<DebridLinkUser | null>(null);
+	const [error, setError] = useState<Error | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [accessToken, setAccessToken] = useLocalStorage<string>('dl:accessToken');
+	const [refreshToken] = useLocalStorage<string>('dl:refreshToken');
+	const [tokenExpiry, setTokenExpiry] = useLocalStorage<number>('dl:tokenExpiry');
+	const [apiKey] = useLocalStorage<string>('dl:apiKey');
+	const token = accessToken || apiKey;
+	const refreshAttempted = useRef(false);
+
+	/**
+	 * Lazy, single-shot renewal - no timers, no scheduler, no global state.
+	 *
+	 * Debrid-Link's real `expires_in` has not been measured yet (plex_debrid
+	 * never refreshes and keeps working, which hints at a long life but proves
+	 * nothing), so this refreshes only when the token actually carried an
+	 * expiry and that expiry is close. If a device-flow mint turns out to last
+	 * years, `dl:tokenExpiry` is simply never near and this never fires; if it
+	 * lasts days, one call on mount covers it. The alternative - Real-Debrid's
+	 * timer machinery - is what put a 24h token into queues that hold jobs for
+	 * days, and it is not worth importing here on a guess.
+	 */
+	useEffect(() => {
+		if (refreshAttempted.current) return;
+		if (!accessToken || !refreshToken || !tokenExpiry) return;
+		if (tokenExpiry - Date.now() > DL_REFRESH_WINDOW_MS) return;
+
+		refreshAttempted.current = true;
+		let isMounted = true;
+		refreshDebridLinkToken(refreshToken)
+			.then((fresh) => {
+				if (!isMounted) return;
+				setAccessToken(fresh.access_token);
+				if (typeof fresh.expires_in === 'number') {
+					setTokenExpiry(Date.now() + fresh.expires_in * 1000);
+				}
+			})
+			.catch((e) => {
+				// Not fatal on its own: the stored token may still be good, and
+				// the profile call below is what settles whether it is.
+				console.error('[Auth] Debrid-Link token refresh failed', e);
+			});
+		return () => {
+			isMounted = false;
+		};
+		// The localStorage setters are new identities on every render; including
+		// them would re-run this effect constantly for nothing.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [accessToken, refreshToken, tokenExpiry]);
+
+	useEffect(() => {
+		if (!token) {
+			return;
+		}
+
+		let isMounted = true;
+		setLoading(true);
+		getDebridLinkAccountInfo(token)
+			.then((info) => {
+				if (!isMounted) return;
+				setUser(info);
+				setError(null);
+				setLoading(false);
+			})
+			.catch((e) => {
+				if (!isMounted) return;
+				// `badToken` is returned for an absent, malformed and expired
+				// token alike, and by this point the refresh above has already
+				// had its one chance. Drop the credentials so withAuth routes
+				// the user to the login page instead of leaving a dead session
+				// that fails every call it makes.
+				if ((e as { code?: string })?.code === BAD_TOKEN) {
+					clearDlKeys();
+					setUser(null);
+					setError(null);
+					setLoading(false);
+					return;
+				}
+				setError(e as Error);
+				setLoading(false);
+			});
+		return () => {
+			isMounted = false;
+		};
+	}, [token]);
+
+	return { user, error, hasAuth: !!token, loading };
+};
+
+const useTrakt = () => {
+	const [user, setUser] = useState<TraktUser | null>(null);
+	const [error, setError] = useState<Error | null>(null);
+	const [loading, setLoading] = useState(false);
+	const [token] = useLocalStorage<string>('trakt:accessToken');
+	const [_, setUserSlug] = useLocalStorage<string>('trakt:userSlug');
+
+	useEffect(() => {
+		if (!token) {
+			return;
+		}
+
+		let isMounted = true;
+		setLoading(true);
+		getTraktUser(token)
+			.then((user) => {
+				if (!isMounted) return;
+				setUser(user);
+				setUserSlug(user.user.ids.slug);
+				setError(null);
+				setLoading(false);
+			})
+			.catch((e) => {
+				if (!isMounted) return;
+				setError(e as Error);
+				setLoading(false);
+			});
+		return () => {
+			isMounted = false;
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [token]);
+
+	return { user, error, hasAuth: !!token, loading };
+};
+
+// Backward compatibility hook for withAuth.tsx
+export const useRealDebridAccessToken = (): [string | null, boolean, boolean] => {
+	const { loading, isRefreshing } = useRealDebrid();
+	const [token] = useLocalStorage<string>('rd:accessToken');
+	return [token, loading, isRefreshing];
 };
 
 export const useAllDebridApiKey = () => {
@@ -84,56 +617,118 @@ export const useAllDebridApiKey = () => {
 	return apiKey;
 };
 
-function removeToken(service: string) {
-	window.localStorage.removeItem(`${service}:accessToken`);
-	window.location.reload();
-}
+export const useTorBoxAccessToken = () => {
+	const [apiKey] = useLocalStorage<string>('tb:apiKey');
+	return apiKey;
+};
 
+/**
+ * The credential to put in a Premiumize `Authorization: Bearer` header.
+ *
+ * Either an OAuth access token (`pm:accessToken`, from the device-code login) or
+ * a manually pasted API key (`pm:apiKey`). They are **not** interchangeable
+ * beyond that header, which is why they are stored apart: the API key is also
+ * the user's WebDAV and Usenet password, and the OAuth token is not (verified -
+ * WebDAV answers 401 for a token and 207 for a key). Anything that ever needs
+ * WebDAV credentials must read `pm:apiKey` specifically, never this.
+ *
+ * The token wins when both exist, because it is the narrower credential.
+ */
+export const usePremiumizeCredential = () => {
+	const [accessToken] = useLocalStorage<string>('pm:accessToken');
+	const [apiKey] = useLocalStorage<string>('pm:apiKey');
+	return accessToken || apiKey;
+};
+
+/**
+ * Offcloud has one credential and no OAuth: the key from the account page,
+ * which is the whole account (no scoping, no per-app keys). It is also
+ * case-insensitive upstream, so normalising it buys nothing - store it as the
+ * user pasted it.
+ */
+export const useOffcloudApiKey = () => {
+	const [apiKey] = useLocalStorage<string>('oc:apiKey');
+	return apiKey;
+};
+
+/**
+ * The credential to put in a Debrid-Link `Authorization: Bearer` header.
+ *
+ * Either an OAuth access token (`dl:accessToken`, from the device-code login)
+ * or a manually pasted API token (`dl:apiKey`). The token wins when both exist
+ * because it is the narrower credential: it carries only the scopes DMM asked
+ * for and the user can revoke it from their account without rotating the key
+ * that authenticates everything else they own.
+ */
+export const useDebridLinkCredential = () => {
+	const [accessToken] = useLocalStorage<string>('dl:accessToken');
+	const [apiKey] = useLocalStorage<string>('dl:apiKey');
+	return accessToken || apiKey;
+};
+
+// Main hook that combines all services
 export const useCurrentUser = () => {
-	const [rdUser, setRdUser] = useState<RealDebridUser | null>(null);
-	const [adUser, setAdUser] = useState<AllDebridUser | null>(null);
-	const [traktUser, setTraktUser] = useState<TraktUser | null>(null);
+	const rd = useRealDebrid();
+	const ad = useAllDebrid();
+	const tb = useTorBox();
+	const pm = usePremiumize();
+	const oc = useOffcloud();
+	const dl = useDebridLink();
+	const trakt = useTrakt();
+
+	return {
+		rdUser: rd.user,
+		rdError: rd.error,
+		hasRDAuth: rd.hasAuth,
+		rdIsRefreshing: rd.isRefreshing,
+		adUser: ad.user,
+		adError: ad.error,
+		hasADAuth: ad.hasAuth,
+		tbUser: tb.user,
+		tbError: tb.error,
+		hasTBAuth: tb.hasAuth,
+		pmUser: pm.user,
+		pmError: pm.error,
+		hasPMAuth: pm.hasAuth,
+		ocUser: oc.user,
+		ocError: oc.error,
+		hasOCAuth: oc.hasAuth,
+		dlUser: dl.user,
+		dlError: dl.error,
+		hasDLAuth: dl.hasAuth,
+		traktUser: trakt.user,
+		traktError: trakt.error,
+		hasTraktAuth: trakt.hasAuth,
+		isLoading: rd.loading,
+	};
+};
+
+export const useDebridLogin = () => {
 	const router = useRouter();
-	const [rdToken] = useLocalStorage<string>('rd:accessToken');
-	const [adToken] = useLocalStorage<string>('ad:apiKey');
-	const [traktToken] = useLocalStorage<string>('trakt:accessToken');
-	const [_, setTraktUserSlug] = useLocalStorage<string>('trakt:userSlug');
-	const [rdError, setRdError] = useState<Error | null>(null);
-	const [adError, setAdError] = useState<Error | null>(null);
-	const [traktError, setTraktError] = useState<Error | null>(null);
 
-	useEffect(() => {
-		(async () => {
-			try {
-				if (rdToken) {
-					const rdUserResponse = await getRealDebridUser(rdToken!);
-					if (rdUserResponse) setRdUser(<RealDebridUser>rdUserResponse);
-				}
-			} catch (error: any) {
-				setRdError(new Error(error));
-			}
-			try {
-				if (adToken) {
-					const adUserResponse = await getAllDebridUser(adToken!);
-					if (adUserResponse) setAdUser(<AllDebridUser>adUserResponse);
-				}
-			} catch (error: any) {
-				setAdError(new Error(error));
-			}
-			try {
-				if (traktToken) {
-					const traktUserResponse = await getTraktUser(traktToken!);
-					if (traktUserResponse) {
-						setTraktUser(traktUserResponse);
-						setTraktUserSlug(traktUserResponse.user.ids.slug);
-					}
-				}
-			} catch (error: any) {
-				setTraktError(new Error(error));
-			}
-		})();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [rdToken, adToken, traktToken, router]);
+	const navigateToLogin = (pathname: string) => {
+		const redirect = getSafeRedirectPath(router.asPath, '/');
+		console.log('[Auth] navigateToLogin', {
+			currentPath: router.asPath,
+			loginPath: pathname,
+			redirect,
+		});
+		if (redirect && redirect !== pathname) {
+			console.log('[Auth] pushing with redirect query', { pathname, redirect });
+			router.push({ pathname, query: { redirect } });
+			return;
+		}
 
-	return { rdUser, rdError, adUser, adError, traktUser, traktError };
+		console.log('[Auth] pushing without redirect query', { pathname });
+		router.push({ pathname });
+	};
+
+	return {
+		loginWithRealDebrid: () => navigateToLogin('/realdebrid/login'),
+		loginWithAllDebrid: () => navigateToLogin('/alldebrid/login'),
+		loginWithTorbox: () => navigateToLogin('/torbox/login'),
+		loginWithPremiumize: () => navigateToLogin('/premiumize/login'),
+		loginWithOffcloud: () => navigateToLogin('/offcloud/login'),
+		loginWithDebridLink: () => navigateToLogin('/debridlink/login'),
+	};
 };

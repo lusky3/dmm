@@ -1,0 +1,189 @@
+// Rate limit configs for every endpoint type, and nothing else.
+//
+// Split out of `middlewareRateLimiter.ts` so a page can state the budgets it
+// enforces instead of repeating them: that file imports ioredis, which has no
+// business in a browser bundle. The numbers live here, one copy, and the setup
+// guides render them.
+
+// Rate limit configs for different endpoint types.
+//
+// `name` is the counter bucket. It has to be spelled out per config because the
+// bucket used to be keyed on the window alone, which quietly merged every config
+// sharing a window into one budget the size of the strictest member: torrents,
+// zurg and sponsor all became a combined 1-per-2s, and proxy shared its second
+// with default, so an /api/challenge call drained the budget /api/proxy/stream
+// was about to spend.
+export const RATE_LIMIT_CONFIGS = {
+	// The DMM Cast stream lists, per viewer *and requested item* (see
+	// extractIdentifier). Keyed on the viewer alone it refused Stremio's
+	// next-episode prefetch whenever play was pressed within five seconds of
+	// opening the list, which stops autoplay. Replaying 2026-09-27..10-06's proxy
+	// log, the per-item key serves 28,844 of the 73,415 Real-Debrid stream
+	// requests that were refused. The rest asked again for an item already asked
+	// for inside the window, most of them scripted clients retrying a refusal.
+	stream: { name: 'stream', rateLimit: 1, windowSeconds: 5 },
+	torrents: { name: 'torrents', rateLimit: 1, windowSeconds: 2 }, // 1 request per 2 seconds for torrents API
+	// zurg posts a snapshot after each analysis pass and does not pace itself. Over
+	// 2026-09-07..10 one zurg averaged 13 a minute and another sent 82 inside two
+	// seconds, so on the `torrents` budget two posts in three were refused - and
+	// their hash-imdb calls shared that counter. Sized to fit every burst seen
+	// while still holding an address to 10 a second.
+	// Rechecked over 2026-09-21..10-04: no zurg that was never refused sent more
+	// than 61 in ten seconds. All 83,792 refusals came from five zurgs, in runs of
+	// 104 to 12,066 posts at 4-52 a second. Of the 9,253 posts let through during
+	// those runs 5 were stored, and 95% of the rest carried no probe at all or
+	// came in the same second as the post before, too soon for zurg to have run
+	// ffprobe. Raising it would let in more of those, not more track data.
+	snapshot: { name: 'snapshot', rateLimit: 100, windowSeconds: 10 },
+	// zurg posts hash-imdb pairs in 100-pair chunks back to back. Over
+	// 2026-09-27..10-03 one address sent 82 inside two seconds and 95 inside ten,
+	// and 15,343 of 20,035 posts were refused 429 on `torrents`.
+	hashImdb: { name: 'hashImdb', rateLimit: 100, windowSeconds: 10 },
+	// plexsim's catalog builder: one library in a handful of 500-hash calls.
+	// Held to the sponsor API's 2,500 items a minute like its two siblings below.
+	identifyHashes: { name: 'identifyHashes', rateLimit: 5, windowSeconds: 60 },
+	// The library page names its movies after it loads: one call per 500 movies,
+	// and later loads ask only about releases it has not seen. Each new filename
+	// costs the identifier about 8 ms of CPU, so this caps an address at 5,000 a
+	// minute.
+	libraryIdentify: { name: 'libraryIdentify', rateLimit: 10, windowSeconds: 60 },
+	// The sponsor API caps an address at 2,500 items a minute on each endpoint. The
+	// limiter counts calls, so each budget is 2,500 over the endpoint's batch cap:
+	// 500 filenames per identify call, 100 hashes per availability and mediainfo call.
+	sponsorIdentify: { name: 'sponsorIdentify', rateLimit: 5, windowSeconds: 60 },
+	sponsorAvailability: { name: 'sponsorAvailability', rateLimit: 25, windowSeconds: 60 },
+	sponsorMediaInfo: { name: 'sponsorMediaInfo', rateLimit: 25, windowSeconds: 60 },
+	// The placement API, per sponsorship: up to 100 releases a call, so a 10,000-release
+	// library backfills in under two minutes and zurg's later calls carry only new releases.
+	sponsorPlace: { name: 'sponsorPlace', rateLimit: 60, windowSeconds: 60 },
+	// The wanted list: zurg reads it about once a minute and acknowledges each film it
+	// fetched, and the website lists, adds and removes. Per sponsorship, both sides.
+	sponsorWanted: { name: 'sponsorWanted', rateLimit: 30, windowSeconds: 60 },
+	wanted: { name: 'wanted', rateLimit: 30, windowSeconds: 60 },
+	// Seerr talking to DMM as its Radarr and Sonarr: a download sync every minute
+	// (two calls per server), a handful per request, settings tests. Per sponsorship.
+	arr: { name: 'arr', rateLimit: 120, windowSeconds: 60 },
+	// Importing a Radarr or Sonarr backup inflates a database of up to a few hundred MB.
+	wantedImport: { name: 'wantedImport', rateLimit: 10, windowSeconds: 3600 },
+	// The whole-show season resolver behind "All Seasons". It reads many season
+	// rows in one request precisely so the browser does not walk `torrents` once
+	// per season at 1-per-2s, which for a twenty-season show is forty seconds of
+	// waiting and forty entries in a bucket shared with everyone on that IP.
+	// Its own name so the two budgets stay separate, and four per minute because
+	// a run asks for packs and then, only where a season has none, episodes.
+	tvSeasons: { name: 'tvSeasons', rateLimit: 4, windowSeconds: 60 },
+	// A season search asks two episodes at a time of every enabled Tor addon, and
+	// there are five of those, so ten proxy calls land together - and the sliding
+	// window still holds the previous second, so two of those bursts have to fit.
+	proxy: { name: 'proxy', rateLimit: 20, windowSeconds: 2 },
+	report: { name: 'report', rateLimit: 5, windowSeconds: 10 }, // 5 reports per 10 seconds
+	// Copyright notices. An agent filing for a rights holder sends a batch in
+	// one notice, so an hour's worth per address is plenty and caps a flood.
+	takedown: { name: 'takedown', rateLimit: 20, windowSeconds: 3600 },
+	// The blocklist the uploaders and scrapers poll every ten minutes each.
+	takedownBlocklist: { name: 'takedownBlocklist', rateLimit: 60, windowSeconds: 60 },
+	takedownAdmin: { name: 'takedownAdmin', rateLimit: 60, windowSeconds: 60 },
+	// The zurg endpoints, sized like the Newznab and Torznab indexers rather
+	// than like a person clicking: a minute's worth in one budget, so a client
+	// that fans out over several titles is not refused on its second call.
+	// `search-torrents` draws from here too - it used to share the `torrents`
+	// bucket with the website's own search API, so a sponsor's zurg and their
+	// browser spent one 1-per-2s counter between them.
+	zurg: { name: 'zurg', rateLimit: 20, windowSeconds: 60 },
+	// The sponsor metadata API (`/api/metadata/<id>` and `/search`), per sponsorship.
+	// rex's start-up pass reads one season list per season of each show it places.
+	metadata: { name: 'metadata', rateLimit: 300, windowSeconds: 60 },
+	zurgAdmin: { name: 'zurgAdmin', rateLimit: 1, windowSeconds: 10 }, // 1 request per 10 seconds for zurg admin endpoints
+	sponsor: { name: 'sponsor', rateLimit: 1, windowSeconds: 2 }, // 1 request per 2 seconds for sponsor status endpoints
+	// Every miss spends a grab from the one indexer account the whole site shares,
+	// so this is paced like a stream rather than like a page fetch.
+	nzbDownload: { name: 'nzbDownload', rateLimit: 1, windowSeconds: 5 },
+	// The Newznab aggregation endpoint. An *arr RSS-syncs on a timer and issues
+	// one search per configured indexer, so the budget is sized for a fleet of
+	// them behind one sponsor key rather than for a person clicking.
+	//
+	// Raised from 20 on 2026-09-14. Measured over 8 days of proxy logs (81,997
+	// requests, 1,981/day rising to 19,945/day): 20/min refused 125 searches
+	// across 82 minutes and 14 keys, all of them *arr bursts rather than abuse.
+	// 30 is the smallest budget that refuses none of it - the busiest minute any
+	// key managed was 26 - and every search fans out to all four upstreams, so
+	// the headroom above that is spent on the one with a metered API allowance.
+	newznabSearch: { name: 'newznabSearch', rateLimit: 30, windowSeconds: 60 },
+	// A grab spends a real download from the shared upstream account, so it gets
+	// both a burst limit and a day-long one. Two entries, two names: same-name
+	// configs share a bucket, so a single name would have made the day limit and
+	// the burst limit one counter - see the note above.
+	//
+	// Also raised on 2026-09-14, off the same logs: grabs were the budget
+	// actually biting, at 1,017 of 3,095 attempts refused. 10/min cost 569
+	// requests over 56 minutes, 15/min costs 331 over 36.
+	//
+	// Sized against what the upstream accounts actually allow, read off their own
+	// pages the same day: two are unlimited (5,122 and 4,409 API hits, 737 and
+	// 176 grabs that day), but one is metered at 600 grabs and 5,000 API hits a
+	// day for every DMM sponsor put together, and the fleet already attempted 999
+	// grabs on 2026-09-13. So the day cap is deliberately well under that shared
+	// ceiling rather than sized to the busiest key: 250 refuses 402 requests
+	// across 8 days, all of them from the single key that grabbed 589 in a day.
+	//
+	// Note what these do NOT bound: a per-key budget times 466 keys is not an
+	// aggregate. If the fleet total keeps doubling weekly, the metered upstream
+	// needs a real fleet-wide counter, not a bigger per-key one.
+	newznabGrab: { name: 'newznabGrab', rateLimit: 15, windowSeconds: 60 },
+	newznabGrabDay: { name: 'newznabGrabDay', rateLimit: 250, windowSeconds: 86400 },
+	// The cheap pre-auth reject on the newznab endpoint, per IP. Wider than
+	// `default`'s 5/s because a Sonarr interactive season search bursts its
+	// queries faster than that from one IP - the per-key budgets above are the
+	// real limits; this only has to stop unauthenticated hammering of caps.
+	//
+	// Raised with them, though nothing has hit it yet: the busiest 10s bucket in
+	// those 8 days was 18 requests from one IP, against a ceiling of 20. Leaving
+	// it there would have turned a per-IP gate into the binding limit as soon as
+	// the per-key budgets above opened up; 25 keeps a margin over that peak
+	// without becoming a budget of its own.
+	newznabIp: { name: 'newznabIp', rateLimit: 25, windowSeconds: 10 },
+	// The Torznab indexer, sized for an *arr fleet behind one sponsor key rather
+	// than for a person clicking. It kept the original 20/min when Newznab's
+	// budgets were doubled, because its cost is not the same: a
+	// search here reads whole library pages and classifies every hash in them
+	// against the debrid caches, so it costs the database far more than a fan-out
+	// to upstream indexers costs DMM. It has no grab budget — a Torznab item's
+	// download is a magnet the client resolves against its own debrid account, so
+	// a grab never comes back to DMM at all.
+	//
+	// It counts pages, not searches: an *arr spends one request per page and a
+	// 429 partway through discards the whole search. Sized together with the
+	// page `MAX_LIMIT` in services/torznab/xml.ts, which keeps Sonarr's deepest
+	// search to ten requests. Replaying 2026-09-06..10-03's proxy log at a page of
+	// a hundred, 20 refuses 0.2% of *arr searches, nearly all of them three or
+	// more searches from one key inside a minute; 25 would refuse 0.02%.
+	//
+	// A refused search holds no slot. zurg's acquisition queue asks a refused
+	// search again once Retry-After has passed, and while refusals counted, a
+	// key sending 21 a minute was held at the limit by its own retries and
+	// served about 13 a minute (2026-10-06). torznabIp, which does count them,
+	// is what still stops one address from hammering.
+	torznabSearch: { name: 'torznabSearch', rateLimit: 20, windowSeconds: 60, countRefused: false },
+	torznabIp: { name: 'torznabIp', rateLimit: 20, windowSeconds: 10 },
+	// /api/info/anime and /api/search/anime answer by asking the community
+	// Stremio addon and kitsu.io, so an unlimited client could drive both
+	// upstreams through dmm-01's address until one of them blocked it. A person
+	// opens a handful of titles a minute; its own bucket keeps a burst here from
+	// refusing /api/challenge, which shares `default`.
+	anime: { name: 'anime', rateLimit: 30, windowSeconds: 60 },
+	// /api/anime/franchise and /api/anime/by-imdb read an in-memory dataset and
+	// one indexed query; Kitsu is asked only for entries the table has no row
+	// for, at most 12 a request and cached for a day. Every show and movie page
+	// asks once, so they get a bucket of their own rather than spending `anime`'s.
+	animeEntries: { name: 'animeEntries', rateLimit: 60, windowSeconds: 60 },
+	// The site's availability lookups, per address. Pages pace Real-Debrid checks to 60 a
+	// minute per tab. Over 2026-10-11..15, leaving out the ~9,950 addresses that rotated
+	// their user agent between calls (scripts), the busiest address sent 298 check+check2
+	// calls in a minute and the 99.9th percentile sent 131; AllDebrid peaked at 282, p99.9
+	// 282, and playable at 105. At these budgets 4, 3 and 0 of ~20,000 addresses would
+	// have waited, and the page waits out Retry-After rather than dropping the batch.
+	availability: { name: 'availability', rateLimit: 180, windowSeconds: 60 },
+	availabilityAd: { name: 'availabilityAd', rateLimit: 180, windowSeconds: 60 },
+	playable: { name: 'playable', rateLimit: 120, windowSeconds: 60 },
+	default: { name: 'default', rateLimit: 5, windowSeconds: 1 }, // 5 requests per second for other endpoints
+} as const;

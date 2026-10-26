@@ -1,0 +1,395 @@
+import { Prisma } from '@prisma/client';
+import { DatabaseClient } from './client';
+
+export interface HashImdbPair {
+	hash: string;
+	imdbId: string;
+}
+
+/** A series and its episodes as IMDb lists them; `season` and `episode` are null where IMDb has none. */
+export interface ImdbSeries {
+	titleType: string;
+	title: string | null;
+	episodes: { season: number | null; episode: number | null; name: string }[];
+}
+
+/** The title DMM matched a release hash to. */
+export interface HashIdentity {
+	imdbId: string;
+	title: string | null;
+	year: number | null;
+}
+
+type ScrapedVerdictRow = HashImdbPair & { verdict: string };
+
+/** content-identifier's answer for one library release, as stored. */
+export interface FilenameIdentification {
+	hash: string;
+	titleKey: string;
+	filename: string;
+	/** "movie" or "tv"; null on rows from before the service decided. */
+	kind: string | null;
+	imdbId: string | null;
+	title: string | null;
+	year: number | null;
+	score: number | null;
+	confident: boolean;
+}
+
+const INFO_HASH = /^[a-f0-9]{40}$/;
+const IMDB_ID = /^tt\d{7,}$/;
+
+/**
+ * Which title each hash is, from the hash-to-imdbId rows DMM already holds.
+ *
+ * `sources` are listed most trusted first. Graded against the ScrapedVerdict
+ * keep verdicts on 1,000 Real-Debrid library entries on 2026-10-03, HashImdb
+ * (zurg's matches) agreed on 65 of 65 hashes, Available on 386 of 400 and
+ * AvailableAd on 288 of 313. Available and AvailableAd record the page a user
+ * added a release from, so a poisoned page files a release under the wrong
+ * title: a pair ScrapedVerdict trashed and never kept is dropped, and a kept
+ * pair beats source order.
+ */
+export function pickHashImdbIds(
+	sources: HashImdbPair[][],
+	verdicts: ScrapedVerdictRow[]
+): Map<string, string> {
+	const judged = new Map<string, Set<string>>();
+	for (const { hash, imdbId, verdict } of verdicts) {
+		const key = `${hash.toLowerCase()}|${imdbId}`;
+		const seen = judged.get(key) ?? new Set<string>();
+		seen.add(verdict);
+		judged.set(key, seen);
+	}
+
+	const candidates = new Map<string, string[]>();
+	for (const rows of sources) {
+		for (const { hash, imdbId } of rows) {
+			if (!IMDB_ID.test(imdbId)) continue;
+			const key = hash.toLowerCase();
+			const ids = candidates.get(key) ?? [];
+			if (!ids.includes(imdbId)) ids.push(imdbId);
+			candidates.set(key, ids);
+		}
+	}
+
+	const picks = new Map<string, string>();
+	for (const [hash, ids] of candidates) {
+		const verdictsOf = (imdbId: string) => judged.get(`${hash}|${imdbId}`);
+		const usable = ids.filter((imdbId) => {
+			const seen = verdictsOf(imdbId);
+			return !seen?.has('trash') || seen.has('keep');
+		});
+		const pick = usable.find((imdbId) => verdictsOf(imdbId)?.has('keep')) ?? usable[0];
+		if (pick) picks.set(hash, pick);
+	}
+	return picks;
+}
+
+/**
+ * Keep verdicts as a source of their own, for releases no mapping table knows:
+ * a hash whose keeps all sit on one title is that title. A set is kept on the
+ * page of every film it holds - "Al.Pacino.Movies.Pack" on nine - and nothing
+ * in the verdicts says which one it is, so a hash kept on several titles adds
+ * no candidate here.
+ */
+export function soleKeeps(verdicts: ScrapedVerdictRow[]): HashImdbPair[] {
+	const kept = new Map<string, Set<string>>();
+	for (const { hash, imdbId, verdict } of verdicts) {
+		if (verdict !== 'keep') continue;
+		const key = hash.toLowerCase();
+		kept.set(key, (kept.get(key) ?? new Set<string>()).add(imdbId));
+	}
+	const pairs: HashImdbPair[] = [];
+	for (const [hash, imdbIds] of kept) {
+		if (imdbIds.size === 1) pairs.push({ hash, imdbId: [...imdbIds][0] });
+	}
+	return pairs;
+}
+
+export class HashImdbService extends DatabaseClient {
+	/** Stored answers for these hash+filename pairs; one indexed read by hash. */
+	public async getFilenameIdentifications(
+		keys: { hash: string; titleKey: string }[]
+	): Promise<FilenameIdentification[]> {
+		const hashes = [...new Set(keys.map((k) => k.hash))];
+		if (hashes.length === 0) return [];
+		const wanted = new Set(keys.map((k) => `${k.hash}|${k.titleKey}`));
+		const rows = await this.prisma.hashIdentification.findMany({
+			where: { hash: { in: hashes } },
+			select: {
+				hash: true,
+				titleKey: true,
+				filename: true,
+				kind: true,
+				imdbId: true,
+				title: true,
+				year: true,
+				score: true,
+				confident: true,
+			},
+		});
+		return rows.filter((r) => wanted.has(`${r.hash}|${r.titleKey}`));
+	}
+
+	/**
+	 * Every title DMM maps each hash to, keyed by lowercase hash: zurg's matches
+	 * (HashImdb) and snapshots (TorrentSnapshot), the pages users added the
+	 * release from (Available, AvailableAd) and kept scrape verdicts. An episode's
+	 * id counts as its show's. All five are read by their hash index. Unlike
+	 * `identifyHashes` nothing is picked: these only confirm a title found
+	 * another way, so any source naming it is enough. On ymsita's library
+	 * (2026-10-12) snapshots and verdicts named 39 more of 475 unnamed releases,
+	 * about 95% of them right; Cast and the other cast tables added nothing that
+	 * would pay for a scan, as none is indexed by hash.
+	 *
+	 * Where the sources name different titles, one only a page-add row names does
+	 * not count: a mis-filed page is how The Devil Wears Prada came to be named as
+	 * its 2026 sequel. Of 151 library titles that rested on such a row (2026-10-12),
+	 * about three in four were right, short of what a confirmation must be.
+	 */
+	public async getHashTitleIds(hashes: string[]): Promise<Map<string, Set<string>>> {
+		const ids = new Map<string, Set<string>>();
+		const wanted = [...new Set(hashes.map((h) => h.toLowerCase()))].filter((h) =>
+			INFO_HASH.test(h)
+		);
+		if (wanted.length === 0) return ids;
+		const select = { hash: true, imdbId: true } as const;
+		const sources = await Promise.all([
+			this.prisma.hashImdb.findMany({ where: { hash: { in: wanted } }, select }),
+			this.prisma.available.findMany({ where: { hash: { in: wanted } }, select }),
+			this.prisma.availableAd.findMany({ where: { hash: { in: wanted } }, select }),
+			this.prisma.scrapedVerdict.findMany({
+				where: { hash: { in: wanted }, verdict: 'keep' },
+				select,
+			}),
+			// payloads average 37 KB (up to 10 MB): read only the id
+			this.prisma.$queryRaw<{ hash: string; imdbId: string | null }[]>(Prisma.sql`
+					SELECT DISTINCT hash, JSON_UNQUOTE(JSON_EXTRACT(payload, '$.IMDBID')) AS imdbId
+					FROM TorrentSnapshot WHERE hash IN (${Prisma.join(wanted)})`),
+		]);
+		const rows = sources
+			// sources[1] and [2] are the page-add tables, Available and AvailableAd
+			.flatMap((source, n) =>
+				source.map(({ hash, imdbId }) => ({ hash, imdbId, pageAdd: n === 1 || n === 2 }))
+			)
+			.filter((r): r is { hash: string; imdbId: string; pageAdd: boolean } =>
+				IMDB_ID.test(r.imdbId ?? '')
+			);
+		if (rows.length === 0) return ids;
+		const episodes = await this.prisma.imdbTitleEpisode.findMany({
+			where: { tconst: { in: [...new Set(rows.map((r) => r.imdbId))] } },
+			select: { tconst: true, parentTconst: true },
+		});
+		const show = new Map(episodes.map((e) => [e.tconst, e.parentTconst]));
+		// per hash, each title and whether anything but a page-add row names it
+		const named = new Map<string, Map<string, boolean>>();
+		for (const { hash, imdbId, pageAdd } of rows) {
+			const titles = named.get(hash) ?? new Map<string, boolean>();
+			const id = show.get(imdbId) ?? imdbId;
+			titles.set(id, Boolean(titles.get(id)) || !pageAdd);
+			named.set(hash, titles);
+		}
+		for (const [hash, titles] of named) {
+			const credible = [...titles].filter(([, solid]) => solid || titles.size === 1);
+			if (credible.length) ids.set(hash, new Set(credible.map(([id]) => id)));
+		}
+		return ids;
+	}
+
+	/** The show an IMDb episode id belongs to, or null when the id is no episode's. */
+	public async getEpisodeShow(tconst: string): Promise<string | null> {
+		const row = await this.prisma.imdbTitleEpisode.findUnique({
+			where: { tconst },
+			select: { parentTconst: true },
+		});
+		return row?.parentTconst ?? null;
+	}
+
+	/**
+	 * A series as IMDb lists it: its type and every episode's season, number and title, read by
+	 * the show's index (idx_parent) and the episodes' ids; null when IMDb has no such title.
+	 */
+	public async getImdbSeries(tconst: string): Promise<ImdbSeries | null> {
+		const show = await this.prisma.imdbTitleBasics.findUnique({
+			where: { tconst },
+			select: { titleType: true, primaryTitle: true },
+		});
+		if (!show) return null;
+		const rows = await this.prisma.imdbTitleEpisode.findMany({
+			where: { parentTconst: tconst },
+			select: { tconst: true, seasonNumber: true, episodeNumber: true },
+		});
+		const titles = new Map(
+			(
+				await this.prisma.imdbTitleBasics.findMany({
+					where: { tconst: { in: rows.map((row) => row.tconst) } },
+					select: { tconst: true, primaryTitle: true },
+				})
+			).map((row) => [row.tconst, row.primaryTitle ?? ''])
+		);
+		return {
+			titleType: show.titleType,
+			title: show.primaryTitle,
+			episodes: rows.map((row) => ({
+				season: row.seasonNumber,
+				episode: row.episodeNumber,
+				name: titles.get(row.tconst) ?? '',
+			})),
+		};
+	}
+
+	/** IMDb's episode ids for one season of a show, by episode number (idx_season_episode). */
+	public async getSeasonEpisodeIds(show: string, season: number): Promise<Map<number, string>> {
+		const rows = await this.prisma.imdbTitleEpisode.findMany({
+			where: { parentTconst: show, seasonNumber: season },
+			select: { tconst: true, episodeNumber: true },
+		});
+		return new Map(
+			rows.flatMap((row) =>
+				row.episodeNumber === null ? [] : [[row.episodeNumber, row.tconst]]
+			)
+		);
+	}
+
+	/** Overwrite stored answers that were asked again and are now confident. */
+	public async confirmFilenameIdentifications(rows: FilenameIdentification[]): Promise<void> {
+		for (const { hash, titleKey, ...answer } of rows) {
+			await this.prisma.hashIdentification.update({
+				where: { hash_titleKey: { hash, titleKey } },
+				data: answer,
+			});
+		}
+	}
+
+	/** Store new answers; a pair already stored keeps its first answer. */
+	public async saveFilenameIdentifications(rows: FilenameIdentification[]): Promise<number> {
+		if (rows.length === 0) return 0;
+		const { count } = await this.prisma.hashIdentification.createMany({
+			data: rows,
+			skipDuplicates: true,
+		});
+		return count;
+	}
+
+	/**
+	 * What each release in a DMM Cast library is, keyed by lowercase hash.
+	 *
+	 * This runs on every library catalog page a Stremio client scrolls, so every
+	 * read is an indexed lookup: by hash for the three mapping tables and for
+	 * verdicts (ScrapedVerdict_hash_idx), by tconst for titles. Reading verdicts
+	 * by hash alone also finds releases only a verdict knows about, which
+	 * `soleKeeps` turns into a last source.
+	 */
+	public async identifyHashes(hashes: string[]): Promise<Map<string, HashIdentity>> {
+		const identities = new Map<string, HashIdentity>();
+		const wanted = [...new Set(hashes.map((hash) => hash.toLowerCase()))].filter((hash) =>
+			INFO_HASH.test(hash)
+		);
+		if (wanted.length === 0) return identities;
+
+		const select = { hash: true, imdbId: true } as const;
+		const [hashImdb, available, availableAd, verdicts] = await Promise.all([
+			this.prisma.hashImdb.findMany({
+				where: { hash: { in: wanted } },
+				select,
+				orderBy: { createdAt: 'asc' },
+			}),
+			this.prisma.available.findMany({ where: { hash: { in: wanted } }, select }),
+			this.prisma.availableAd.findMany({ where: { hash: { in: wanted } }, select }),
+			this.prisma.scrapedVerdict.findMany({
+				where: { hash: { in: wanted } },
+				select: { hash: true, imdbId: true, verdict: true },
+			}),
+		]);
+		const sources = [hashImdb, available, availableAd, soleKeeps(verdicts)];
+
+		const imdbIds = [...new Set(sources.flat().map((row) => row.imdbId))].filter((imdbId) =>
+			IMDB_ID.test(imdbId)
+		);
+		if (imdbIds.length === 0) return identities;
+
+		const basics = await this.prisma.imdbTitleBasics.findMany({
+			where: { tconst: { in: imdbIds } },
+			select: { tconst: true, primaryTitle: true, startYear: true },
+		});
+
+		const titles = new Map(basics.map((basic) => [basic.tconst, basic]));
+		for (const [hash, imdbId] of pickHashImdbIds(sources, verdicts)) {
+			const basic = titles.get(imdbId);
+			identities.set(hash, {
+				imdbId,
+				title: basic?.primaryTitle ?? null,
+				year: basic?.startYear ?? null,
+			});
+		}
+		return identities;
+	}
+
+	public async upsertBatch(pairs: HashImdbPair[]) {
+		const results: { id: string; created: boolean }[] = [];
+
+		for (const { hash, imdbId } of pairs) {
+			// Check if this exact hash+imdbId combo already exists
+			const existing = await this.prisma.hashImdb.findFirst({
+				where: { hash, imdbId },
+			});
+
+			if (existing) {
+				// Same imdbId — just bump updatedAt
+				await this.prisma.hashImdb.update({
+					where: { id: existing.id },
+					data: { updatedAt: new Date() },
+				});
+				results.push({ id: existing.id, created: false });
+				continue;
+			}
+
+			// Different imdbId or first entry — find next available id
+			const existingForHash = await this.prisma.hashImdb.findMany({
+				where: { hash },
+				select: { id: true },
+				orderBy: { id: 'asc' },
+			});
+
+			let id: string;
+			if (existingForHash.length === 0) {
+				id = hash;
+			} else {
+				// Find the next index: hash-1, hash-2, etc.
+				let maxIdx = 0;
+				for (const row of existingForHash) {
+					if (row.id === hash) continue;
+					const suffix = row.id.slice(hash.length + 1);
+					const idx = parseInt(suffix, 10);
+					if (!isNaN(idx) && idx > maxIdx) {
+						maxIdx = idx;
+					}
+				}
+				id = `${hash}-${maxIdx + 1}`;
+			}
+
+			await this.prisma.hashImdb.create({
+				data: { id, hash, imdbId },
+			});
+			results.push({ id, created: true });
+		}
+
+		return results;
+	}
+
+	public async getByHash(hash: string) {
+		return this.prisma.hashImdb.findMany({
+			where: { hash },
+			orderBy: { createdAt: 'asc' },
+		});
+	}
+
+	public async getByHashes(hashes: string[]) {
+		if (hashes.length === 0) return [];
+		return this.prisma.hashImdb.findMany({
+			where: { hash: { in: hashes } },
+			orderBy: { createdAt: 'asc' },
+		});
+	}
+}

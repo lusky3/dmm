@@ -1,0 +1,214 @@
+import debridHandler from '@/pages/api/debrid-uploader/jobs';
+import nzbHandler from '@/pages/api/nzb2rd/jobs';
+import { fetchNzb, promoteJob, submitNzb } from '@/services/nzb2rd';
+import { repository } from '@/services/repository';
+import { createMockRequest, createMockResponse } from '@/test/utils/api';
+import { activeSponsor, sponsorshipLapsed } from '@/test/utils/sponsor';
+import { signSponsorToken } from '@/utils/sponsorToken';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/services/repository');
+vi.mock('@/services/nzb2rd', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/services/nzb2rd')>();
+	return {
+		...actual,
+		fetchNzb: vi.fn(),
+		submitNzb: vi.fn(),
+		addHashToRdAccount: vi.fn(),
+		promoteJob: vi.fn(),
+	};
+});
+vi.mock('@/services/debridUploaderServers', () => ({
+	orderedServersForNewJob: () => ['http://uploader.test'],
+	resolveJobServer: vi.fn().mockResolvedValue(null),
+}));
+
+const mockRepo = vi.mocked(repository);
+const mockSubmit = vi.mocked(submitNzb);
+const mockPromote = vi.mocked(promoteJob);
+const HASH = 'a'.repeat(40);
+
+/** Mints the token *and* seeds the live row it names — the gate needs both. */
+function sponsorToken(): string {
+	return activeSponsor();
+}
+
+beforeEach(() => {
+	process.env.DMM_SPONSOR_SECRET = 'test-sponsor-secret';
+	vi.clearAllMocks();
+	mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue(null);
+	mockRepo.recordNzb2rdTransferPending = vi.fn().mockResolvedValue(undefined);
+	mockRepo.recordTransferMeta = vi.fn().mockResolvedValue(undefined);
+	mockRepo.addNzb2rdWaiter = vi.fn().mockResolvedValue(undefined);
+	mockRepo.getDebridTransfer = vi.fn().mockResolvedValue(null);
+	mockRepo.recordDebridTransferPending = vi.fn().mockResolvedValue(undefined);
+	mockRepo.recordDebridJobServer = vi.fn().mockResolvedValue(undefined);
+	mockRepo.checkAvailabilityByHashes = vi.fn().mockResolvedValue([]);
+	vi.mocked(fetchNzb).mockResolvedValue('<nzb></nzb>');
+	mockSubmit.mockResolvedValue({ status: 201, data: { id: 'job-1', status: 'pending' } });
+	mockPromote.mockResolvedValue(true);
+});
+
+afterEach(() => {
+	delete process.env.DMM_SPONSOR_SECRET;
+});
+
+const nzbBody = (over: Record<string, unknown> = {}) => ({
+	id: 'release-1',
+	title: 'Some.Release.1080p',
+	imdbId: 'tt1418646',
+	rdKey: 'rd-key',
+	...over,
+});
+
+async function runNzb(headers: Record<string, string> = {}) {
+	const req = createMockRequest({ method: 'POST', body: nzbBody(), headers });
+	const res = createMockResponse();
+	await nzbHandler(req as never, res as never);
+	return res;
+}
+
+describe('usenet→RD carries a verified sponsorship, never a claimed one', () => {
+	// The Sponsorship ID rides along so nzb2rd can ask again when the job finally
+	// starts: its queue is days deep, and the tier has to end with the pledge.
+	it('asks nzb2rd for the priority tier, naming the sponsorship, when the token verifies', async () => {
+		await runNzb({ 'x-dmm-sponsor': sponsorToken() });
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ sponsor: 'ZP1M' }));
+	});
+
+	it('does not when there is no token', async () => {
+		await runNzb();
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ sponsor: null }));
+	});
+
+	it('does not on a forged token', async () => {
+		// The payload is readable and therefore forgeable; only the signature is
+		// trusted, and only here. A tampered one must buy nothing.
+		const [payload] = sponsorToken().split('.');
+		await runNzb({ 'x-dmm-sponsor': `${payload}.not-the-real-signature` });
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ sponsor: null }));
+	});
+
+	it('does not on an expired token', async () => {
+		const expired = signSponsorToken({
+			shortId: 'ZP1M',
+			githubUsername: 'someone',
+			sources: ['github'],
+			keyVersion: 1,
+			exp: Date.now() - 1,
+		});
+		await runNzb({ 'x-dmm-sponsor': expired });
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ sponsor: null }));
+	});
+
+	// The regression: the token outlives the pledge by up to a week, so a signature
+	// check alone kept handing a lapsed sponsor the priority tier for that window.
+	it('does not once the sponsorship behind a still-valid token has lapsed', async () => {
+		const token = sponsorToken();
+		sponsorshipLapsed();
+
+		await runNzb({ 'x-dmm-sponsor': token });
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ sponsor: null }));
+	});
+});
+
+describe('a sponsor asking for a release someone else already queued', () => {
+	// The case the perk used to miss entirely. Dedup returns before `submitNzb`,
+	// so the tier flag that call carries is never set and the sponsor inherits
+	// the first submitter's tier — normal, when the first submitter was not one.
+	beforeEach(() => {
+		mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue({
+			releaseId: 'release-1',
+			jobId: 'job-A',
+			imdbId: 'tt1418646',
+			status: 'pending',
+		});
+		global.fetch = vi.fn().mockResolvedValue({
+			status: 200,
+			json: async () => ({ status: 'pending' }),
+		}) as never;
+	});
+
+	it('promotes the existing job instead of leaving them in the normal line', async () => {
+		const res = await runNzb({ 'x-dmm-sponsor': sponsorToken() });
+
+		expect(mockPromote).toHaveBeenCalledWith('job-A', 'ZP1M');
+		// Still no second fetch of the same bytes — the dedup is the point.
+		expect(mockSubmit).not.toHaveBeenCalled();
+		expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ promoted: true }));
+	});
+
+	// This one is not decoration. `isSponsorRequest` is async — it revalidates
+	// against the live sponsor row — and an unawaited call returns a promise,
+	// which is truthy, so a missing `await` promotes every caller instead of
+	// none. That exact slip shipped into review and this assertion is what
+	// caught it. `no-misused-promises` now catches the shape at lint time too.
+	it('leaves a non-sponsor where they are', async () => {
+		const res = await runNzb();
+
+		expect(mockPromote).not.toHaveBeenCalled();
+		expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ promoted: false }));
+	});
+
+	it('does not promote on a forged token', async () => {
+		const [payload] = sponsorToken().split('.');
+		await runNzb({ 'x-dmm-sponsor': `${payload}.not-the-real-signature` });
+		expect(mockPromote).not.toHaveBeenCalled();
+	});
+
+	it('reports promoted:false when the job was already in the tier', async () => {
+		// A second sponsor asking for the same release. nzb2rd refuses to restamp
+		// it, so the first sponsor keeps their place in the tier.
+		mockPromote.mockResolvedValue(false);
+		const res = await runNzb({ 'x-dmm-sponsor': sponsorToken() });
+		expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ promoted: false }));
+	});
+});
+
+describe('debrid→RD carries a verified sponsorship, never a claimed one', () => {
+	async function runDebrid(headers: Record<string, string> = {}) {
+		const fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 201,
+			json: async () => ({ id: 'job-2', status: 'pending' }),
+		});
+		global.fetch = fetchMock as never;
+		const req = createMockRequest({
+			method: 'POST',
+			body: { hash: HASH, imdbId: 'tt1418646', rdKey: 'rd-key', tbKey: 'tb-key' },
+			headers,
+		});
+		const res = createMockResponse();
+		await debridHandler(req as never, res as never);
+		return fetchMock;
+	}
+
+	it('claims sponsorship to the uploader when the token verifies', async () => {
+		const fetchMock = await runDebrid({ 'x-dmm-sponsor': sponsorToken() });
+		const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/jobs'));
+		expect(JSON.parse(call![1].body).sponsor).toBe(true);
+	});
+
+	it('does not when there is no token', async () => {
+		const fetchMock = await runDebrid();
+		const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/jobs'));
+		expect(JSON.parse(call![1].body).sponsor).toBe(false);
+	});
+
+	it('does not on a forged token', async () => {
+		const [payload] = sponsorToken().split('.');
+		const fetchMock = await runDebrid({ 'x-dmm-sponsor': `${payload}.forged` });
+		const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/jobs'));
+		expect(JSON.parse(call![1].body).sponsor).toBe(false);
+	});
+
+	// Same regression on the uploader's raised job ceiling.
+	it('does not once the sponsorship behind a still-valid token has lapsed', async () => {
+		const token = sponsorToken();
+		sponsorshipLapsed();
+
+		const fetchMock = await runDebrid({ 'x-dmm-sponsor': token });
+		const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/jobs'));
+		expect(JSON.parse(call![1].body).sponsor).toBe(false);
+	});
+});

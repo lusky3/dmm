@@ -1,0 +1,236 @@
+import type { NextApiRequest, NextApiResponse } from 'next';
+
+import { repository } from '@/services/repository';
+
+export type HistoryRange = '24h' | '7d' | '30d' | '90d';
+export type HistoryType = 'stream' | 'servers' | 'rd' | 'torrentio' | 'torbox-api' | 'torbox-cdn';
+
+interface HistoryQuery {
+	type?: HistoryType;
+	range?: HistoryRange;
+	sortBy?: 'reliability' | 'latency';
+	limit?: string;
+}
+
+function parseRange(range: HistoryRange): {
+	hoursBack?: number;
+	daysBack: number;
+	useDaily: boolean;
+} {
+	switch (range) {
+		case '24h':
+			return { hoursBack: 24, daysBack: 1, useDaily: false };
+		case '7d':
+			return { hoursBack: 168, daysBack: 7, useDaily: false };
+		case '30d':
+			return { daysBack: 30, useDaily: true };
+		case '90d':
+			return { daysBack: 90, useDaily: true };
+		default:
+			return { hoursBack: 24, daysBack: 1, useDaily: false };
+	}
+}
+
+// Max hourly retention in hours (90 days)
+const MAX_HOURLY_HOURS = 2160;
+
+// Window for the per-region CDN breakdown. A day is long enough that a quiet
+// region still has votes, and short enough that a region TorBox fixed this
+// morning stops being reported as broken.
+const CDN_REGION_SUMMARY_HOURS = 24;
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+	if (req.method !== 'GET') {
+		res.setHeader('Allow', 'GET');
+		return res.status(405).json({ error: 'Method not allowed' });
+	}
+
+	// No caching to ensure consistency with the main status page
+	res.setHeader('Cache-Control', 'private, no-store, no-cache, must-revalidate');
+	res.setHeader('Pragma', 'no-cache');
+
+	const query = req.query as HistoryQuery;
+	const type = query.type ?? 'stream';
+	const range = (query.range ?? '24h') as HistoryRange;
+	const { hoursBack, daysBack, useDaily } = parseRange(range);
+
+	try {
+		switch (type) {
+			case 'stream': {
+				if (useDaily) {
+					const dailyData = await repository.getStreamDailyHistory(daysBack);
+					if (dailyData.length > 0) {
+						return res.status(200).json({
+							type: 'stream',
+							granularity: 'daily',
+							range,
+							data: dailyData,
+						});
+					}
+					// Fall back to hourly if daily rollup hasn't run yet
+					const hourlyData = await repository.getStreamHourlyHistory(MAX_HOURLY_HOURS);
+					return res.status(200).json({
+						type: 'stream',
+						granularity: 'hourly',
+						range,
+						data: hourlyData,
+					});
+				}
+				const data = await repository.getStreamHourlyHistory(hoursBack!);
+				return res.status(200).json({
+					type: 'stream',
+					granularity: 'hourly',
+					range,
+					data,
+				});
+			}
+
+			case 'servers': {
+				const sortBy = query.sortBy ?? 'reliability';
+				const limit = query.limit ? parseInt(query.limit, 10) : 50;
+				const data = await repository.getServerReliability(daysBack, sortBy, limit);
+				return res.status(200).json({
+					type: 'servers',
+					range,
+					sortBy,
+					data,
+				});
+			}
+
+			case 'rd': {
+				if (useDaily) {
+					const dailyData = await repository.getRdDailyHistory(daysBack);
+					if (dailyData.length > 0) {
+						return res.status(200).json({
+							type: 'rd',
+							granularity: 'daily',
+							range,
+							data: dailyData,
+						});
+					}
+					const hourlyData = await repository.getRdHourlyHistory(MAX_HOURLY_HOURS);
+					return res.status(200).json({
+						type: 'rd',
+						granularity: 'hourly',
+						range,
+						data: hourlyData,
+					});
+				}
+				const data = await repository.getRdHourlyHistory(hoursBack!);
+				return res.status(200).json({
+					type: 'rd',
+					granularity: 'hourly',
+					range,
+					data,
+				});
+			}
+
+			case 'torrentio': {
+				if (useDaily) {
+					const dailyData = await repository.getTorrentioDailyHistory(daysBack);
+					if (dailyData.length > 0) {
+						return res.status(200).json({
+							type: 'torrentio',
+							granularity: 'daily',
+							range,
+							data: dailyData,
+						});
+					}
+					const hourlyData = await repository.getTorrentioHourlyHistory(MAX_HOURLY_HOURS);
+					return res.status(200).json({
+						type: 'torrentio',
+						granularity: 'hourly',
+						range,
+						data: hourlyData,
+					});
+				}
+				const data = await repository.getTorrentioHourlyHistory(hoursBack!);
+				return res.status(200).json({
+					type: 'torrentio',
+					granularity: 'hourly',
+					range,
+					data,
+				});
+			}
+
+			case 'torbox-api': {
+				if (useDaily) {
+					const dailyData = await repository.getTorBoxOperationalDailyHistory(daysBack);
+					if (dailyData.length > 0) {
+						return res.status(200).json({
+							type: 'torbox-api',
+							granularity: 'daily',
+							range,
+							data: dailyData,
+						});
+					}
+					const hourlyData =
+						await repository.getTorBoxOperationalHourlyHistory(MAX_HOURLY_HOURS);
+					return res.status(200).json({
+						type: 'torbox-api',
+						granularity: 'hourly',
+						range,
+						data: hourlyData,
+					});
+				}
+				const data = await repository.getTorBoxOperationalHourlyHistory(hoursBack!);
+				return res.status(200).json({
+					type: 'torbox-api',
+					granularity: 'hourly',
+					range,
+					data,
+				});
+			}
+
+			// Reader-browser CDN probes. The per-region summary rides along with
+			// the series because it answers the question the series cannot: a dip
+			// in the overall line is only actionable once you know which region
+			// caused it. It always comes from hourly rows - the daily rollup
+			// keeps per-region counts, but the summary window is "recently", not
+			// "over the whole chart range".
+			case 'torbox-cdn': {
+				const regions =
+					await repository.getTorBoxCdnRegionSummary(CDN_REGION_SUMMARY_HOURS);
+
+				if (useDaily) {
+					const dailyData = await repository.getTorBoxCdnDailyHistory(daysBack);
+					if (dailyData.length > 0) {
+						return res.status(200).json({
+							type: 'torbox-cdn',
+							granularity: 'daily',
+							range,
+							data: dailyData,
+							regions,
+							regionWindowHours: CDN_REGION_SUMMARY_HOURS,
+						});
+					}
+					const hourlyData = await repository.getTorBoxCdnHourlyHistory(MAX_HOURLY_HOURS);
+					return res.status(200).json({
+						type: 'torbox-cdn',
+						granularity: 'hourly',
+						range,
+						data: hourlyData,
+						regions,
+						regionWindowHours: CDN_REGION_SUMMARY_HOURS,
+					});
+				}
+
+				const data = await repository.getTorBoxCdnHourlyHistory(hoursBack!);
+				return res.status(200).json({
+					type: 'torbox-cdn',
+					granularity: 'hourly',
+					range,
+					data,
+					regions,
+					regionWindowHours: CDN_REGION_SUMMARY_HOURS,
+				});
+			}
+
+			default:
+				return res.status(400).json({ error: 'Invalid type parameter' });
+		}
+	} catch (error) {
+		console.error('Failed to fetch history data:', error);
+		return res.status(500).json({ error: 'Internal server error' });
+	}
+}

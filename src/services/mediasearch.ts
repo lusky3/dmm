@@ -15,15 +15,53 @@ export type SearchResult = {
 	title: string;
 	fileSize: number;
 	hash: string;
-	rdAvailable: boolean;
+	rdAvailable: boolean; // Real Debrid
+	adAvailable: boolean; // AllDebrid
+	tbAvailable: boolean; // Torbox
+	pmAvailable: boolean; // Premiumize
+	ocAvailable: boolean; // Offcloud
+	dlAvailable: boolean; // Debrid-Link
 	files: FileData[];
-	adAvailable: boolean;
+	// `files` is the last listing to answer that holds a video, or the only
+	// listing if none does (see applyProviderFiles). The checks run concurrently
+	// and providers can disagree: one may hold a disc unpacked and another the
+	// same hash as one archive. `fileId` never agrees: RD numbers files per
+	// torrent, TorBox has its own ids that are not in listing order. Anything
+	// that sends an id back to a provider (casting an episode) must read that
+	// provider's own array.
+	rdFiles?: FileData[];
+	tbFiles?: FileData[];
+	// The providers whose listing of this hash is only an archive (.zip/.rar)
+	// with no video in it; another provider may still list it unpacked.
+	archiveOnly?: ArchiveOnly;
 	noVideos: boolean;
 	// for cached results in RD
 	medianFileSize: number;
 	biggestFileSize: number;
+	// mean of the video files - only known once an availability check has run
+	meanFileSize?: number;
 	videoCount: number;
+	imdbId?: string;
+	// a completed TB → RD transfer already exists for this hash (its content is
+	// in RD under a different, rewritten hash), so the "TB → RD" button is redundant
+	tbTransferred?: boolean;
+	// That rewritten hash — the one RD will actually accept. This row's own hash
+	// is the release name RD blocks, so adding it can only ever answer 451; the
+	// content is reachable through this one and nothing else.
+	tbTransferredHash?: string;
+	// tracker stats (optional)
+	trackerStats?: {
+		seeders: number;
+		leechers: number;
+		downloads: number;
+		hasActivity: boolean;
+	};
 };
+
+export interface Hashlist {
+	title: string;
+	torrents: HashlistTorrent[];
+}
 
 export interface HashlistTorrent {
 	filename: string;
@@ -39,20 +77,108 @@ export interface EnrichedHashlistTorrent extends HashlistTorrent {
 	noVideos: boolean;
 	rdAvailable: boolean;
 	adAvailable: boolean;
+	tbAvailable: boolean; // TorBox
+	pmAvailable: boolean; // Premiumize
+	ocAvailable: boolean; // Offcloud
+	dlAvailable: boolean; // Debrid-Link
 	files: FileData[];
+	rdFiles?: FileData[];
+	tbFiles?: FileData[];
+	archiveOnly?: ArchiveOnly;
 }
 
+export type ArchiveOnly = Partial<Record<'rd' | 'ad' | 'tb', true>>;
+
 export type ScrapeSearchResult = Pick<SearchResult, 'title' | 'fileSize' | 'hash'>;
+
+/**
+ * Only real HTML tag names are stripped, never a bare `<...>` run. Release
+ * titles legitimately contain angle brackets - `<CHECKMATE>`, `<DVDrip>`,
+ * `<---ANT#RAX--->` are all genuine - and a naive /<[^>]+>/ strip destroys them.
+ */
+const HTML_TAG_NAMES =
+	'a|b|i|u|p|br|hr|em|div|span|img|td|tr|th|table|tbody|thead|strong|small|font|ul|ol|li|h[1-6]|center|code|pre|script|style|iframe|button|label';
+const HTML_TAG = new RegExp(`<\\/?(?:${HTML_TAG_NAMES})\\b[^>]*>`, 'gi');
+// Markup that got cut off mid-tag, e.g. a title truncated inside a download button.
+const HTML_TAG_UNCLOSED = new RegExp(`<\\/?(?:${HTML_TAG_NAMES})\\b[^>]*$`, 'i');
+
+/** Only entities actually seen in the corpus; anything else is left verbatim. */
+const NAMED_ENTITIES: Record<string, string> = {
+	amp: '&',
+	lt: '<',
+	gt: '>',
+	quot: '"',
+	apos: "'",
+	nbsp: ' ',
+	ndash: '–',
+	mdash: '—',
+	hellip: '…',
+	times: '×',
+};
+
+const decodeEntitiesOnce = (value: string): string =>
+	value.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, body: string) => {
+		if (body[0] === '#') {
+			const codePoint =
+				body[1] === 'x' || body[1] === 'X'
+					? parseInt(body.slice(2), 16)
+					: parseInt(body.slice(1), 10);
+			if (!Number.isFinite(codePoint) || codePoint <= 0 || codePoint > 0x10ffff) return match;
+			try {
+				return String.fromCodePoint(codePoint);
+			} catch {
+				return match;
+			}
+		}
+		const named = NAMED_ENTITIES[body.toLowerCase()];
+		return named === undefined ? match : named;
+	});
+
+/**
+ * Scraped titles arrive however the source site rendered them. Most adapters
+ * never decode, so 253209 stored titles carry raw entities - `Grandma&#039;s
+ * Boy` - and a smaller set carry leaked markup where a selector swallowed the
+ * surrounding HTML. Both break matching and display, and entity variants of one
+ * title read as two different titles when comparing releases.
+ */
+export const decodeTitle = (title: string): string => {
+	if (!title) return title;
+	let out = title.replace(HTML_TAG, '').replace(HTML_TAG_UNCLOSED, '');
+	// Double-encoded values (`&amp;amp;`) occur; the bound stops a title that
+	// legitimately reads "&amp;" from being decoded forever.
+	for (let pass = 0; pass < 3; pass++) {
+		const next = decodeEntitiesOnce(out);
+		if (next === out) break;
+		out = next;
+	}
+	return out.replace(/\s+/g, ' ').trim();
+};
+
+/**
+ * Hashes that are well-formed hex but can never name a torrent. The sha1 of the
+ * empty string is what a scraper produces when a listing carries no magnet at
+ * all, and it passed the format check happily - it was stored as the hash of
+ * 2110 distinct pages, every one of them a dead result.
+ */
+const DEGENERATE_HASHES = new Set(['da39a3ee5e6b4b0d3255bfef95601890afd80709', '0'.repeat(40)]);
+
+export const isUsableHash = (hash: string | undefined | null): boolean =>
+	!!hash && /^[a-f0-9]{40}$/.test(hash) && !DEGENERATE_HASHES.has(hash);
 
 export const flattenAndRemoveDuplicates = (arr: ScrapeSearchResult[][]): ScrapeSearchResult[] => {
 	const flattened = arr.reduce((acc, val) => acc.concat(val), []);
 	const unique = new Map<string, ScrapeSearchResult>();
 	flattened.forEach((item) => {
+		// Stored scraper JSON predates this type. A nameless row cannot be
+		// rendered or matched by consumers, and must not hide a later named
+		// occurrence of the same hash.
+		if (typeof item.title !== 'string' || !item.title.trim()) return;
 		if (!unique.has(item.hash)) {
-			unique.set(item.hash, item);
+			const title = decodeTitle(item.title);
+			if (title) unique.set(item.hash, title === item.title ? item : { ...item, title });
 		}
 	});
-	return Array.from(unique.values()).filter((r) => r.hash.match(/^[a-f0-9]{40}$/));
+	return Array.from(unique.values()).filter((r) => isUsableHash(r.hash));
 };
 
 export const sortByFileSize = (results: ScrapeSearchResult[]): ScrapeSearchResult[] => {
@@ -61,3 +187,21 @@ export const sortByFileSize = (results: ScrapeSearchResult[]): ScrapeSearchResul
 	});
 	return results;
 };
+
+/**
+ * Returns true if the title contains meaningful content beyond video-technical tags.
+ * Rejects titles like "1080p", "720p x265", "WEB-DL", etc.
+ */
+export function hasSubstantialTitle(title: string): boolean {
+	if (!title || !title.trim()) return false;
+	const stripped = title
+		.replace(/\b\d{3,4}p\b/gi, '')
+		.replace(/\b(4k|x26[45]|h\.?26[45]|hevc|avc)\b/gi, '')
+		.replace(/\b(web[-.]?dl|blu[-.]?ray|bdrip|hdrip|hdtv|webrip|dvdrip)\b/gi, '')
+		.replace(/\b(hdr10?|sdr|10bit|8bit|aac|ac3|dts|dd5\.?1|atmos|truehd|flac|mp3)\b/gi, '')
+		.replace(/\b(remux|proper|repack|internal|limited)\b/gi, '')
+		.replace(/[.\-_\[\](){}]/g, ' ')
+		.trim();
+	// Must have 2+ consecutive alphabetical characters OR a season/episode code
+	return /[a-z]{2}/i.test(stripped) || /s\d+e\d+/i.test(stripped);
+}

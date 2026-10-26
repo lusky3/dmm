@@ -1,37 +1,207 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-arm64-openssl-3.0.x"]
 }
 
 datasource db {
-  provider = "mysql"
-  url = env("DATABASE_URL")
+  provider     = "mysql"
+  url          = env("DATABASE_URL")
   relationMode = "prisma"
 }
 
 model Cache {
-  key   String @id
-  value Json
+  key       String   @id
+  value     Json
   updatedAt DateTime @updatedAt
 }
 
 model Scraped {
-  key   String @id
-  value Json
+  key       String   @id
+  value     Json
   updatedAt DateTime @updatedAt
 }
 
 model ScrapedTrue {
-  key   String @id
-  value Json
+  key       String   @id
+  value     Json
   updatedAt DateTime @updatedAt
 }
 
+/// One verdict per (movie, hash, filename): whether a scraped result belongs on
+/// the movie's page. Recorded for kept results too, so nothing is judged twice.
+model ScrapedVerdict {
+  id         Int      @id @default(autoincrement())
+  imdbId     String   @db.VarChar(16)
+  hash       String   @db.VarChar(40)
+  /// sha1 of the filename; the verdict depends on the filename, not the hash
+  titleKey   String   @db.Char(40)
+  title      String   @db.Text
+  verdict    String   @db.VarChar(8)
+  /// "rules" when code settled it, "identified" when content-identifier named the movie,
+  /// "jev" when the model's answers were needed
+  rule       String   @db.VarChar(16)
+  media      String?  @db.VarChar(16)
+  titleMatch String?  @db.VarChar(16)
+  engine     String   @db.VarChar(64)
+  createdAt  DateTime @default(now())
+
+  @@unique([imdbId, hash, titleKey])
+  @@index([imdbId, titleKey])
+  /// Which titles a release was judged for: the DMM Cast cover lookup reads by hash alone
+  @@index([hash])
+}
+
+/// Results moved off a movie page by a trash verdict, kept for review and
+/// restore: the original entry, where it came from, and the movie it was on.
+model ScrapedTrash {
+  id         Int      @id @default(autoincrement())
+  source     String   @db.VarChar(16)
+  key        String   @db.VarChar(191)
+  imdbId     String   @db.VarChar(16)
+  movieTitle String   @db.VarChar(500)
+  hash       String   @db.VarChar(40)
+  title      String   @db.Text
+  fileSize   Float?
+  rule       String   @db.VarChar(16)
+  engine     String   @db.VarChar(64)
+  trashedAt  DateTime @default(now())
+
+  @@index([imdbId])
+  @@index([hash])
+}
+
+model ScrapedMusic {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@index([updatedAt])
+}
+
+model MusicMetadata {
+  mbid       String   @id @db.VarChar(36)
+  artistMbid String?  @db.VarChar(36)
+  artist     String   @db.VarChar(500)
+  album      String   @db.VarChar(500)
+  year       Int?
+  updatedAt  DateTime @updatedAt
+  coverUrl   String?  @db.VarChar(500)
+
+  @@index([artist])
+  @@index([year])
+  @@fulltext([artist, album])
+}
+
+model AvailableMusic {
+  hash             String               @id
+  mbid             String               @db.VarChar(36)
+  filename         String
+  originalFilename String
+  bytes            BigInt
+  originalBytes    BigInt
+  host             String
+  progress         Int
+  status           String
+  ended            DateTime
+  updatedAt        DateTime             @updatedAt
+  files            AvailableMusicFile[]
+
+  @@index([status])
+  @@index([mbid])
+  @@index([mbid, hash])
+  @@index([mbid, status, bytes])
+}
+
+model AvailableMusicFile {
+  link           String         @id
+  file_id        Int
+  hash           String
+  path           String         @db.Text
+  bytes          BigInt
+  trackNumber    Int?
+  availableMusic AvailableMusic @relation(fields: [hash], references: [hash], onDelete: Cascade)
+
+  @@index([hash])
+}
+
+model ScrapedXxx {
+  hash            String    @id @db.VarChar(40)
+  name            String    @db.Text
+  size            BigInt
+  filesCount      Int?
+  seeders         Int?
+  leechers        Int?
+  videoResolution String?   @db.VarChar(20)
+  videoCodec      String?   @db.VarChar(20)
+  videoSource     String?   @db.VarChar(20)
+  languages       Json?
+  publishedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([updatedAt])
+  @@index([size])
+  @@index([seeders])
+  @@fulltext([name])
+}
+
+model ScrapedAudiobook {
+  hash        String    @id @db.VarChar(40)
+  name        String    @db.Text
+  size        BigInt
+  filesCount  Int?
+  seeders     Int?
+  leechers    Int?
+  languages   Json?
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([updatedAt])
+  @@index([size])
+  @@index([seeders])
+  @@fulltext([name])
+}
+
+model ScrapedComic {
+  hash        String    @id @db.VarChar(40)
+  name        String    @db.Text
+  size        BigInt
+  filesCount  Int?
+  seeders     Int?
+  leechers    Int?
+  languages   Json?
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([updatedAt])
+  @@index([size])
+  @@index([seeders])
+  @@fulltext([name])
+}
+
+model ScrapedEbook {
+  hash        String    @id @db.VarChar(40)
+  name        String    @db.Text
+  size        BigInt
+  filesCount  Int?
+  seeders     Int?
+  leechers    Int?
+  languages   Json?
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([updatedAt])
+  @@index([size])
+  @@index([seeders])
+  @@fulltext([name])
+}
+
 model Search {
-  key   String @id
-  value Json
+  key       String   @id
+  value     Json
   updatedAt DateTime @updatedAt
 }
 
@@ -40,15 +210,192 @@ model Cast {
   imdbId    String
   userId    String
   hash      String
-  url       String
+  url       String   @db.Text
   updatedAt DateTime @updatedAt
-  duration  Int      @default(0)
-  bitrate   Int      @default(0)
-  size      Int      @default(0)
-  mediaInfo Json?
+  size      BigInt   @default(0)
+  link      String?
 
-  @@index([imdbId, userId, updatedAt])
   @@unique([imdbId, userId, hash])
+  @@index([imdbId, userId, updatedAt])
+}
+
+model CastProfile {
+  userId            String   @id
+  clientId          String?
+  clientSecret      String?
+  updatedAt         DateTime @updatedAt
+  refreshToken      String?
+  // A pasted Real-Debrid API key, held instead of the OAuth triple. Both are
+  // bearer tokens for the same REST API; only the triple needs renewing, so
+  // the columns are mutually exclusive rather than both required.
+  apiKey            String?
+  movieMaxSize      Float    @default(0)
+  episodeMaxSize    Float    @default(0)
+  otherStreamsLimit Int      @default(5)
+  hideCastOption    Boolean  @default(false)
+}
+
+model TorBoxCast {
+  id        String   @id @default(uuid())
+  imdbId    String
+  userId    String
+  hash      String
+  url       String   @db.Text
+  updatedAt DateTime @updatedAt
+  size      BigInt   @default(0)
+  link      String?  @db.Text
+  torrentId Int?
+  fileId    Int?
+
+  @@unique([imdbId, userId, hash])
+  @@index([imdbId, userId, updatedAt])
+}
+
+model TorBoxCastProfile {
+  userId            String   @id
+  apiKey            String   @db.Text
+  updatedAt         DateTime @updatedAt
+  movieMaxSize      Float    @default(0)
+  episodeMaxSize    Float    @default(0)
+  otherStreamsLimit Int      @default(5)
+  hideCastOption    Boolean  @default(false)
+}
+
+model AllDebridCast {
+  id        String   @id @default(uuid())
+  imdbId    String
+  userId    String
+  hash      String
+  url       String   @db.Text
+  updatedAt DateTime @updatedAt
+  size      BigInt   @default(0)
+  link      String?  @db.Text
+  magnetId  Int?
+  fileIndex Int?
+
+  @@unique([imdbId, userId, hash])
+  @@index([imdbId, userId, updatedAt])
+}
+
+// Premiumize casts store a hash and a file path, never a link.
+//
+// `transfer/directdl` turns a cached hash into signed CDN links in one stateless
+// call - nothing lands in transfers, folders or storage - so every viewer
+// resolves the hash with their own key at play time. That also matters for
+// billing: Premiumize charges the *minting* account's fair-use pool, so a link
+// minted by the caster and handed to a viewer would spend the caster's quota.
+// There is nothing here that can rot, and nothing to re-mint into the row.
+model PremiumizeCast {
+  id        String   @id @default(uuid())
+  imdbId    String
+  userId    String
+  hash      String
+  url       String   @db.Text
+  updatedAt DateTime @updatedAt
+  size      BigInt   @default(0)
+  // The `path` directdl reports for this file, which is how play finds it again
+  path      String?  @db.Text
+
+  @@unique([imdbId, userId, hash])
+  @@index([imdbId, userId, updatedAt])
+}
+
+model PremiumizeCastProfile {
+  userId            String   @id
+  apiKey            String   @db.Text
+  updatedAt         DateTime @updatedAt
+  movieMaxSize      Float    @default(0)
+  episodeMaxSize    Float    @default(0)
+  otherStreamsLimit Int      @default(5)
+  hideCastOption    Boolean  @default(false)
+}
+
+model OffcloudCast {
+  id        String   @id @default(uuid())
+  imdbId    String
+  userId    String
+  hash      String
+  url       String   @db.Text
+  updatedAt DateTime @updatedAt
+  size      BigInt   @default(0)
+  // The path `cache/info` reports for this file, which is how play finds it again
+  path      String?  @db.Text
+
+  @@unique([imdbId, userId, hash])
+  @@index([imdbId, userId, updatedAt])
+}
+
+model OffcloudCastProfile {
+  userId            String   @id
+  apiKey            String   @db.Text
+  updatedAt         DateTime @updatedAt
+  movieMaxSize      Float    @default(0)
+  episodeMaxSize    Float    @default(0)
+  otherStreamsLimit Int      @default(5)
+  hideCastOption    Boolean  @default(false)
+}
+
+// Debrid-Link casts store a hash and a file path like their siblings, and one
+// thing none of the others can: the file's own download URL.
+//
+// `POST /seedbox/add` is idempotent by hash and the torrent id it returns is
+// *stable* - a bare-hash add, a magnet add, a duplicate add and a re-add after
+// removal all answer with the same id - so the viewer resolves the release with
+// their own credential at play time exactly as the other providers do.
+//
+// `downloadUrl` is the deliberate extra. A Debrid-Link URL carries no token, no
+// signature, no timestamp and no user id: the torrent id is the whole
+// capability, it serves any IP, and it keeps serving after the torrent is
+// deleted. That makes a stored one a genuine fallback when the viewer's own
+// credential cannot resolve the hash (quota spent, hour-long flood lockout,
+// dead token) - and, in exactly the same breath, an irrevocable capability to
+// the content. It is never logged and never handed to a client; only the play
+// route reads it, and only to redirect.
+model DebridLinkCast {
+  id          String   @id @default(uuid())
+  imdbId      String
+  userId      String
+  hash        String
+  // The filename, as in every sibling table - NOT the download URL.
+  url         String   @db.Text
+  updatedAt   DateTime @updatedAt
+  size        BigInt   @default(0)
+  // The file's path inside the release, which is how play finds it again
+  path        String?  @db.Text
+  // The keyless Debrid-Link URL for this file. Nullable: a row cast before this
+  // column existed, or one whose resolve produced no URL, still plays through
+  // the viewer's own credential.
+  downloadUrl String?  @db.Text
+
+  @@unique([imdbId, userId, hash])
+  @@index([imdbId, userId, updatedAt])
+}
+
+model DebridLinkCastProfile {
+  userId            String   @id
+  // Whatever `useDebridLinkCredential` held at enrol: an OAuth access token
+  // (`dl:accessToken`) or a pasted API token (`dl:apiKey`). Both go in the same
+  // `Authorization: Bearer` header, so nothing downstream has to tell them
+  // apart.
+  apiKey            String   @db.Text
+  // Written when the browser has one. Debrid-Link's real token lifetime is
+  // still unmeasured, so this is a column rather than a migration later.
+  refreshToken      String?  @db.Text
+  updatedAt         DateTime @updatedAt
+  movieMaxSize      Float    @default(0)
+  episodeMaxSize    Float    @default(0)
+  otherStreamsLimit Int      @default(5)
+  hideCastOption    Boolean  @default(false)
+}
+
+model AllDebridCastProfile {
+  userId            String   @id
+  apiKey            String   @db.Text
+  updatedAt         DateTime @updatedAt
+  movieMaxSize      Float    @default(0)
+  episodeMaxSize    Float    @default(0)
+  otherStreamsLimit Int      @default(5)
+  hideCastOption    Boolean  @default(false)
 }
 
 model Titles {
@@ -62,25 +409,945 @@ model Titles {
 }
 
 model Anime {
-  id         Int      @id @default(autoincrement())
-  anidb_id Int? @unique
+  id              Int     @id @default(autoincrement())
+  anidb_id        Int?    @unique
   anime_planet_id String? @unique
-  kitsu_id Int? @unique
-  mal_id Int? @unique
-  imdb_id String? @unique
-
-  title       String
-  type       String
-  aliases     Json
-  description String @db.Text
-
-  poster_url  String
-  background_url String
-  rating      Float
+  kitsu_id        Int?    @unique
+  mal_id          Int?    @unique
+  imdb_id         String? @unique
+  title           String
+  type            String
+  aliases         Json
+  description     String  @db.Text
+  poster_url      String
+  background_url  String
+  rating          Float
 
   @@index([anidb_id])
   @@index([anime_planet_id])
   @@index([kitsu_id])
   @@index([mal_id])
   @@index([imdb_id])
+}
+
+model Available {
+  hash             String          @id
+  imdbId           String
+  filename         String
+  originalFilename String
+  bytes            BigInt
+  originalBytes    BigInt
+  host             String
+  progress         Int
+  status           String
+  ended            DateTime
+  updatedAt        DateTime        @updatedAt
+  season           Int?
+  episode          Int?
+  files            AvailableFile[]
+
+  @@index([status])
+  @@index([imdbId])
+  @@index([imdbId, hash])
+  @@index([imdbId, status, season, episode, bytes])
+}
+
+model AvailableFile {
+  link      String    @id
+  file_id   Int
+  hash      String
+  path      String    @db.Text
+  bytes     BigInt
+  season    Int?
+  episode   Int?
+  available Available @relation(fields: [hash], references: [hash], onDelete: Cascade)
+
+  @@index([hash])
+  @@index([hash, season, episode])
+}
+
+model AvailableAd {
+  hash              String            @id
+  imdbId            String
+  filename          String
+  originalFilename  String
+  bytes             BigInt
+  originalBytes     BigInt
+  host              String
+  progress          Int
+  status            String
+  statusCode        Int?
+  ended             DateTime
+  updatedAt         DateTime          @updatedAt
+  createdAt         DateTime          @default(now())
+  season            Int?
+  episode           Int?
+  verifiedAt        DateTime          @default(now())
+  verificationCount Int               @default(1)
+  files             AvailableAdFile[]
+
+  @@index([status])
+  @@index([imdbId])
+  @@index([imdbId, hash])
+  @@index([imdbId, status, season, episode, bytes])
+  @@index([updatedAt])
+}
+
+model AvailableAdFile {
+  link        String      @id
+  file_id     Int
+  hash        String
+  path        String      @db.Text
+  bytes       BigInt
+  season      Int?
+  episode     Int?
+  availableAd AvailableAd @relation(fields: [hash], references: [hash], onDelete: Cascade)
+
+  @@index([hash])
+  @@index([hash, season, episode])
+}
+
+model User {
+  id                  Int                  @id @default(autoincrement())
+  patreonId           String?              @unique
+  githubId            String?              @unique
+  discordId           String?              @unique
+  patreonSubscription PatreonSubscription?
+}
+
+model PatreonSubscription {
+  id               Int      @id @default(autoincrement())
+  tier             String
+  perks            String
+  subscriptionDate DateTime @default(now())
+  userId           Int      @unique
+  user             User     @relation(fields: [userId], references: [id])
+}
+
+model Report {
+  id        Int      @id @default(autoincrement())
+  hash      String
+  imdbId    String
+  userId    String
+  type      String
+  createdAt DateTime @default(now())
+
+  @@unique([hash, userId])
+  @@index([imdbId])
+  @@index([hash])
+}
+
+model TrackerStats {
+  hash               String   @id
+  seeders            Int      @default(0)
+  leechers           Int      @default(0)
+  downloads          Int      @default(0)
+  successfulTrackers Int      @default(0)
+  totalTrackers      Int      @default(0)
+  lastChecked        DateTime @default(now())
+
+  @@index([lastChecked])
+}
+
+model TorrentSnapshot {
+  id        String   @id
+  hash      String
+  addedDate DateTime
+  payload   Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hash])
+  @@index([hash, addedDate])
+}
+
+model HashImdb {
+  id        String   @id
+  hash      String
+  imdbId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([hash])
+  @@index([imdbId])
+}
+
+/// What content-identifier made of a library release's filename. Keyed by hash
+/// and filename: the service names the title from the filename alone, so a
+/// made-up filename sent for a real hash never answers for the real filename.
+/// Staging only - a row reaches HashImdb, if ever, after review.
+model HashIdentification {
+  id        Int      @id @default(autoincrement())
+  hash      String   @db.VarChar(40)
+  /// sha1 of "auto3:" + the filename (the service decides movie or show); older
+  /// prefixes ("auto2:", "auto:", "tv:", none) are answers judged by older rules, no longer read
+  titleKey  String   @db.Char(40)
+  filename  String   @db.Text
+  /// "movie" or "tv"; null on rows from before the service decided
+  kind      String?  @db.VarChar(8)
+  /// null when nothing in IMDb matched
+  imdbId    String?  @db.VarChar(16)
+  title     String?  @db.VarChar(500)
+  year      Int?
+  score     Float?
+  /// about 98% precise on held-out casts; only these count as identified
+  confident Boolean
+  createdAt DateTime @default(now())
+
+  @@unique([hash, titleKey])
+  @@index([imdbId])
+}
+
+model HashPageCount {
+  hash      String   @id @db.VarChar(40)
+  pageCount Int
+  updatedAt DateTime
+
+  @@index([pageCount])
+}
+
+model MdblistCache {
+  id        String   @id
+  type      String
+  data      Json
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([type])
+  @@index([updatedAt])
+}
+
+model ZurgKeys {
+  apiKey     String    @id
+  createdAt  DateTime  @default(now())
+  validUntil DateTime?
+
+  @@index([validUntil])
+}
+
+model DmmApiKeys {
+  apiKey    String   @id
+  createdAt DateTime @default(now())
+}
+
+model StreamServerHealth {
+  host      String   @id
+  status    Int?
+  latencyMs Float?
+  ok        Boolean  @default(false)
+  error     String?  @db.Text
+  checkedAt DateTime
+  updatedAt DateTime @updatedAt
+
+  @@index([ok])
+  @@index([latencyMs])
+  @@index([checkedAt])
+}
+
+model RdOperationalHourly {
+  id           Int      @id @default(autoincrement())
+  hour         DateTime
+  operation    String
+  totalCount   Int      @default(0)
+  successCount Int      @default(0)
+  failureCount Int      @default(0)
+  otherCount   Int      @default(0)
+  successRate  Float    @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([hour, operation])
+  @@index([hour])
+  @@index([operation, hour])
+}
+
+model RdOperationalDaily {
+  id             Int      @id @default(autoincrement())
+  date           DateTime
+  operation      String
+  totalCount     Int
+  successCount   Int
+  failureCount   Int
+  avgSuccessRate Float
+  minSuccessRate Float
+  maxSuccessRate Float
+  peakHour       Int?
+  createdAt      DateTime @default(now())
+
+  @@unique([date, operation])
+  @@index([date])
+  @@index([operation, date])
+}
+
+model StreamCheckResult {
+  id        Int      @id @default(autoincrement())
+  ok        Boolean
+  latencyMs Float?
+  server    String?
+  error     String?
+  checkedAt DateTime @default(now())
+
+  @@index([checkedAt])
+}
+
+model TorrentioCheckResult {
+  id        Int      @id @default(autoincrement())
+  ok        Boolean
+  latencyMs Float?
+  error     String?  @db.Text
+  urls      Json     @default(dbgenerated("(_utf8mb4\\'[]\\')"))
+  checkedAt DateTime @default(now())
+
+  @@index([checkedAt])
+}
+
+model TorrentioHealthHourly {
+  id           Int      @id @default(autoincrement())
+  hour         DateTime @unique
+  successCount Int      @default(0)
+  totalCount   Int      @default(0)
+  successRate  Float    @default(0)
+  avgLatencyMs Float?
+  createdAt    DateTime @default(now())
+
+  @@index([hour])
+}
+
+model TorrentioHealthDaily {
+  id             Int      @id @default(autoincrement())
+  date           DateTime @unique
+  avgSuccessRate Float
+  minSuccessRate Float
+  maxSuccessRate Float
+  avgLatencyMs   Float?
+  checksCount    Int
+  createdAt      DateTime @default(now())
+
+  @@index([date])
+}
+
+model StreamHealthHourly {
+  id             Int      @id @default(autoincrement())
+  hour           DateTime @unique
+  totalServers   Int
+  workingServers Int
+  workingRate    Float
+  avgLatencyMs   Float?
+  minLatencyMs   Float?
+  maxLatencyMs   Float?
+  fastestServer  String?
+  checksInHour   Int      @default(1)
+  failedServers  Json
+  createdAt      DateTime @default(now())
+
+  @@index([hour])
+}
+
+model StreamHealthDaily {
+  id             Int      @id @default(autoincrement())
+  date           DateTime @unique
+  avgWorkingRate Float
+  minWorkingRate Float
+  maxWorkingRate Float
+  avgLatencyMs   Float?
+  checksCount    Int
+  alwaysWorking  Int      @default(0)
+  neverWorking   Int      @default(0)
+  flaky          Int      @default(0)
+  createdAt      DateTime @default(now())
+
+  @@index([date])
+}
+
+model ServerReliabilityDaily {
+  id           Int      @id @default(autoincrement())
+  date         DateTime
+  host         String
+  checksCount  Int
+  successCount Int
+  avgLatencyMs Float?
+  reliability  Float
+  createdAt    DateTime @default(now())
+
+  @@unique([date, host])
+  @@index([date])
+  @@index([host])
+  @@index([reliability])
+}
+
+// The four TorBoxCdnHealth / TorBoxCheckResult / TorBoxHealthHourly /
+// TorBoxHealthDaily models below are RETAINED BUT UNUSED. They held the results
+// of a synthetic probe DMM ran against api.torbox.app and the TorBox CDN nodes
+// every 5 minutes; that probe was removed because TorBox rate-limits a single
+// datacentre IP - measured 2026-08-25 at 5 of 12 pings answering HTTP 429 while
+// real users were succeeding at 96% - so the probe reported outages nobody was
+// having. TorBox availability is now counted from real user traffic in
+// TorBoxOperationalHourly / TorBoxOperationalDaily instead.
+//
+// No code reads or writes these four. The rows are kept so the history is not
+// destroyed; drop them in a migration once you are sure nothing wants it back.
+model TorBoxCdnHealth {
+  host      String   @id @db.VarChar(191)
+  region    String   @db.VarChar(32)
+  name      String   @db.VarChar(64)
+  status    Int?
+  latencyMs Float?
+  ok        Boolean
+  error     String?  @db.Text
+  checkedAt DateTime
+
+  @@index([ok])
+  @@index([region])
+}
+
+model TorBoxCheckResult {
+  id           Int      @id @default(autoincrement())
+  apiOk        Boolean
+  apiLatencyMs Float?
+  apiDetail    String?  @db.Text
+  authState    String   @db.VarChar(16)
+  authError    String?  @db.Text
+  totalNodes   Int      @default(0)
+  workingNodes Int      @default(0)
+  checkedAt    DateTime @default(now())
+
+  @@index([checkedAt])
+}
+
+model TorBoxHealthHourly {
+  id              Int      @id @default(autoincrement())
+  hour            DateTime @unique
+  totalNodes      Int
+  workingNodes    Int
+  workingRate     Float
+  apiSuccessCount Int      @default(0)
+  apiTotalCount   Int      @default(0)
+  apiSuccessRate  Float    @default(0)
+  avgLatencyMs    Float?
+  minLatencyMs    Float?
+  maxLatencyMs    Float?
+  fastestNode     String?  @db.VarChar(191)
+  checksInHour    Int      @default(1)
+  failedNodes     Json
+  createdAt       DateTime @default(now())
+
+  @@index([hour])
+}
+
+model TorBoxHealthDaily {
+  id                Int      @id @default(autoincrement())
+  date              DateTime @unique
+  avgWorkingRate    Float
+  minWorkingRate    Float
+  maxWorkingRate    Float
+  avgApiSuccessRate Float    @default(0)
+  avgLatencyMs      Float?
+  checksCount       Int
+  createdAt         DateTime @default(now())
+
+  @@index([date])
+}
+
+model ImdbTitleBasics {
+  tconst         String   @id @map("tconst") @db.VarChar(12)
+  titleType      String   @map("title_type") @db.VarChar(20)
+  primaryTitle   String?  @map("primary_title") @db.VarChar(500)
+  originalTitle  String?  @map("original_title") @db.VarChar(500)
+  isAdult        Boolean? @default(false) @map("is_adult")
+  startYear      Int?     @map("start_year") @db.UnsignedSmallInt
+  endYear        Int?     @map("end_year") @db.UnsignedSmallInt
+  runtimeMinutes Int?     @map("runtime_minutes") @db.UnsignedInt
+
+  @@index([titleType], map: "idx_title_type")
+  @@index([isAdult], map: "idx_is_adult")
+  @@index([startYear], map: "idx_start_year")
+  @@index([primaryTitle(length: 100)], map: "idx_primary_title")
+  @@fulltext([primaryTitle], map: "ft_ngram_primary_title")
+  @@fulltext([primaryTitle], map: "ft_primary_title")
+  @@map("imdb_title_basics")
+}
+
+model ImdbTitleAkas {
+  id              Int      @id @default(autoincrement()) @db.UnsignedInt
+  titleId         String   @map("title_id") @db.VarChar(12)
+  ordering        Int      @db.UnsignedSmallInt
+  title           String?  @db.Text
+  region          String?  @db.VarChar(10)
+  language        String?  @db.VarChar(10)
+  types           String?  @db.Text
+  attributes      String?  @db.Text
+  isOriginalTitle Boolean? @default(false) @map("is_original_title")
+
+  @@unique([titleId, ordering], map: "uk_title_ordering")
+  @@index([region], map: "idx_region")
+  @@index([language], map: "idx_language")
+  @@fulltext([title], map: "ft_title")
+  @@map("imdb_title_akas")
+}
+
+model ImdbTitleRatings {
+  tconst        String  @id @map("tconst") @db.VarChar(12)
+  averageRating Decimal @map("average_rating") @db.Decimal(3, 1)
+  numVotes      Int     @map("num_votes") @db.UnsignedInt
+
+  @@index([averageRating], map: "idx_rating")
+  @@index([averageRating, numVotes], map: "idx_rating_votes")
+  @@index([numVotes], map: "idx_votes")
+  @@map("imdb_title_ratings")
+}
+
+model ImdbTitleEpisode {
+  tconst        String @id @db.VarChar(12)
+  parentTconst  String @map("parent_tconst") @db.VarChar(12)
+  seasonNumber  Int?   @map("season_number") @db.UnsignedSmallInt
+  episodeNumber Int?   @map("episode_number") @db.UnsignedInt
+
+  @@index([parentTconst], map: "idx_parent")
+  @@index([parentTconst, seasonNumber, episodeNumber], map: "idx_season_episode")
+  @@map("imdb_title_episode")
+}
+
+model ImdbTitleGenres {
+  titleId String @map("title_id") @db.VarChar(12)
+  genreId Int    @map("genre_id") @db.UnsignedSmallInt
+
+  @@id([titleId, genreId])
+  @@index([genreId], map: "fk_tg_genre")
+  @@map("imdb_title_genres")
+}
+
+model ImdbGenres {
+  id   Int    @id @default(autoincrement()) @db.UnsignedSmallInt
+  name String @unique(map: "name") @db.VarChar(50)
+
+  @@map("imdb_genres")
+}
+
+model ImdbNameBasics {
+  nconst      String  @id @db.VarChar(12)
+  primaryName String? @map("primary_name") @db.VarChar(255)
+  birthYear   Int?    @map("birth_year") @db.UnsignedSmallInt
+  deathYear   Int?    @map("death_year") @db.UnsignedSmallInt
+
+  @@index([birthYear], map: "idx_birth_year")
+  @@map("imdb_name_basics")
+}
+
+model ImdbNameKnownTitles {
+  nameId  String @map("name_id") @db.VarChar(12)
+  titleId String @map("title_id") @db.VarChar(12)
+
+  @@id([nameId, titleId])
+  @@index([titleId], map: "idx_title")
+  @@map("imdb_name_known_titles")
+}
+
+model ImdbNameProfessions {
+  nameId       String @map("name_id") @db.VarChar(12)
+  professionId Int    @map("profession_id") @db.UnsignedSmallInt
+
+  @@id([nameId, professionId])
+  @@index([professionId], map: "fk_np_profession")
+  @@map("imdb_name_professions")
+}
+
+model ImdbProfessions {
+  id   Int    @id @default(autoincrement()) @db.UnsignedSmallInt
+  name String @unique(map: "name") @db.VarChar(100)
+
+  @@map("imdb_professions")
+}
+
+model DonationHistory {
+  id             String   @id @default(cuid())
+  createdAt      DateTime @default(now())
+  githubUsername String
+  amountInCents  Int
+  donationDate   DateTime @default(now())
+  donationMethod String
+  transactionId  String?
+  notes          String?
+  durationDays   Int
+  endDate        DateTime
+
+  @@index([donationDate])
+  @@index([githubUsername, createdAt])
+}
+
+model PatreonUsageHistory {
+  id             String    @id @default(cuid())
+  createdAt      DateTime  @default(now())
+  patreonUserId  String
+  githubUsername String
+  action         String
+  cooldownUntil  DateTime?
+
+  @@index([githubUsername])
+  @@index([patreonUserId, createdAt])
+}
+
+model RepoAccess {
+  id             String    @id @default(cuid())
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  githubUsername String
+  repoOwner      String
+  repoName       String
+  hasAccess      Boolean   @default(true)
+  grantedAt      DateTime  @default(now())
+  revokedAt      DateTime?
+  grantReason    String?
+  revokeReason   String?
+
+  @@unique([githubUsername, repoOwner, repoName])
+  @@index([githubUsername])
+  @@index([hasAccess, updatedAt])
+  @@index([repoOwner, repoName, hasAccess])
+}
+
+model Sponsors {
+  id                     String    @id @default(cuid())
+  shortId                String    @unique
+  createdAt              DateTime  @default(now())
+  updatedAt              DateTime  @updatedAt
+  githubUsername         String    @unique
+  githubSponsoring       Boolean   @default(false)
+  patreonUserId          String?   @unique
+  patreonEmail           String?
+  patreonAmount          Int       @default(0)
+  oneTimeDonationAmount  Int?
+  oneTimeDonationDate    DateTime?
+  oneTimeDonationEndDate DateTime?
+  discordUserId          String?   @unique
+  discordUsername        String?
+  zurgApiKey             String?   @unique
+  zurgApiKeyVersion      Int       @default(1)
+  dmmApiKey              String?   @unique
+  dmmApiKeyVersion       Int       @default(1)
+  discordStaff           Boolean   @default(false)
+
+  @@index([githubSponsoring, patreonAmount])
+  @@index([updatedAt])
+}
+
+/// A sponsor's own debrid credential, for the Torznab feed's availability filters.
+///
+/// Real-Debrid and AllDebrid availability is answered from `Available` and
+/// `AvailableAd`, which DMM populates itself. The other providers have no such
+/// table and no anonymous cache probe, so filtering on one means asking that
+/// provider with an account key. The key is the sponsor's own, linked once here
+/// rather than carried in the feed URL, where it would sit in every *arr's
+/// config file and in DMM's own access logs.
+model SponsorProviderKey {
+  shortId   String   @db.VarChar(16)
+  /// `tb`, `pm` or `oc`. Debrid-Link has no non-mutating availability check.
+  service   String   @db.VarChar(4)
+  apiKey    String   @db.Text
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@id([shortId, service])
+}
+
+/// A title a sponsor wants, for their zurg to fetch.
+///
+/// zurg polls `/api/sponsor/wanted` with the sponsor's DMM API key and fetches each
+/// item with its acquisition engine: a cached torrent onto a debrid account or an NZB
+/// for its Usenet backend. Keyed on the gatekeeper `shortId`, like
+/// `SponsorProviderKey`, so the website (sponsor token) and zurg (API key) name the
+/// same list. A show without `seasons` wants every season, new ones included.
+model WantedItem {
+  id           String    @id @default(uuid())
+  shortId      String    @db.VarChar(16)
+  imdbId       String    @db.VarChar(16)
+  /// `movie` or `show`.
+  kind         String    @db.VarChar(8)
+  title        String    @db.VarChar(512)
+  /// Season numbers wanted, or null for all of them.
+  seasons      Json?
+  createdAt    DateTime  @default(now())
+  /// When zurg acknowledged the film acquired. Shows stay followed.
+  fulfilledAt  DateTime?
+  /// When zurg last read this sponsor's list.
+  lastPolledAt DateTime?
+
+  /// Leads with `shortId`, so it also serves reading one sponsor's list.
+  @@unique([shortId, imdbId])
+}
+
+/// Which sponsorship let a cast profile store an "other streams" limit above
+/// the standard 5.
+///
+/// Stremio calls the stream routes with nothing but the profile's userId, so the
+/// stored limit alone kept a lapsed sponsor's 10 forever. A save above 5 writes
+/// the sponsor's shortId here, a save at 5 or below deletes the row, and the
+/// stream routes re-read the sponsorship it names. One table for all six
+/// providers rather than a column on each `*CastProfile`, so a missing table
+/// costs sponsors their 10 instead of failing every profile read.
+model CastSponsorGrant {
+  /// `rd`, `tb`, `ad`, `pm`, `oc` or `dl`.
+  service   String   @db.VarChar(4)
+  /// The `userId` of that provider's `*CastProfile` row.
+  userId    String
+  shortId   String   @db.VarChar(16)
+  updatedAt DateTime @updatedAt
+
+  @@id([service, userId])
+}
+
+model DiscordUser {
+  id              String   @id @default(cuid()) @db.VarChar(30)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  discordUserId   String   @unique
+  discordUsername String?
+  rdApiToken      String?
+}
+
+model TempAuthData {
+  id              String   @id @default(cuid())
+  token           String   @unique
+  createdAt       DateTime @default(now())
+  githubUsername  String?
+  githubId        String?
+  patreonUserId   String?
+  patreonEmail    String?
+  patreonFullName String?
+  discordUserId   String?
+  discordUsername String?
+  expiresAt       DateTime
+
+  @@index([expiresAt])
+  @@index([token])
+}
+
+model TorBoxOperationalHourly {
+  id           Int      @id @default(autoincrement())
+  hour         DateTime
+  operation    String
+  totalCount   Int      @default(0)
+  successCount Int      @default(0)
+  failureCount Int      @default(0)
+  otherCount   Int      @default(0)
+  successRate  Float    @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([hour, operation])
+  @@index([hour])
+  @@index([operation, hour])
+}
+
+model TorBoxOperationalDaily {
+  id             Int      @id @default(autoincrement())
+  date           DateTime
+  operation      String
+  totalCount     Int
+  successCount   Int
+  failureCount   Int
+  avgSuccessRate Float
+  minSuccessRate Float
+  maxSuccessRate Float
+  peakHour       Int?
+  createdAt      DateTime @default(now())
+
+  @@unique([date, operation])
+  @@index([date])
+  @@index([operation, date])
+}
+
+// Crowd-sourced TorBox CDN reachability, one row per region per hour.
+// Every count comes from a reader's own browser probing tb-cdn from their own
+// network - never from a probe of ours, which would only ever measure one
+// datacentre IP's standing with TorBox. See the status-page notes in AGENTS.md.
+model TorBoxCdnHourly {
+  id           Int      @id @default(autoincrement())
+  hour         DateTime
+  region       String   @db.VarChar(16)
+  okCount      Int      @default(0)
+  failCount    Int      @default(0)
+  latencySumMs Float    @default(0)
+  latencyCount Int      @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([hour, region])
+  @@index([hour])
+  @@index([region, hour])
+}
+
+model TorBoxCdnDaily {
+  id           Int      @id @default(autoincrement())
+  date         DateTime
+  region       String   @db.VarChar(16)
+  okCount      Int
+  failCount    Int
+  latencySumMs Float    @default(0)
+  latencyCount Int      @default(0)
+  minRate      Float    @default(0)
+  maxRate      Float    @default(0)
+  createdAt    DateTime @default(now())
+
+  @@unique([date, region])
+  @@index([date])
+  @@index([region, date])
+}
+
+/// A request for content the asker cannot fetch themselves.
+///
+/// The uploader needs two credentials to move a release: a Real-Debrid key for
+/// where it lands, and a TorBox or AllDebrid key for where the bytes come from.
+/// A user with only Real-Debrid holds half of that pair, so this table is where
+/// they leave the other half for somebody else to supply.
+///
+/// It lives here rather than in the uploader because there are two uploader
+/// hosts with two separate SQLite files, and a board has to be one list.
+///
+/// `requesterId` and `fulfillerId` are DMM user ids — the HMAC of the
+/// Real-Debrid username that `generateUserId` produces — which is also what
+/// `CastProfile.userId` is keyed on. That join is deliberate: fulfilment mints a
+/// fresh Real-Debrid token from the requester's stored OAuth triple, because an
+/// access token dies in 24 hours and a request may sit here for days.
+model ContentRequest {
+  id          String   @id @default(uuid())
+  hash        String
+  imdbId      String
+  title       String?  @db.Text
+  mediaType   String
+  requesterId String
+  status      String   @default("open")
+  fulfillerId String?
+  /// The uploader job once one exists, and which host is running it — job ids
+  /// are generated per host and collide across them.
+  jobId       String?
+  jobHost     String?  @db.Text
+  error       String?  @db.Text
+  /// The whole release in bytes, for the transfer size cap and host routing.
+  sizeBytes   BigInt?
+  /// The page it was asked from, so a completed transfer is filed under the
+  /// right film or season.
+  returnPath  String?  @db.Text
+  /// When the transfer landed, so a fulfiller's sends can be counted by day.
+  /// `updatedAt` moves on any later write, a thank-you included.
+  fulfilledAt DateTime?
+  /// When the asker thanked whoever sent it.
+  thankedAt   DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  /// One ask per release per person, so re-asking cannot queue the same thing twice.
+  @@unique([hash, requesterId])
+  @@index([status, createdAt])
+  @@index([requesterId, status])
+  @@index([imdbId])
+  @@index([fulfillerId, status])
+}
+
+/// A fulfiller's identity on the board, tied to the gatekeeper sponsorship that
+/// collects the sponsor time their sends earn. A fulfiller is known by the id
+/// they fulfilled under — a Real-Debrid-derived DMM id or a TorBox user id — so
+/// one person can hold two rows pointing at the same sponsorship.
+model FulfillerLink {
+  fulfillerId String   @id
+  shortId     String   @db.VarChar(16)
+  /// Opted in to their GitHub name on the leaderboard.
+  showName    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([shortId])
+}
+
+/// Sponsor time earned by fulfilling requests. DMM's own: gatekeeper never reads
+/// it, so it opens DMM's sponsor perks and nothing gatekeeper grants.
+model SponsorEarned {
+  shortId        String   @id @db.VarChar(16)
+  earnedUntil    DateTime
+  /// How many reward blocks have been paid, so a recount never pays one twice.
+  creditedBlocks Int      @default(0)
+  updatedAt      DateTime @updatedAt
+}
+
+/// A copyright notice as it arrived. Nothing it names is blocked until an
+/// operator approves it; the row stays as the record of what was asked and when
+/// it was acted on.
+model TakedownNotice {
+  id            String    @id @default(uuid())
+  /// pending, approved or rejected.
+  status        String    @default("pending")
+  claimantName  String    @db.VarChar(200)
+  claimantEmail String    @db.VarChar(320)
+  /// Whom the claimant acts for, when that is not themselves.
+  representing  String?   @db.VarChar(200)
+  work          String    @db.Text
+  reason        String    @db.Text
+  /// The locations exactly as submitted, so a review sees what was asked
+  /// rather than only what the parser understood.
+  locations     String    @db.MediumText
+  hashes        Json
+  releases      Json
+  hashlistIds   Json
+  submitterIp   String?   @db.VarChar(64)
+  reviewNote    String?   @db.Text
+  reviewedAt    DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([status, createdAt])
+}
+
+/// A torrent infohash removed by an approved notice. Lowercase hex.
+model BlockedHash {
+  hash      String   @id @db.VarChar(40)
+  noticeId  String
+  createdAt DateTime @default(now())
+
+  @@index([noticeId])
+}
+
+/// A Usenet release removed by an approved notice, by normalized name.
+model BlockedRelease {
+  name      String   @id @db.VarChar(191)
+  noticeId  String
+  createdAt DateTime @default(now())
+
+  @@index([noticeId])
+}
+
+/// A rex server's own `<hash>.rex-direct.debridmediamanager.com` name, so Plex
+/// clients reach it over HTTPS from anywhere without the operator owning a domain
+/// (dmm's own plex.direct; `src/pages/api/rex-direct`). The hash is random and
+/// stored, never derived from the machineIdentifier -- that id is public via
+/// `/identity`, and a derivable hash would leak the server's home IP. Open to any
+/// rex claimed on a Plex account (its server token proves the account owns it);
+/// rows from the sponsor-only days carry the sponsorship instead.
+model RexDirectName {
+  machineIdentifier String    @id @db.VarChar(64)
+  hash              String    @unique @db.VarChar(64)
+  /// The sponsorship that registered this name, for the old sponsor-key path.
+  shortId           String?   @db.VarChar(16)
+  /// The Plex account the server is claimed on, for the per-account cap.
+  plexAccountId     String?   @db.VarChar(32)
+  /// The source IP the A record was last pointed at, so an unchanged heartbeat
+  /// skips the Cloudflare write.
+  lastIp            String?   @db.VarChar(64)
+  /// This server's own certificate for its name (ZeroSSL, `utils/rexDirectAcme`).
+  certificate       String?   @db.MediumText
+  privateKey        String?   @db.Text
+  certExpiresAt     DateTime?
+  /// Set while a certificate is being issued, so replicas and heartbeats do not
+  /// start a second order; a stale one (15 min) is taken over.
+  issuingSince      DateTime?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([shortId])
+  @@index([plexAccountId])
+}
+
+/// The current `*.rex-direct.debridmediamanager.com` wildcard cert, written by the
+/// renewal cron on dmm-01 and served to rex servers by the register endpoint. One
+/// row (`id` = "current"). The dmm_web container has no host mount, so the cert
+/// reaches it through the database rather than a file path.
+model RexDirectCert {
+  id         String   @id @db.VarChar(16)
+  fullchain  String   @db.MediumText
+  privkey    String   @db.MediumText
+  updatedAt  DateTime @updatedAt
 }

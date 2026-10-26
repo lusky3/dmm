@@ -1,0 +1,24 @@
+import { CAST_STREAM_RESOURCE } from '@/services/anime/stremioAnimeIds';
+import { CAST_ADDON_VERSIONS } from '@/utils/castAddonVersions';
+import { NextApiRequest, NextApiResponse } from 'next';
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+	const host = req.headers.host || '';
+	const isDev = !host.includes('debridmediamanager.com');
+	const name = isDev ? '[LOCAL] DMM Cast for TorBox (No Library)' : 'DMM Cast for TorBox';
+
+	res.setHeader('access-control-allow-origin', '*');
+	res.status(200).json({
+		id: 'com.debridmediamanager.cast.torbox',
+		name,
+		description:
+			'Cast your preferred Debrid Media Manager streams to your Stremio device using TorBox; supports Anime, TV shows and Movies!',
+		logo: 'https://static.debridmediamanager.com/dmmcast.png',
+		background: 'https://static.debridmediamanager.com/background.png',
+		version: CAST_ADDON_VERSIONS.torbox,
+		resources: [CAST_STREAM_RESOURCE],
+		types: ['movie', 'series', 'anime'],
+		catalogs: [],
+		behaviorHints: { adult: false, p2p: false },
+	});
+}

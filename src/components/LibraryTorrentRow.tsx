@@ -1,0 +1,864 @@
+import { UserTorrent, UserTorrentStatus } from '@/torrent/userTorrent';
+import {
+	handleReinsertTorrentinRd,
+	handleRestartTbTorrent,
+	handleRestartTorrent,
+} from '@/utils/addMagnet';
+import { getAllDebridStatusText } from '@/utils/allDebridStatus';
+import { canReinsert } from '@/utils/canReinsert';
+import { handleCopyOrDownloadMagnet } from '@/utils/copyMagnet';
+import { getDebridLinkStatusText } from '@/utils/debridLinkStatus';
+import { runDebridTransferToRd } from '@/utils/debridUploader';
+import {
+	handleDeleteAdTorrent,
+	handleDeleteDlTorrent,
+	handleDeleteOcTorrent,
+	handleDeletePmTorrent,
+	handleDeleteRdTorrent,
+	handleDeleteTbTorrent,
+} from '@/utils/deleteTorrent';
+import { handleShare } from '@/utils/hashList';
+import type { LibraryGrouping } from '@/utils/libraryGrouping';
+import type { LibraryIdentification } from '@/utils/libraryIdentify';
+import { getOffcloudStatusText } from '@/utils/offcloudStatus';
+import { getPremiumizeStatusText } from '@/utils/premiumizeStatus';
+import { getRealDebridStatusText } from '@/utils/realDebridStatus';
+import { torrentPrefix } from '@/utils/results';
+import { shortenNumber } from '@/utils/speed';
+import { getTorBoxStatusText } from '@/utils/torBoxStatus';
+import { isWebDownloadRowId } from '@/utils/torboxWebDownload';
+import {
+	BadgeCheck,
+	Cast,
+	Check,
+	Film,
+	FolderOpen,
+	Leaf,
+	Link2,
+	Loader2,
+	Plus,
+	RefreshCw,
+	Search,
+	Send,
+	Share2,
+	Trash2,
+	Tv,
+} from 'lucide-react';
+import Link from 'next/link';
+import { useRouter } from 'next/router';
+import { memo, ReactNode, useState } from 'react';
+import { toast } from 'react-hot-toast';
+import { CastSearchModal } from './CastSearchModal';
+import ImdbPickerModal, { ImdbPick } from './ImdbPickerModal';
+
+const ONE_GIGABYTE = 1024 * 1024 * 1024;
+
+// What each provider calls a finished, playable torrent.
+const DONE_STATUS_TEXTS = new Set(['Downloaded', 'Ready', 'cached', 'Finished', 'completed']);
+
+// "The.Movie.2020.mkv" and "The Movie (2020)" name the same thing
+const normalizeName = (name: string) =>
+	name
+		.replace(/ ➡️ .*$/, '')
+		.toLowerCase()
+		.replace(/\.(mkv|mp4|avi)$/, '')
+		.replace(/\((\d{4})\)/, '$1')
+		.replace(/[^a-z0-9]+/g, '');
+
+interface TorrentRowProps {
+	torrent: UserTorrent;
+	rdKey: string | null;
+	adKey: string | null;
+	tbKey: string | null;
+	pmKey: string | null;
+	ocKey: string | null;
+	dlKey: string | null;
+	shouldDownloadMagnets: boolean;
+	grouping: LibraryGrouping;
+	hashFilter?: string;
+	titleFilter?: string;
+	tvTitleFilter?: string;
+	isSelected: boolean;
+	onSelect: (id: string) => void;
+	onDelete: (id: string) => void;
+	onShowInfo: (torrent: UserTorrent) => void;
+	onTypeChange: (torrent: UserTorrent) => void;
+	onRefreshLibrary?: () => Promise<void>;
+	/** The movie or show content-identifier confidently named from the filename. */
+	identification?: LibraryIdentification;
+}
+
+function TorrentRow({
+	torrent,
+	rdKey,
+	adKey,
+	tbKey,
+	pmKey,
+	ocKey,
+	dlKey,
+	shouldDownloadMagnets,
+	grouping,
+	hashFilter,
+	titleFilter,
+	tvTitleFilter,
+	isSelected,
+	onSelect,
+	onDelete,
+	onShowInfo,
+	onTypeChange,
+	onRefreshLibrary,
+	identification,
+}: TorrentRowProps) {
+	const router = useRouter();
+	const [showCastModal, setShowCastModal] = useState(false);
+	const [castTorrentInfo, setCastTorrentInfo] = useState<any>(null);
+	const [isCasting, setIsCasting] = useState(false);
+	const [showSendModal, setShowSendModal] = useState(false);
+	const [isSendingToRd, setIsSendingToRd] = useState(false);
+
+	// A TorBox/AllDebrid library torrent can be pushed into RD, but library
+	// torrents carry no imdb id, so the user picks the title first. The matching
+	// source key must be present (it is, since the torrent lives in that service).
+	const isTbTorrent = torrent.id.startsWith('tb:');
+	// A TorBox web download has no magnet, no swarm and no shareable infohash,
+	// so the actions built on those are meaningless for it.
+	const isTbWebDownload = isWebDownloadRowId(torrent.id);
+	// Premiumize reports no info hash for a transfer, and none at all for content
+	// whose transfer record is gone; an Offcloud row created from a plain HTTP
+	// URL never had one to report. Magnet-shaped actions have nothing to work
+	// with on those rows.
+	const hasInfoHash = /^[a-fA-F0-9]{40}$/.test(torrent.hash);
+	// TorBox only: AllDebrid is withdrawn as a transfer source, because it answers
+	// `NO_SERVER` to the uploader hosts and `AUTH_BLOCKED` to most submitters'
+	// keys, so an AD row's transfer could only ever fail.
+	const canSendToRd = !!rdKey && /^[a-fA-F0-9]{40}$/.test(torrent.hash) && isTbTorrent && !!tbKey;
+
+	const handleSendPick = async (pick: ImdbPick) => {
+		setShowSendModal(false);
+		if (!rdKey || isSendingToRd) return;
+		setIsSendingToRd(true);
+		try {
+			await runDebridTransferToRd({
+				hash: torrent.hash,
+				imdbId: pick.imdbId,
+				rdKey,
+				tbKey: tbKey ?? undefined,
+				sizeBytes: torrent.bytes,
+				title: torrent.title || torrent.filename,
+				returnPath: '/library',
+			});
+		} finally {
+			setIsSendingToRd(false);
+		}
+	};
+
+	// Helper function to get user-friendly status text for any service
+	const getStatusText = (torrent: UserTorrent): string => {
+		if (torrent.id.startsWith('rd:')) {
+			return getRealDebridStatusText(torrent.serviceStatus);
+		} else if (torrent.id.startsWith('ad:')) {
+			return getAllDebridStatusText(torrent.serviceStatus);
+		} else if (torrent.id.startsWith('tb:')) {
+			return getTorBoxStatusText(torrent.serviceStatus);
+		} else if (torrent.id.startsWith('pm:')) {
+			return getPremiumizeStatusText(torrent.serviceStatus);
+		} else if (torrent.id.startsWith('oc:')) {
+			return getOffcloudStatusText(torrent.serviceStatus);
+		} else if (torrent.id.startsWith('dl:')) {
+			return getDebridLinkStatusText(torrent.serviceStatus);
+		}
+		return torrent.serviceStatus; // Fallback to raw status
+	};
+
+	const [castService, setCastService] = useState<'rd' | 'ad' | 'tb' | 'pm' | 'oc' | 'dl' | null>(
+		null
+	);
+
+	// An id picked in the cast modal is the user's and is saved under the hash; an
+	// identified one only casts (`identified=1` keeps it out of the hash map), so a
+	// row the identifier named casts without asking
+	const castImdbQuery = (imdbId: string | undefined, separator: '?' | '&') => {
+		if (imdbId) return `${separator}imdbId=${imdbId}`;
+		if (identification) return `${separator}imdbId=${identification.imdbId}&identified=1`;
+		return '';
+	};
+
+	// Handler for cast button click
+	const handleCastClick = async (imdbId?: string) => {
+		if (!rdKey || !torrent.id.startsWith('rd:')) return;
+
+		const rdId = torrent.id.substring(3);
+		if (!rdId || !torrent.hash) return;
+
+		setCastService('rd');
+		setIsCasting(true);
+		try {
+			// Key in the header, not the query string - see castApiClient.
+			const castUrl = `/api/stremio/cast/library/${rdId}:${torrent.hash}${castImdbQuery(imdbId, '?')}`;
+			const response = await fetch(castUrl, {
+				headers: { Authorization: `Bearer ${rdKey}` },
+			});
+			const data = await response.json();
+
+			if (data.status === 'need_imdb_id') {
+				setCastTorrentInfo(data.torrentInfo);
+				setShowCastModal(true);
+			} else if (data.status === 'error') {
+				toast.error(data.errorMessage || 'Failed to cast to Stremio');
+			} else if (data.status === 'success') {
+				window.location.href = data.redirectUrl;
+				toast.success('Opening in Stremio...');
+			}
+		} catch (error) {
+			console.error('Cast error:', error);
+			toast.error('Failed to cast to Stremio');
+		} finally {
+			setIsCasting(false);
+		}
+	};
+
+	const handleAdCastClick = async (imdbId?: string) => {
+		if (!adKey || !torrent.id.startsWith('ad:')) return;
+
+		const adId = torrent.id.substring(3);
+		if (!adId || !torrent.hash) return;
+
+		setCastService('ad');
+		setIsCasting(true);
+		try {
+			const castUrl = `/api/stremio-ad/cast/library/${adId}:${torrent.hash}${castImdbQuery(imdbId, '?')}`;
+			const response = await fetch(castUrl, {
+				headers: { Authorization: `Bearer ${adKey}` },
+			});
+			const data = await response.json();
+
+			if (data.status === 'need_imdb_id') {
+				setCastTorrentInfo(data.torrentInfo);
+				setShowCastModal(true);
+			} else if (data.status === 'error') {
+				toast.error(data.errorMessage || 'Failed to cast to Stremio');
+			} else if (data.status === 'success') {
+				window.location.href = data.redirectUrl;
+				toast.success('Opening in Stremio...');
+			}
+		} catch (error) {
+			console.error('Cast error:', error);
+			toast.error('Failed to cast to Stremio');
+		} finally {
+			setIsCasting(false);
+		}
+	};
+
+	const handleTbCastClick = async (imdbId?: string) => {
+		if (!tbKey || !torrent.id.startsWith('tb:')) return;
+
+		const tbId = torrent.id.substring(3);
+		if (!tbId || !torrent.hash) return;
+
+		setCastService('tb');
+		setIsCasting(true);
+		try {
+			const castUrl = `/api/stremio-tb/cast/library/${tbId}:${torrent.hash}${castImdbQuery(imdbId, '?')}`;
+			const response = await fetch(castUrl, {
+				headers: { Authorization: `Bearer ${tbKey}` },
+			});
+			const data = await response.json();
+
+			if (data.status === 'need_imdb_id') {
+				setCastTorrentInfo(data.torrentInfo);
+				setShowCastModal(true);
+			} else if (data.status === 'error') {
+				toast.error(data.errorMessage || 'Failed to cast to Stremio');
+			} else if (data.status === 'success') {
+				window.location.href = data.redirectUrl;
+				toast.success('Opening in Stremio...');
+			}
+		} catch (error) {
+			console.error('Cast error:', error);
+			toast.error('Failed to cast to Stremio');
+		} finally {
+			setIsCasting(false);
+		}
+	};
+
+	const handlePmCastClick = async (imdbId?: string) => {
+		if (!pmKey || !torrent.id.startsWith('pm:')) return;
+
+		// Premiumize resolves a cast from the info hash alone, and a row whose
+		// transfer record was cleared reports none - there is nothing to cast.
+		if (!torrent.hash) return;
+
+		setCastService('pm');
+		setIsCasting(true);
+		try {
+			const castUrl = `/api/stremio-pm/cast/library/${torrent.hash}${castImdbQuery(imdbId, '?')}`;
+			const response = await fetch(castUrl, {
+				headers: { Authorization: `Bearer ${pmKey}` },
+			});
+			const data = await response.json();
+
+			if (data.status === 'need_imdb_id') {
+				setCastTorrentInfo(data.torrentInfo);
+				setShowCastModal(true);
+			} else if (data.status === 'error') {
+				toast.error(data.errorMessage || 'Failed to cast to Stremio');
+			} else if (data.status === 'success') {
+				window.location.href = data.redirectUrl;
+				toast.success('Opening in Stremio...');
+			}
+		} catch (error) {
+			console.error('Cast error:', error);
+			toast.error('Failed to cast to Stremio');
+		} finally {
+			setIsCasting(false);
+		}
+	};
+
+	const handleOcCastClick = async (imdbId?: string) => {
+		if (!ocKey || !torrent.id.startsWith('oc:')) return;
+
+		// Offcloud resolves a cast from the info hash alone, and a row created
+		// from a plain HTTP submission never had one - there is nothing to cast.
+		if (!torrent.hash) return;
+
+		setCastService('oc');
+		setIsCasting(true);
+		try {
+			// The request id rides along so the route can fall back to
+			// `cloud/explore` for an item this account holds but Offcloud's
+			// shared cache does not.
+			const requestId = torrent.id.substring(3);
+			const castUrl = `/api/stremio-oc/cast/library/${torrent.hash}?requestId=${encodeURIComponent(requestId)}${castImdbQuery(imdbId, '&')}`;
+			const response = await fetch(castUrl, {
+				headers: { Authorization: `Bearer ${ocKey}` },
+			});
+			const data = await response.json();
+
+			if (data.status === 'need_imdb_id') {
+				setCastTorrentInfo(data.torrentInfo);
+				setShowCastModal(true);
+			} else if (data.status === 'error') {
+				toast.error(data.errorMessage || 'Failed to cast to Stremio');
+			} else if (data.status === 'success') {
+				window.location.href = data.redirectUrl;
+				toast.success('Opening in Stremio...');
+			}
+		} catch (error) {
+			console.error('Cast error:', error);
+			toast.error('Failed to cast to Stremio');
+		} finally {
+			setIsCasting(false);
+		}
+	};
+
+	const handleDlCastClick = async (imdbId?: string) => {
+		if (!dlKey || !torrent.id.startsWith('dl:')) return;
+
+		// The cast is addressed by hash, because play resolves by hash with the
+		// viewer's own credential. Debrid-Link reports `hashString` on every
+		// seedbox row, so unlike Premiumize and Offcloud there is no hashless
+		// case - but a row restored from an old cache could still lack one.
+		if (!torrent.hash) return;
+
+		setCastService('dl');
+		setIsCasting(true);
+		try {
+			// The torrent id rides along and is what the route prefers: listing a
+			// torrent by id costs no quota, while resolving by hash means an add,
+			// which spends one of the day's 50 torrents. Casting something the
+			// user is already looking at in their library should be free.
+			const torrentId = torrent.id.substring(3);
+			const castUrl = `/api/stremio-dl/cast/library/${torrent.hash}?torrentId=${encodeURIComponent(torrentId)}${castImdbQuery(imdbId, '&')}`;
+			const response = await fetch(castUrl, {
+				headers: { Authorization: `Bearer ${dlKey}` },
+			});
+			const data = await response.json();
+
+			if (data.status === 'need_imdb_id') {
+				setCastTorrentInfo(data.torrentInfo);
+				setShowCastModal(true);
+			} else if (data.status === 'error') {
+				toast.error(data.errorMessage || 'Failed to cast to Stremio');
+			} else if (data.status === 'success') {
+				window.location.href = data.redirectUrl;
+				toast.success('Opening in Stremio...');
+			}
+		} catch (error) {
+			console.error('Cast error:', error);
+			toast.error('Failed to cast to Stremio');
+		} finally {
+			setIsCasting(false);
+		}
+	};
+
+	// Handler for IMDB ID selection from modal
+	const handleSelectImdbId = async (imdbId: string) => {
+		setShowCastModal(false);
+		if (castService === 'dl') {
+			await handleDlCastClick(imdbId);
+		} else if (castService === 'oc') {
+			await handleOcCastClick(imdbId);
+		} else if (castService === 'pm') {
+			await handlePmCastClick(imdbId);
+		} else if (castService === 'tb') {
+			await handleTbCastClick(imdbId);
+		} else if (castService === 'ad') {
+			await handleAdCastClick(imdbId);
+		} else {
+			await handleCastClick(imdbId);
+		}
+	};
+
+	// Calculate filter texts
+	const hashGroupCount = grouping.hashCounts.get(torrent.hash) ?? 0;
+	const hashFilterText = hashGroupCount > 1 && !hashFilter ? `${hashGroupCount} same hash` : '';
+
+	const titleGroup = grouping.titleGroupsById[torrent.id];
+	const titleKey = titleGroup.filter;
+	const titleGroupCount = titleGroup.count;
+	const titleFilterText =
+		titleGroupCount > 1 && !titleFilter && !hashFilter ? `${titleGroupCount} same title` : '';
+
+	let tvTitleFilterText = '';
+	const tvTitleKey = grouping.tvTitlesById[torrent.id];
+	if (tvTitleKey !== undefined) {
+		const tvTitleGroupCount = grouping.tvTitleCounts.get(tvTitleKey) ?? 0;
+		if (tvTitleGroupCount > 1 && !tvTitleFilter && titleGroupCount < tvTitleGroupCount) {
+			tvTitleFilterText = `${tvTitleGroupCount} same show`;
+		}
+	}
+
+	const hashChip = hashFilterText ? (
+		<Link
+			href={`/library?hash=${torrent.hash}&page=1`}
+			className="ml-1 inline-block cursor-pointer rounded border-2 border-orange-500 bg-orange-900/30 px-1 py-0 text-xs font-bold text-orange-100 transition-colors hover:bg-orange-800/50"
+			onClick={(e) => e.stopPropagation()}
+		>
+			{hashFilterText}
+		</Link>
+	) : null;
+
+	// A magnet the provider has not named yet reports its hash as the filename;
+	// the hash as a title says nothing, so the row reads "Magnet" like the others.
+	const isMagnetRow =
+		['Invalid Magnet', 'Magnet', 'noname'].includes(torrent.filename) ||
+		torrent.filename === torrent.hash;
+	const displayTitle = identification
+		? `${identification.title}${identification.year ? ` (${identification.year})` : ''}${
+				// a show's parsed title ends in the seasons it holds: "Title ➡️ S01"
+				torrent.title.includes(' ➡️ ')
+					? torrent.title.slice(torrent.title.indexOf(' ➡️ '))
+					: ''
+			}`
+		: torrent.title;
+	const filenameIsTitle = normalizeName(torrent.filename) === normalizeName(displayTitle);
+	const multipleServices = [rdKey, adKey, tbKey, pmKey, ocKey, dlKey].filter(Boolean).length > 1;
+
+	// The provider's own word for "done" is on nearly every row and says nothing;
+	// anything else (expired, stalled, an error, a transfer under way) is shown.
+	const statusText = getStatusText(torrent);
+	const progress = torrent.progress ?? 0;
+	let statusLine: ReactNode = null;
+	if (
+		torrent.status !== UserTorrentStatus.finished &&
+		torrent.status !== UserTorrentStatus.error
+	) {
+		statusLine =
+			progress > 0 || torrent.speed > 0 ? (
+				<>
+					<span className="inline-block align-middle">{progress.toFixed(2)}%&nbsp;</span>
+					{torrent.speed > 0 ? (
+						<>
+							<span className="inline-block align-middle">
+								<Leaf className="inline-block h-4 w-4 text-green-500" />
+							</span>
+							<span className="mr-1 inline-block align-middle">
+								{torrent.seeders}
+							</span>
+							<span className="inline-block align-middle">
+								{shortenNumber(torrent.speed)}B/s
+							</span>
+						</>
+					) : (
+						<span className="inline-block align-middle">{statusText}</span>
+					)}
+				</>
+			) : (
+				statusText
+			);
+	} else if (torrent.status === UserTorrentStatus.error || !DONE_STATUS_TEXTS.has(statusText)) {
+		statusLine = statusText;
+	}
+	const added = new Date(torrent.added);
+
+	return (
+		<>
+			{/* Below lg the row is a card: title and filename take the full width beside
+			    the select toggle, and size, status, date and actions wrap beneath them.
+			    From lg up the title cell's max-w-0 truncates it rather than letting a long
+			    filename widen the table past the window. */}
+			<tr
+				className={`border-b border-gray-800 align-middle max-lg:flex max-lg:flex-wrap max-lg:items-center max-lg:py-1 lg:hover:bg-gray-800/50 ${isSelected ? 'bg-green-800' : ''}`}
+			>
+				<td
+					onClick={() => onSelect(torrent.id)}
+					className="truncate px-0.5 py-1 text-center text-sm max-lg:w-8"
+				>
+					{isSelected ? (
+						<Check className="inline-block h-4 w-4 text-green-500" />
+					) : (
+						<Plus className="inline-block h-4 w-4 text-gray-500" />
+					)}
+				</td>
+				<td
+					onClick={() => onShowInfo(torrent)}
+					className="truncate px-0.5 py-1 text-sm max-lg:grow max-lg:basis-[calc(100%-2rem)] max-lg:[overflow-wrap:anywhere] max-lg:whitespace-normal lg:max-w-0"
+				>
+					{isMagnetRow ? (
+						<>
+							{torrent.filename === torrent.hash ? 'Magnet' : torrent.filename}
+							{hashChip}
+						</>
+					) : (
+						<>
+							<div
+								className="inline-block cursor-pointer"
+								onClick={(e) => {
+									e.stopPropagation();
+									onTypeChange(torrent);
+								}}
+							>
+								{
+									{
+										movie: (
+											<Film className="inline-block h-4 w-4 text-yellow-500" />
+										),
+										tv: <Tv className="inline-block h-4 w-4 text-cyan-500" />,
+										other: (
+											<FolderOpen className="inline-block h-4 w-4 text-orange-500" />
+										),
+									}[torrent.mediaType]
+								}
+							</div>
+							&nbsp;
+							{identification ? (
+								<strong>
+									{displayTitle}
+									{/* the no-break space keeps the badge on the title's last line */}
+									{'\u00a0'}
+									<Link
+										href={`/${identification.kind === 'tv' ? 'show' : 'movie'}/${identification.imdbId}`}
+										target="_blank"
+										aria-label={`Go to ${identification.kind === 'tv' ? 'show' : 'movie'} page`}
+										title={`Verified: identified from the filename as ${identification.imdbId}. Open the ${identification.kind === 'tv' ? 'show' : 'movie'} page`}
+										className="inline-block align-[-3px]"
+										onClick={(e) => e.stopPropagation()}
+									>
+										<BadgeCheck
+											className="block h-4 w-4 text-sky-400 hover:text-sky-300"
+											aria-label={`Verified: identified from the filename as ${identification.imdbId}`}
+										/>
+									</Link>
+								</strong>
+							) : (
+								<strong>{torrent.title}</strong>
+							)}
+							{!identification && torrent.info && (
+								<>
+									{/* glued to the title so the icon never wraps onto a line alone */}
+									{'\u00a0'}
+									<Link
+										href={`/search?query=${encodeURIComponent(
+											(
+												torrent.info.title +
+												' ' +
+												(torrent.info.year || '')
+											).trim() || torrent.title
+										)}`}
+										target="_blank"
+										aria-label="Search again"
+										title="Search again"
+										className="inline-block align-text-bottom text-blue-400 hover:text-blue-300"
+										onClick={(e) => e.stopPropagation()}
+									>
+										<Search className="h-4 w-4" />
+									</Link>
+								</>
+							)}{' '}
+							{hashChip ||
+								(titleFilterText && (
+									<Link
+										href={`/library?title=${encodeURIComponent(titleKey)}&page=1`}
+										className="ml-1 inline-block cursor-pointer rounded border-2 border-amber-500 bg-amber-900/30 px-1 py-0 text-xs font-bold text-amber-100 transition-colors hover:bg-amber-800/50"
+										onClick={(e) => e.stopPropagation()}
+									>
+										{titleFilterText}
+									</Link>
+								))}
+							{tvTitleFilterText && tvTitleKey !== undefined && (
+								<Link
+									href={`/library?tvTitle=${encodeURIComponent(tvTitleKey)}&page=1`}
+									className="ml-1 inline-block cursor-pointer rounded border-2 border-sky-500 bg-sky-900/30 px-1 py-0 text-xs font-bold text-sky-100 transition-colors hover:bg-sky-800/50"
+									onClick={(e) => e.stopPropagation()}
+								>
+									{tvTitleFilterText}
+								</Link>
+							)}
+							{!filenameIsTitle && (
+								<>
+									<br />
+									{torrent.filename}
+								</>
+							)}
+						</>
+					)}
+				</td>
+				<td
+					onClick={() => onShowInfo(torrent)}
+					className="px-0.5 py-1 text-center text-xs max-lg:ml-8 max-lg:pr-3"
+				>
+					{multipleServices && (
+						<span className="mr-1 inline-block">{torrentPrefix(torrent.id)}</span>
+					)}
+					{(Math.max(0, torrent.bytes) / ONE_GIGABYTE).toFixed(1)} GB
+					{statusLine && (
+						<span className="whitespace-nowrap max-lg:ml-3 lg:block">{statusLine}</span>
+					)}
+				</td>
+				<td
+					onClick={() => onShowInfo(torrent)}
+					className="px-0.5 py-1 text-center text-xs whitespace-nowrap max-lg:pr-3"
+					title={`${added.toLocaleString(undefined, { timeZone: 'UTC' })} UTC`}
+				>
+					{added.toLocaleDateString(undefined, {
+						timeZone: 'UTC',
+						month: 'short',
+						day: 'numeric',
+						...(added.getUTCFullYear() !== new Date().getUTCFullYear() && {
+							year: 'numeric',
+						}),
+					})}
+				</td>
+				<td
+					onClick={() => onShowInfo(torrent)}
+					className="flex place-content-center px-0.5 py-1 max-lg:ml-auto max-lg:py-0"
+				>
+					{rdKey && torrent.id.startsWith('rd:') && (
+						<button
+							title="Cast (RD)"
+							className="cursor-pointer p-2.5 text-green-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								handleCastClick();
+							}}
+							disabled={isCasting}
+						>
+							<Cast className="h-4 w-4 text-green-400" />
+						</button>
+					)}
+					{adKey && torrent.id.startsWith('ad:') && (
+						<button
+							title="Cast (AD)"
+							className="cursor-pointer p-2.5 text-purple-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								handleAdCastClick();
+							}}
+							disabled={isCasting}
+						>
+							<Cast className="h-4 w-4 text-purple-400" />
+						</button>
+					)}
+					{tbKey && torrent.id.startsWith('tb:') && (
+						<button
+							title="Cast (TB)"
+							className="cursor-pointer p-2.5 text-cyan-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								handleTbCastClick();
+							}}
+							disabled={isCasting}
+						>
+							<Cast className="h-4 w-4 text-cyan-400" />
+						</button>
+					)}
+					{pmKey && torrent.id.startsWith('pm:') && torrent.hash && (
+						<button
+							title="Cast (PM)"
+							className="cursor-pointer p-2.5 text-yellow-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								handlePmCastClick();
+							}}
+							disabled={isCasting}
+						>
+							<Cast className="h-4 w-4 text-yellow-400" />
+						</button>
+					)}
+					{ocKey && torrent.id.startsWith('oc:') && torrent.hash && (
+						<button
+							title="Cast (OC)"
+							className="cursor-pointer p-2.5 text-orange-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								handleOcCastClick();
+							}}
+							disabled={isCasting}
+						>
+							<Cast className="h-4 w-4 text-orange-400" />
+						</button>
+					)}
+					{dlKey && torrent.id.startsWith('dl:') && torrent.hash && (
+						<button
+							title="Cast (DL)"
+							className="cursor-pointer p-2.5 text-sky-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								handleDlCastClick();
+							}}
+							disabled={isCasting}
+						>
+							<Cast className="h-4 w-4 text-sky-400" />
+						</button>
+					)}
+					{canSendToRd && (
+						<button
+							title="Send to Real-Debrid"
+							className="cursor-pointer p-2.5 text-indigo-400 disabled:opacity-50 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								setShowSendModal(true);
+							}}
+							disabled={isSendingToRd}
+						>
+							{isSendingToRd ? (
+								<Loader2 className="h-4 w-4 animate-spin text-indigo-400" />
+							) : (
+								<Send className="h-4 w-4 text-indigo-400" />
+							)}
+						</button>
+					)}
+					{!isTbWebDownload && hasInfoHash && (
+						<button
+							title="Share"
+							className="cursor-pointer p-2.5 text-indigo-600 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={async (e) => {
+								e.stopPropagation();
+								router.push(await handleShare(torrent));
+							}}
+						>
+							<Share2 className="h-4 w-4 text-indigo-500" />
+						</button>
+					)}
+					<button
+						title="Delete"
+						className="cursor-pointer p-2.5 text-red-500 sm:mr-2 sm:p-0 lg:mb-2"
+						onClick={async (e) => {
+							e.stopPropagation();
+							let success = false;
+							if (rdKey && torrent.id.startsWith('rd:')) {
+								success = await handleDeleteRdTorrent(rdKey, torrent.id);
+							}
+							if (adKey && torrent.id.startsWith('ad:')) {
+								success = await handleDeleteAdTorrent(adKey, torrent.id);
+							}
+							if (tbKey && torrent.id.startsWith('tb:')) {
+								success = await handleDeleteTbTorrent(tbKey, torrent.id);
+							}
+							if (pmKey && torrent.id.startsWith('pm:')) {
+								success = await handleDeletePmTorrent(pmKey, torrent.id);
+							}
+							if (ocKey && torrent.id.startsWith('oc:')) {
+								success = await handleDeleteOcTorrent(ocKey, torrent.id);
+							}
+							// Debrid-Link's remove never reports a failure - it echoes
+							// back whatever id it was asked about - so this is
+							// "asked", not "destroyed"; the next library listing is
+							// what settles it.
+							if (dlKey && torrent.id.startsWith('dl:')) {
+								success = await handleDeleteDlTorrent(dlKey, torrent.id);
+							}
+							if (success) onDelete(torrent.id);
+						}}
+					>
+						<Trash2 className="h-4 w-4 text-red-500" />
+					</button>
+					{!isTbWebDownload && hasInfoHash && (
+						<button
+							title="Copy magnet url"
+							className="cursor-pointer p-2.5 text-pink-500 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={(e) => {
+								e.stopPropagation();
+								void handleCopyOrDownloadMagnet(
+									torrent.hash,
+									shouldDownloadMagnets
+								);
+							}}
+						>
+							<Link2 className="h-4 w-4 text-teal-500" />
+						</button>
+					)}
+					{canReinsert(torrent) && (
+						<button
+							title="Reinsert"
+							className="cursor-pointer p-2.5 text-green-500 sm:mr-2 sm:p-0 lg:mb-2"
+							onClick={async (e) => {
+								e.stopPropagation();
+								try {
+									if (rdKey && torrent.id.startsWith('rd:')) {
+										// The function now handles fetching info and preserving selection internally
+										await handleReinsertTorrentinRd(rdKey, torrent, true);
+										onDelete(torrent.id);
+										// Trigger library refresh to fetch the newly reinserted torrent
+										if (onRefreshLibrary) {
+											await onRefreshLibrary();
+										}
+									}
+									if (adKey && torrent.id.startsWith('ad:')) {
+										await handleRestartTorrent(adKey, torrent.id);
+										// AllDebrid might also need refresh
+										if (onRefreshLibrary) {
+											await onRefreshLibrary();
+										}
+									}
+									if (tbKey && torrent.id.startsWith('tb:')) {
+										await handleRestartTbTorrent(tbKey, torrent.id);
+										// TorBox might also need refresh
+										if (onRefreshLibrary) {
+											await onRefreshLibrary();
+										}
+									}
+								} catch (error) {
+									console.error(error);
+								}
+							}}
+						>
+							<RefreshCw className="h-4 w-4 text-green-500" />
+						</button>
+					)}
+				</td>
+			</tr>
+			{/* Cast Search Modal */}
+			{showCastModal && castTorrentInfo && (
+				<CastSearchModal
+					isOpen={showCastModal}
+					onClose={() => setShowCastModal(false)}
+					torrentInfo={castTorrentInfo}
+					onSelectImdbId={handleSelectImdbId}
+				/>
+			)}
+			{/* Send-to-RD imdb picker */}
+			{showSendModal && (
+				<ImdbPickerModal
+					open={showSendModal}
+					initialQuery={torrent.title || torrent.filename}
+					subtitle={torrent.filename}
+					onPick={handleSendPick}
+					onClose={() => setShowSendModal(false)}
+				/>
+			)}
+		</>
+	);
+}
+
+export default memo(TorrentRow);

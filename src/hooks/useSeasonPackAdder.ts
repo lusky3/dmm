@@ -1,0 +1,560 @@
+import type { FileData, SearchResult } from '@/services/mediasearch';
+import { checkOffcloudCache } from '@/services/offcloud';
+import { checkPremiumizeCache } from '@/services/premiumize';
+import { RD_ADD_MIN_SPACING_MS } from '@/services/realDebrid';
+import { checkCachedStatus } from '@/services/torbox';
+import type { UserTorrent } from '@/torrent/userTorrent';
+import { runConcurrentFunctions } from '@/utils/batch';
+import { isRdBlockedName } from '@/utils/deInfringe';
+import { delay } from '@/utils/delay';
+import { groupBy } from '@/utils/groupBy';
+import { addThroughRdPause, RdPauseStreak, type BulkRdAddOutcome } from '@/utils/rdAddPause';
+import {
+	airedEpisodeCount,
+	getSeasonCoverage,
+	planSeason,
+	preferSharedPacks,
+	summarisePlan,
+	type SeasonPlanEntry,
+} from '@/utils/seasonPacks';
+import { isVideo } from '@/utils/selectable';
+import { generateTokenAndHash } from '@/utils/token';
+import axios from 'axios';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { AddRdOptions, CachedAddService } from './useTorrentManagement';
+
+/** Every service with a cache signal. Debrid-Link has none, so it cannot promise "cached only". */
+export type SeasonAdderService = CachedAddService;
+
+/** The per-user keys a cache probe needs. RD and AD are answered from DMM's own tables. */
+export type SeasonAdderKeys = {
+	tb?: string | null;
+	pm?: string | null;
+	oc?: string | null;
+};
+
+/** What happened to one season during a run, for the season navigation to show. */
+export type SeasonRunState = 'pending' | 'running' | 'added' | 'held' | 'gap' | 'failed';
+
+/**
+ * Adds every season of a show that is missing from the library.
+ *
+ * The season page can only see the season it is on, so this resolves the rest
+ * from one server call rather than walking the season search once per season -
+ * that route is rate limited at one request every two seconds per IP, which for
+ * a twenty-season show is forty seconds of waiting before the first add.
+ *
+ * The order of preference per season is the one a user asked for: a cached pack
+ * covers the season in one add even when a few episodes are already held, and
+ * only a season with no cached pack falls back to filling its gaps episode by
+ * episode. What is already held is decided from the library rather than by
+ * infohash - see `getSeasonCoverage`.
+ */
+
+/**
+ * Between adds. RD's `addMagnet` budget is about 30 a minute per account
+ * rather than the 250/min it publishes for the API as a whole. A run of adds
+ * can still bring on RD's account pause (every add refused with 451 for 21 s
+ * to about five minutes); the adds wait that out themselves, inside
+ * `addHashAsMagnet`, and the run stops only once the pause has outlasted any
+ * RD was seen to hold — see `RdPauseStreak`.
+ */
+const ADD_SPACING_MS = process.env.VITEST_WORKER_ID ? 0 : RD_ADD_MIN_SPACING_MS;
+/** TorBox swallows a hundred hashes per cache probe; two in flight is its measured comfort. */
+const TB_PROBE_BATCH = 100;
+
+type ApiCandidate = {
+	hash: string;
+	title: string;
+	sizeMb: number;
+	rdAvailable: boolean;
+	adAvailable?: boolean;
+	videoCount?: number;
+	files?: FileData[];
+	seasons?: number[];
+	episodes?: number[];
+};
+
+type ApiSeason = {
+	season: number;
+	packs: ApiCandidate[];
+	episodes: Record<string, ApiCandidate[]>;
+};
+
+export type SeasonAdderPlan = {
+	service: SeasonAdderService;
+	entries: SeasonPlanEntry[];
+	summary: ReturnType<typeof summarisePlan>;
+};
+
+type ShowFacts = {
+	title: string;
+	seasonCount: number;
+	episodeCounts: Record<number, number>;
+	lastEpisodeToAir?: { season_number: number; episode_number: number } | null;
+};
+
+/** A candidate carries everything `addRd` needs to read a 451 correctly. */
+const asSearchResult = (candidate: ApiCandidate, service: SeasonAdderService): SearchResult => ({
+	title: candidate.title,
+	fileSize: candidate.sizeMb,
+	hash: candidate.hash,
+	rdAvailable: service === 'rd',
+	adAvailable: service === 'ad',
+	tbAvailable: service === 'tb',
+	pmAvailable: service === 'pm',
+	ocAvailable: service === 'oc',
+	dlAvailable: false,
+	files: candidate.files ?? [],
+	rdFiles: service === 'rd' ? candidate.files : undefined,
+	tbFiles: service === 'tb' ? candidate.files : undefined,
+	noVideos: false,
+	medianFileSize: 0,
+	biggestFileSize: 0,
+	videoCount: candidate.videoCount ?? 0,
+});
+
+const filenamesOf = (candidate: ApiCandidate) => (candidate.files ?? []).map((f) => f.filename);
+
+export function useSeasonPackAdder({
+	imdbId,
+	show,
+	libraryItems,
+	hashAndProgress,
+	addCached,
+	episodeMaxSize,
+}: {
+	imdbId: string;
+	show: ShowFacts | null;
+	libraryItems: UserTorrent[];
+	hashAndProgress: Record<string, number>;
+	/** Adds a release only if the service serves it at once; see `useTorrentManagement`. */
+	addCached: (service: SeasonAdderService, hash: string, opts?: AddRdOptions) => Promise<boolean>;
+	episodeMaxSize: string;
+}) {
+	const [discovering, setDiscovering] = useState(false);
+	const [running, setRunning] = useState(false);
+	const [seasonState, setSeasonState] = useState<Record<number, SeasonRunState>>({});
+	const stopped = useRef(false);
+
+	/**
+	 * Leaving the show ends the run.
+	 *
+	 * Without this, navigating away keeps filling the previous show's library in
+	 * the background - the loop holds its own closure, so it cannot notice on its
+	 * own that the page has moved on. The cleanup covers unmounting too, which is
+	 * the other way a user leaves.
+	 */
+	useEffect(() => {
+		return () => {
+			stopped.current = true;
+		};
+	}, [imdbId]);
+
+	const stop = useCallback(() => {
+		stopped.current = true;
+	}, []);
+
+	/**
+	 * TorBox availability, which the server cannot answer: the cache probe needs
+	 * the user's own key. It also supplies the file list the pack window counts,
+	 * so a TorBox run never reads Real-Debrid's availability table.
+	 */
+	const sweepTorBox = useCallback(async (hashes: string[], tbKey: string) => {
+		const found = new Map<string, { videoCount: number; files: FileData[] }>();
+		if (hashes.length === 0) return found;
+
+		const funcs = groupBy(TB_PROBE_BATCH, hashes).map((group) => async () => {
+			const resp = await checkCachedStatus(
+				{ hash: group, format: 'object', list_files: true },
+				tbKey
+			);
+			if (!resp.success || !resp.data) return;
+			for (const [hash, entry] of Object.entries(resp.data as Record<string, any>)) {
+				const files: FileData[] = Array.isArray(entry?.files)
+					? entry.files.map((file: any, index: number) => ({
+							fileId: typeof file.id === 'number' ? file.id : index,
+							filename: file.name ?? '',
+							filesize: file.size ?? 0,
+						}))
+					: [];
+				found.set(hash.toLowerCase(), {
+					videoCount: files.filter((f) => isVideo({ path: f.filename })).length,
+					files,
+				});
+			}
+		});
+		await runConcurrentFunctions(funcs, 2, 200);
+		return found;
+	}, []);
+
+	const fetchSeasons = useCallback(
+		async (seasons: number[], mode: 'packs' | 'episodes'): Promise<ApiSeason[]> => {
+			if (seasons.length === 0) return [];
+			const [tokenWithTimestamp, tokenHash] = await generateTokenAndHash();
+			const response = await axios.get<{ seasons: ApiSeason[] }>('/api/torrents/tv-seasons', {
+				params: {
+					imdbId,
+					seasons: seasons.join(','),
+					mode,
+					maxSize: episodeMaxSize,
+					dmmProblemKey: tokenWithTimestamp,
+					solution: tokenHash,
+				},
+			});
+			return response.data.seasons ?? [];
+		},
+		[imdbId, episodeMaxSize]
+	);
+
+	/**
+	 * Narrows the server's candidates to what this service can actually serve
+	 * instantly, and attaches the file counts the pack window needs. Real-Debrid
+	 * and AllDebrid arrive already answered by DMM's availability tables; the
+	 * rest are probed here with the user's own key.
+	 *
+	 * A probe is a hint for choosing what to try, never the verdict: the add
+	 * itself decides, and removes whatever did not come back finished.
+	 */
+	const resolveForService = useCallback(
+		async (
+			apiSeasons: ApiSeason[],
+			service: SeasonAdderService,
+			keys: SeasonAdderKeys
+		): Promise<ApiSeason[]> => {
+			const narrow = (apply: (candidate: ApiCandidate) => ApiCandidate | null) =>
+				apiSeasons.map((entry) => ({
+					season: entry.season,
+					packs: entry.packs.map(apply).filter((c): c is ApiCandidate => c !== null),
+					episodes: Object.fromEntries(
+						Object.entries(entry.episodes).map(([episode, bucket]) => [
+							episode,
+							bucket.map(apply).filter((c): c is ApiCandidate => c !== null),
+						])
+					),
+				}));
+
+			if (service === 'rd') return narrow((c) => (c.rdAvailable ? c : null));
+			if (service === 'ad') return narrow((c) => (c.adAvailable ? c : null));
+
+			const key = keys[service];
+			if (!key) return [];
+			const hashes = new Set<string>();
+			for (const entry of apiSeasons) {
+				for (const pack of entry.packs) hashes.add(pack.hash);
+				for (const bucket of Object.values(entry.episodes)) {
+					for (const candidate of bucket) hashes.add(candidate.hash);
+				}
+			}
+
+			if (service === 'tb') {
+				const cached = await sweepTorBox([...hashes], key);
+				return narrow((candidate) => {
+					const hit = cached.get(candidate.hash.toLowerCase());
+					if (!hit) return null;
+					return { ...candidate, videoCount: hit.videoCount, files: hit.files };
+				});
+			}
+
+			// Premiumize and Offcloud answer cached or not and list no files, so
+			// the pack window counts from the list DMM's tables hold for the
+			// torrent. A pack neither table knows has no count and is not
+			// offered as a pack - see `planSeason`.
+			const probe = service === 'pm' ? checkPremiumizeCache : checkOffcloudCache;
+			const results = await probe(key, [...hashes]);
+			const cached = new Set(
+				results.filter((r) => r.cached).map((r) => r.hash.toLowerCase())
+			);
+			return narrow((c) => (cached.has(c.hash.toLowerCase()) ? c : null));
+		},
+		[sweepTorBox]
+	);
+
+	const buildEntries = useCallback(
+		(apiSeasons: ApiSeason[], service: SeasonAdderService, facts: ShowFacts) => {
+			const airedCounts: Record<number, number> = {};
+			for (let season = 1; season <= facts.seasonCount; season++) {
+				airedCounts[season] = airedEpisodeCount(
+					season,
+					facts.episodeCounts[season] ?? 0,
+					facts.lastEpisodeToAir
+				);
+			}
+			return apiSeasons.map((entry) => {
+				const knownHashes = new Set<string>();
+				for (const pack of entry.packs) knownHashes.add(pack.hash.toLowerCase());
+				for (const bucket of Object.values(entry.episodes)) {
+					for (const candidate of bucket) knownHashes.add(candidate.hash.toLowerCase());
+				}
+
+				const coverage = getSeasonCoverage(libraryItems, {
+					season: entry.season,
+					showTitle: facts.title,
+					servicePrefix: service,
+					knownHashes,
+				});
+
+				const episodeCandidates = new Map<number, ApiCandidate[]>();
+				for (const [episode, bucket] of Object.entries(entry.episodes)) {
+					const parsed = Number.parseInt(episode, 10);
+					if (Number.isInteger(parsed) && bucket.length > 0) {
+						episodeCandidates.set(parsed, bucket);
+					}
+				}
+
+				return planSeason({
+					season: entry.season,
+					expectedEpisodeCount: airedCounts[entry.season] ?? 0,
+					// The whole run's counts, so a complete-series release is
+					// judged against every season it claims rather than against
+					// this one - see `expectedEpisodesForClaim`.
+					episodeCounts: airedCounts,
+					coverage,
+					// A release RD has already rejected for its name can only answer
+					// 451 again, so it is not a candidate at all. The block is RD's
+					// alone: every other service serves those names.
+					packCandidates:
+						service === 'rd'
+							? entry.packs.filter((c) => !isRdBlockedName(c.title, filenamesOf(c)))
+							: entry.packs,
+					episodeCandidates,
+				});
+			});
+		},
+		[libraryItems]
+	);
+
+	/**
+	 * Works out what the run would do, without adding anything.
+	 *
+	 * Packs first, because most seasons have one. Only the seasons left without
+	 * a usable pack are asked for episode by episode, so the common show never
+	 * pays for the per-episode payload.
+	 */
+	const discover = useCallback(
+		async (
+			service: SeasonAdderService,
+			keys: SeasonAdderKeys = {}
+		): Promise<SeasonAdderPlan | null> => {
+			if (!show) return null;
+			setDiscovering(true);
+			try {
+				// Specials are excluded: nobody means season zero by "all seasons".
+				const seasons = Array.from({ length: show.seasonCount }, (_, i) => i + 1);
+				const packSeasons = await fetchSeasons(seasons, 'packs');
+				const resolvedPacks = await resolveForService(packSeasons, service, keys);
+				let entries = buildEntries(resolvedPacks, service, show);
+
+				const needEpisodes = entries
+					.filter((entry) => entry.status === 'gap' && entry.missingEpisodes.length > 0)
+					.map((entry) => entry.season);
+
+				if (needEpisodes.length > 0) {
+					const episodeSeasons = await fetchSeasons(needEpisodes, 'episodes');
+					const resolvedEpisodes = await resolveForService(episodeSeasons, service, keys);
+					const replanned = new Map(
+						buildEntries(resolvedEpisodes, service, show).map((entry) => [
+							entry.season,
+							entry,
+						])
+					);
+					entries = entries.map((entry) => replanned.get(entry.season) ?? entry);
+				}
+
+				entries.sort((a, b) => a.season - b.season);
+				entries = preferSharedPacks(entries);
+				setSeasonState(
+					Object.fromEntries(
+						entries.map((entry) => [
+							entry.season,
+							entry.status === 'held'
+								? 'held'
+								: entry.status === 'gap'
+									? 'gap'
+									: 'pending',
+						])
+					) as Record<number, SeasonRunState>
+				);
+				return { service, entries, summary: summarisePlan(entries) };
+			} finally {
+				setDiscovering(false);
+			}
+		},
+		[show, fetchSeasons, resolveForService, buildEntries]
+	);
+
+	/**
+	 * Walks the plan one add at a time.
+	 *
+	 * Serial and spaced on purpose: an RD add is three to seven Real-Debrid calls
+	 * and a run of them is what brings on RD's account pause. A release RD
+	 * answers with an unexplained 451 is tried once more after the pause rather
+	 * than reported missing; the run gives up only when RD has refused every
+	 * add for longer than it was ever seen to pause, and stops the moment the
+	 * page moves to another show.
+	 *
+	 * `onRdPause` hears when the run is waiting on such a pause, so the page can
+	 * say why nothing seems to happen for half a minute.
+	 */
+	const run = useCallback(
+		async (plan: SeasonAdderPlan, onRdPause?: (paused: boolean) => void) => {
+			stopped.current = false;
+			setRunning(true);
+
+			let added = 0;
+			let failed = 0;
+			const pauseStreak = new RdPauseStreak();
+			let waitingOnPause = false;
+			let abortedByThrottle = false;
+			const gaps: number[] = [];
+			/** Seasons Real-Debrid refused with a 451 its names did not explain. */
+			const refused: number[] = [];
+			/**
+			 * Hashes this run has already put in the account. A complete-series
+			 * release is the best candidate for every season it covers, so
+			 * without this the run adds the same 470 GB torrent once per season
+			 * and reports five adds where it made one.
+			 */
+			const addedHashes = new Set<string>();
+
+			const markSeason = (season: number, state: SeasonRunState) =>
+				setSeasonState((prev) => ({ ...prev, [season]: state }));
+
+			const tryAdd = async (candidate: ApiCandidate): Promise<BulkRdAddOutcome> => {
+				if (addedHashes.has(candidate.hash.toLowerCase())) return 'added';
+				const row = asSearchResult(candidate, plan.service);
+				// Cached only: a release the tables or a probe still believe in but
+				// the service no longer serves is removed again rather than left
+				// downloading in the user's account. A paused RD add gets its
+				// second try here; the account's pause holds it until RD is quiet.
+				const outcome = await addThroughRdPause((onPaused) =>
+					addCached(plan.service, candidate.hash, {
+						row,
+						silent: true,
+						onPaused: () => {
+							waitingOnPause = true;
+							onRdPause?.(true);
+							onPaused();
+						},
+					})
+				);
+				pauseStreak.note(outcome);
+				if (waitingOnPause && outcome !== 'paused') {
+					waitingOnPause = false;
+					onRdPause?.(false);
+				}
+				if (outcome === 'added') addedHashes.add(candidate.hash.toLowerCase());
+				return outcome;
+			};
+			const pausedTooLong = () => pauseStreak.exhausted;
+
+			try {
+				for (const entry of plan.entries) {
+					if (stopped.current) break;
+					if (entry.status === 'held' || entry.status === 'gap') continue;
+
+					markSeason(entry.season, 'running');
+
+					if (entry.status === 'pack') {
+						let done = false;
+						let sawPause = false;
+						for (const candidate of entry.packCandidates as ApiCandidate[]) {
+							if (stopped.current) break;
+							const outcome = await tryAdd(candidate);
+							if (outcome === 'added') {
+								done = true;
+								break;
+							}
+							if (outcome === 'paused') sawPause = true;
+							if (pausedTooLong()) break;
+							await delay(ADD_SPACING_MS);
+						}
+						if (done) {
+							added++;
+							markSeason(entry.season, 'added');
+						} else if (pausedTooLong()) {
+							markSeason(entry.season, 'failed');
+							abortedByThrottle = true;
+							break;
+						} else if (sawPause) {
+							// Real-Debrid refused it rather than lacking it, so it is
+							// not a gap: trying again later may well land it.
+							failed++;
+							refused.push(entry.season);
+							markSeason(entry.season, 'failed');
+						} else {
+							failed++;
+							gaps.push(entry.season);
+							markSeason(entry.season, 'gap');
+						}
+						await delay(ADD_SPACING_MS);
+						continue;
+					}
+
+					// Episode fallback: fill the gaps only, and let a release that
+					// spans episodes satisfy every one it covers.
+					const covered = new Set<number>();
+					let addedHere = 0;
+					let missedHere = 0;
+					let pausedHere = false;
+					for (const episode of [...entry.episodeCandidates.keys()].sort(
+						(a, b) => a - b
+					)) {
+						if (stopped.current) break;
+						if (covered.has(episode)) continue;
+						const bucket = entry.episodeCandidates.get(episode) as ApiCandidate[];
+						let got = false;
+						for (const candidate of bucket) {
+							const outcome = await tryAdd(candidate);
+							if (outcome === 'added') {
+								for (const e of candidate.episodes ?? [episode]) covered.add(e);
+								got = true;
+								break;
+							}
+							if (outcome === 'paused') pausedHere = true;
+							if (pausedTooLong()) break;
+							await delay(ADD_SPACING_MS);
+						}
+						if (got) addedHere++;
+						else missedHere++;
+						if (pausedTooLong()) break;
+						await delay(ADD_SPACING_MS);
+					}
+
+					if (pausedTooLong()) {
+						markSeason(entry.season, 'failed');
+						abortedByThrottle = true;
+						break;
+					}
+					if (addedHere > 0) {
+						added++;
+						markSeason(entry.season, missedHere > 0 ? 'failed' : 'added');
+						if (missedHere > 0 && pausedHere) refused.push(entry.season);
+					} else if (pausedHere) {
+						failed++;
+						refused.push(entry.season);
+						markSeason(entry.season, 'failed');
+					} else {
+						failed++;
+						gaps.push(entry.season);
+						markSeason(entry.season, 'gap');
+					}
+				}
+			} finally {
+				setRunning(false);
+			}
+
+			return {
+				added,
+				failed,
+				gaps,
+				refused,
+				abortedByThrottle,
+				stopped: stopped.current,
+			};
+		},
+		[addCached, imdbId]
+	);
+
+	return { discover, run, stop, discovering, running, seasonState };
+}

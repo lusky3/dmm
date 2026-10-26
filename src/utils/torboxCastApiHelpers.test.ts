@@ -1,0 +1,261 @@
+import { createMockRequest, createMockResponse } from '@/test/utils/api';
+import crypto from 'crypto';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/services/torbox', () => ({
+	getUserData: vi.fn(),
+}));
+
+import { getUserData } from '@/services/torbox';
+import {
+	decryptApiKey,
+	encryptApiKey,
+	generateTorBoxUserId,
+	handleApiError,
+	resolveTorBoxUser,
+	validateApiKey,
+	validateMethod,
+	validateTorBoxApiKey,
+} from './torboxCastApiHelpers';
+
+const originalSalt = process.env.DMMCAST_SALT;
+const testSalt = 'test-tb-salt';
+
+describe('torboxCastApiHelpers', () => {
+	beforeEach(() => {
+		process.env.DMMCAST_SALT = testSalt;
+		vi.mocked(getUserData).mockReset();
+	});
+
+	afterAll(() => {
+		process.env.DMMCAST_SALT = originalSalt;
+	});
+
+	describe('validateMethod', () => {
+		it('returns true for allowed method', () => {
+			const req = createMockRequest({ method: 'POST' });
+			const res = createMockResponse();
+			expect(validateMethod(req, res, ['POST'])).toBe(true);
+		});
+
+		it('returns false and sets 405 for disallowed method', () => {
+			const req = createMockRequest({ method: 'PATCH' });
+			const res = createMockResponse();
+			expect(validateMethod(req, res, ['GET'])).toBe(false);
+			expect(res._getStatusCode()).toBe(405);
+		});
+	});
+
+	describe('validateApiKey', () => {
+		it('returns apiKey from the Authorization header', () => {
+			const req = createMockRequest({ headers: { authorization: 'Bearer tb-key' } });
+			const res = createMockResponse();
+			expect(validateApiKey(req, res)).toBe('tb-key');
+		});
+
+		// Card 210: useTorBoxCastToken sent `/api/stremio-tb/id?apiKey=<key>`, and
+		// dmm-01's access log held 8,496 such lines carrying 5,546 TorBox keys
+		// between 2026-08-30 and 2026-10-03. Only that hook ever called the
+		// route, so a key in the query string is refused rather than honoured.
+		it('refuses a key in the query string without using it', () => {
+			const req = createMockRequest({ query: { apiKey: 'tb-key' } });
+			const res = createMockResponse();
+			expect(validateApiKey(req, res)).toBeNull();
+			expect(res._getStatusCode()).toBe(400);
+			expect(JSON.stringify(res._getData())).not.toContain('tb-key');
+		});
+
+		it('refuses a query key even alongside the header', () => {
+			const req = createMockRequest({
+				query: { apiKey: 'tb-key' },
+				headers: { authorization: 'Bearer tb-key' },
+			});
+			const res = createMockResponse();
+			expect(validateApiKey(req, res)).toBeNull();
+			expect(res._getStatusCode()).toBe(400);
+		});
+
+		it('returns apiKey from body', () => {
+			const req = createMockRequest({ body: { apiKey: 'body-tb-key' } });
+			const res = createMockResponse();
+			expect(validateApiKey(req, res)).toBe('body-tb-key');
+		});
+
+		it('returns null and sets 401 when missing', () => {
+			const req = createMockRequest();
+			const res = createMockResponse();
+			expect(validateApiKey(req, res)).toBeNull();
+			expect(res._getStatusCode()).toBe(401);
+		});
+	});
+
+	describe('generateTorBoxUserId', () => {
+		it('generates deterministic user id from email', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: true,
+				data: { email: 'user@example.com' },
+			} as any);
+
+			const result = await generateTorBoxUserId('tb-api-key');
+
+			expect(getUserData).toHaveBeenCalledWith('tb-api-key');
+			const expected = crypto
+				.createHmac('sha256', testSalt)
+				.update('torbox:user@example.com')
+				.digest('base64url')
+				.slice(0, 12);
+			expect(result).toBe(expected);
+		});
+
+		it('throws when email is not available', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: true,
+				data: {},
+			} as any);
+
+			await expect(generateTorBoxUserId('bad-key')).rejects.toThrow(
+				'Failed to generate TorBox user ID'
+			);
+		});
+
+		it('throws when success is false', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: false,
+				data: null,
+			} as any);
+
+			await expect(generateTorBoxUserId('bad-key')).rejects.toThrow(
+				'Failed to generate TorBox user ID'
+			);
+		});
+
+		it('throws when DMMCAST_SALT is missing', async () => {
+			delete process.env.DMMCAST_SALT;
+			vi.mocked(getUserData).mockResolvedValue({
+				success: true,
+				data: { email: 'user@example.com' },
+			} as any);
+
+			await expect(generateTorBoxUserId('key')).rejects.toThrow(
+				'Failed to generate TorBox user ID'
+			);
+		});
+
+		it('throws when getUserData rejects', async () => {
+			vi.mocked(getUserData).mockRejectedValue(new Error('API error'));
+
+			await expect(generateTorBoxUserId('key')).rejects.toThrow(
+				'Failed to generate TorBox user ID'
+			);
+		});
+	});
+
+	describe('validateTorBoxApiKey', () => {
+		it('returns valid with email for valid key', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: true,
+				data: { email: 'user@tb.com' },
+			} as any);
+
+			const result = await validateTorBoxApiKey('valid-key');
+
+			expect(result).toEqual({ valid: true, email: 'user@tb.com' });
+		});
+
+		it('returns invalid when success is false', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: false,
+				data: null,
+			} as any);
+
+			const result = await validateTorBoxApiKey('bad-key');
+
+			expect(result).toEqual({ valid: false });
+		});
+
+		it('returns invalid when email is missing', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: true,
+				data: {},
+			} as any);
+
+			const result = await validateTorBoxApiKey('bad-key');
+
+			expect(result).toEqual({ valid: false });
+		});
+
+		it('returns invalid on error', async () => {
+			vi.mocked(getUserData).mockRejectedValue(new Error('fail'));
+
+			const result = await validateTorBoxApiKey('bad-key');
+
+			expect(result).toEqual({ valid: false });
+		});
+	});
+
+	describe('handleApiError', () => {
+		it('sends 500 with default message', () => {
+			const res = createMockResponse();
+			const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			handleApiError(new Error('boom'), res);
+
+			expect(res._getStatusCode()).toBe(500);
+			expect(res._getData()).toEqual({
+				error: 'Internal Server Error: boom',
+			});
+			consoleSpy.mockRestore();
+		});
+
+		it('sends 500 with custom message', () => {
+			const res = createMockResponse();
+			const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+			handleApiError('err', res, 'Custom TorBox error');
+
+			expect(res._getData()).toEqual({ error: 'Custom TorBox error' });
+			consoleSpy.mockRestore();
+		});
+	});
+
+	describe('encryptApiKey / decryptApiKey', () => {
+		it('returns the same key (passthrough)', () => {
+			const key = 'my-torbox-key';
+			expect(encryptApiKey(key)).toBe(key);
+			expect(decryptApiKey(key)).toBe(key);
+		});
+
+		it('roundtrips correctly', () => {
+			const key = 'tb-key-456';
+			expect(decryptApiKey(encryptApiKey(key))).toBe(key);
+		});
+	});
+
+	// Callers used to run validateTorBoxApiKey and generateTorBoxUserId back to
+	// back, spending two /user/me calls per request against per-key rate limits.
+	describe('resolveTorBoxUser', () => {
+		it('answers both questions in one round trip', async () => {
+			vi.mocked(getUserData).mockResolvedValue({
+				success: true,
+				data: { email: 'a@b.c' },
+			} as any);
+
+			const result = await resolveTorBoxUser('key');
+
+			expect(result.valid).toBe(true);
+			expect(result.email).toBe('a@b.c');
+			expect(result.userId).toHaveLength(12);
+			expect(vi.mocked(getUserData)).toHaveBeenCalledTimes(1);
+		});
+
+		it('reports an unusable key without a user id', async () => {
+			vi.mocked(getUserData).mockResolvedValue({ success: false } as any);
+			expect(await resolveTorBoxUser('key')).toEqual({ valid: false });
+		});
+
+		it('reports a thrown lookup as an invalid key', async () => {
+			vi.mocked(getUserData).mockRejectedValue(new Error('network'));
+			expect(await resolveTorBoxUser('key')).toEqual({ valid: false });
+		});
+	});
+});

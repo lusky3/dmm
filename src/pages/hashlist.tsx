@@ -1,25 +1,80 @@
-import { useAllDebridApiKey, useRealDebridAccessToken } from '@/hooks/auth';
-import { EnrichedHashlistTorrent, HashlistTorrent } from '@/services/mediasearch';
+import { useLibraryCache } from '@/contexts/LibraryCacheContext';
+import {
+	useAllDebridApiKey,
+	useDebridLinkCredential,
+	useOffcloudApiKey,
+	usePremiumizeCredential,
+	useRealDebridAccessToken,
+	useTorBoxAccessToken,
+} from '@/hooks/auth';
+import { deleteMagnetAd, getMagnetStatus, uploadMagnet } from '@/services/allDebrid';
+import { EnrichedHashlistTorrent, Hashlist, HashlistTorrent } from '@/services/mediasearch';
+import {
+	checkCachedStatus,
+	createTorrent,
+	getTorrentList,
+	TorBoxRateLimitError,
+} from '@/services/torbox';
+import { TorBoxTorrentInfo } from '@/services/types';
 import UserTorrentDB from '@/torrent/db';
-import { handleAddAsMagnetInAd, handleAddAsMagnetInRd } from '@/utils/addMagnet';
+import {
+	handleAddAsMagnetInDl,
+	handleAddAsMagnetInOc,
+	handleAddAsMagnetInPm,
+	handleAddAsMagnetInRd,
+	handleAddMultipleHashesInDl,
+} from '@/utils/addMagnet';
 import { runConcurrentFunctions } from '@/utils/batch';
-import { handleDeleteAdTorrent, handleDeleteRdTorrent } from '@/utils/deleteTorrent';
-import { fetchAllDebrid, fetchRealDebrid } from '@/utils/fetchTorrents';
-import { instantCheckInAd2, instantCheckInRd2, wrapLoading } from '@/utils/instantChecks';
+import {
+	handleDeleteAdTorrent,
+	handleDeleteDlTorrent,
+	handleDeleteOcTorrent,
+	handleDeletePmTorrent,
+	handleDeleteRdTorrent,
+	handleDeleteTbTorrent,
+} from '@/utils/deleteTorrent';
+import {
+	convertToAllDebridUserTorrent,
+	convertToTbUserTorrent,
+	convertToUserTorrent,
+} from '@/utils/fetchTorrents';
+import { HashlistNotPublishedError, readHashlistFragment } from '@/utils/hashlistSource';
+import {
+	checkAvailabilityOc2,
+	checkAvailabilityPm2,
+	checkDatabaseAvailabilityTb2,
+	checkPlayableAvailabilityAd,
+	checkPlayableAvailabilityRd,
+	wrapLoading,
+} from '@/utils/instantChecks';
 import { getMediaId } from '@/utils/mediaId';
 import { getTypeByName } from '@/utils/mediaType';
 import getReleaseTags from '@/utils/score';
-import { genericToastOptions } from '@/utils/toastOptions';
+import { fetchBlockedHashes } from '@/utils/takedownClient';
+import { genericToastOptions, toasterPosition } from '@/utils/toastOptions';
+import { generateTokenAndHash } from '@/utils/token';
+import { uniqueByHash } from '@/utils/uniqueByHash';
 import { filenameParse } from '@ctrl/video-filename-parser';
-import lzString from 'lz-string';
+import {
+	CheckCircle,
+	ChevronLeft,
+	ChevronRight,
+	Download,
+	Film,
+	Search,
+	Shuffle,
+	Tv,
+	X,
+} from 'lucide-react';
 import Head from 'next/head';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
-import { useEffect, useState } from 'react';
-import { Toaster, toast } from 'react-hot-toast';
-import { FaDownload, FaTimes } from 'react-icons/fa';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { toast, Toaster } from 'react-hot-toast';
 
 const ONE_GIGABYTE = 1024 * 1024 * 1024;
+const ITEMS_PER_PAGE = 100;
+const SEARCH_DEBOUNCE_MS = 200;
 
 interface SortBy {
 	column: 'hash' | 'filename' | 'title' | 'bytes' | 'score';
@@ -28,17 +83,97 @@ interface SortBy {
 
 const torrentDB = new UserTorrentDB();
 
+// Parsing a filename costs ~0.15 ms, so a 176k-item list took ~27 s of main
+// thread in one go; with the page frozen that long Chrome offers to kill it.
+function enrichHashlistTorrent(torrent: HashlistTorrent): EnrichedHashlistTorrent {
+	const mediaType = getTypeByName(torrent.filename);
+	const info =
+		mediaType === 'movie'
+			? filenameParse(torrent.filename)
+			: filenameParse(torrent.filename, true);
+	// Parsing supplies display metadata, not membership: a shared hash remains
+	// usable even when its filename has no year or the parser cannot identify it.
+	return {
+		score: getReleaseTags(torrent.filename, torrent.bytes / ONE_GIGABYTE).score,
+		info,
+		mediaType,
+		title: getMediaId(info, mediaType, false) || torrent.filename,
+		rdAvailable: false,
+		adAvailable: false,
+		tbAvailable: false,
+		pmAvailable: false,
+		ocAvailable: false,
+		dlAvailable: false,
+		noVideos: false,
+		files: [],
+		...torrent,
+	} as EnrichedHashlistTorrent;
+}
+
+const ENRICH_SLICE_MS = 50;
+const ENRICH_PUBLISH_MS = 1000;
+
+/**
+ * Enriches the list in slices of ~50 ms, yielding to the browser between them
+ * so the page stays responsive, and hands what is done so far to `onProgress`
+ * about once a second, so a long list starts showing rows before it finishes.
+ */
+async function enrichInSlices(
+	torrents: HashlistTorrent[],
+	onProgress: (partial: EnrichedHashlistTorrent[]) => void
+): Promise<EnrichedHashlistTorrent[]> {
+	const enriched: EnrichedHashlistTorrent[] = [];
+	let sliceStart = performance.now();
+	let lastPublish = sliceStart;
+	for (let i = 0; i < torrents.length; i++) {
+		enriched.push(enrichHashlistTorrent(torrents[i]));
+		if (i % 256 !== 255) continue;
+		const now = performance.now();
+		if (now - sliceStart < ENRICH_SLICE_MS) continue;
+		if (now - lastPublish >= ENRICH_PUBLISH_MS) {
+			onProgress(enriched.slice());
+			lastPublish = now;
+		}
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		sliceStart = performance.now();
+	}
+	return enriched;
+}
+
 function HashlistPage() {
 	const router = useRouter();
 	const [query, setQuery] = useState('');
+	// Filtering a 28k-item list on every keystroke queued one full pass per
+	// character typed; the list filters on this settled copy instead.
+	const [searchQuery, setSearchQuery] = useState('');
+	useEffect(() => {
+		const timer = setTimeout(() => setSearchQuery(query), SEARCH_DEBOUNCE_MS);
+		return () => clearTimeout(timer);
+	}, [query]);
 
+	const [hashlistTitle, setHashlistTitle] = useState<string>('');
 	const [userTorrentsList, setUserTorrentsList] = useState<EnrichedHashlistTorrent[]>([]);
 	const [filteredList, setFilteredList] = useState<EnrichedHashlistTorrent[]>([]);
+	const rdBulkCandidates = useMemo(
+		() => filteredList.filter((t) => t.rdAvailable),
+		[filteredList]
+	);
+	const [showOnlyAvailable, setShowOnlyAvailable] = useState(true);
 	const [sortBy, setSortBy] = useState<SortBy>({ column: 'hash', direction: 'asc' });
 
 	const [rdKey] = useRealDebridAccessToken();
 	const adKey = useAllDebridApiKey();
+	const tbKey = useTorBoxAccessToken();
+	const pmKey = usePremiumizeCredential();
+	const ocKey = useOffcloudApiKey();
+	const dlKey = useDebridLinkCredential();
+	const {
+		addTorrent: addToCache,
+		removeTorrent: removeFromCache,
+		lastFetchTime: libraryFetchTime,
+	} = useLibraryCache();
 
+	const [currentPage, setCurrentPage] = useState(1);
 	const [movieCount, setMovieCount] = useState<number>(0);
 	const [tvCount, setTvCount] = useState<number>(0);
 	const [movieGrouping] = useState<Record<string, number>>({});
@@ -47,55 +182,194 @@ function HashlistPage() {
 	const [hasDupes] = useState<Array<string>>([]);
 	const [totalBytes, setTotalBytes] = useState<number>(0);
 
+	// Hashlist navigation state (for browsing hashlists from /hashlists page)
+	const [navState, setNavState] = useState<{
+		files: string[];
+		names: string[];
+		currentIndex: number;
+	} | null>(null);
+	const [navLoading, setNavLoading] = useState(false);
+	const [mounted, setMounted] = useState(false);
+
+	// Load navigation state from sessionStorage (client-side only)
+	useEffect(() => {
+		setMounted(true);
+		const stored = sessionStorage.getItem('hashlistNav');
+		if (stored) {
+			try {
+				setNavState(JSON.parse(stored));
+			} catch {
+				// Invalid JSON, ignore
+			}
+		}
+	}, []);
+
+	async function navigateToHashlist(index: number) {
+		if (!navState || index < 0 || index >= navState.files.length) return;
+
+		setNavLoading(true);
+		try {
+			const response = await fetch(navState.files[index]);
+			const html = await response.text();
+			const match = html.match(/src="https:\/\/debridmediamanager\.com\/hashlist#([^"]+)"/);
+			if (match && match[1]) {
+				// Update navigation state
+				const newNavState = { ...navState, currentIndex: index };
+				sessionStorage.setItem('hashlistNav', JSON.stringify(newNavState));
+				setNavState(newNavState);
+				// Navigate to new hashlist
+				window.location.hash = match[1];
+				window.location.reload();
+			}
+		} catch (err) {
+			console.error('Failed to load hashlist:', err);
+		} finally {
+			setNavLoading(false);
+		}
+	}
+
+	function handleNavPrevious() {
+		if (navState && navState.currentIndex > 0) {
+			navigateToHashlist(navState.currentIndex - 1);
+		}
+	}
+
+	function handleNavNext() {
+		if (navState && navState.currentIndex < navState.files.length - 1) {
+			navigateToHashlist(navState.currentIndex + 1);
+		}
+	}
+
+	function handleNavRandom() {
+		if (!navState || navState.files.length <= 1) return;
+		let newIndex;
+		do {
+			newIndex = Math.floor(Math.random() * navState.files.length);
+		} while (newIndex === navState.currentIndex);
+		navigateToHashlist(newIndex);
+	}
+
+	function clearNavState() {
+		sessionStorage.removeItem('hashlistNav');
+		setNavState(null);
+	}
+
 	async function initialize() {
 		await torrentDB.initializeDB();
 		await Promise.all([fetchUserTorrentsList(), fetchHashAndProgress()]);
 	}
 
+	// The list is read once. This effect used to re-run whenever a debrid key
+	// changed while the list was still empty, and keys hydrate after mount, so a
+	// logged-in visit parsed every filename twice.
+	const listLoadStarted = useRef(false);
 	useEffect(() => {
-		if (userTorrentsList.length !== 0) return;
+		if (listLoadStarted.current) return;
+		listLoadStarted.current = true;
 		initialize();
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [rdKey, adKey]);
+	}, []);
 
-	// fetch list from api
-	async function getUserTorrentsList(): Promise<HashlistTorrent[]> {
-		const hash = window.location.hash;
-		if (!hash) return [];
-		const jsonString = lzString.decompressFromEncodedURIComponent(hash.substring(1));
-		return JSON.parse(jsonString) as HashlistTorrent[];
+	async function decodeJsonStringFromUrl(): Promise<string> {
+		return readHashlistFragment(window.location.hash.substring(1));
 	}
-	async function fetchUserTorrentsList() {
-		try {
-			const torrents = (await getUserTorrentsList()).map((torrent) => {
-				const mediaType = getTypeByName(torrent.filename);
-				const info =
-					mediaType === 'movie'
-						? filenameParse(torrent.filename)
-						: filenameParse(torrent.filename, true);
-				return {
-					score: getReleaseTags(torrent.filename, torrent.bytes / ONE_GIGABYTE).score,
-					info,
-					mediaType,
-					title: getMediaId(info, mediaType, false) || torrent.filename,
-					...torrent,
-				};
-			}) as EnrichedHashlistTorrent[];
-			if (!torrents.length) return;
 
-			setUserTorrentsList(torrents);
-
-			const hashArr = torrents.map((r) => r.hash);
-			if (rdKey) wrapLoading('RD', instantCheckInRd2(rdKey, hashArr, setUserTorrentsList));
-			if (adKey) wrapLoading('AD', instantCheckInAd2(adKey, hashArr, setUserTorrentsList));
-		} catch (error) {
-			setUserTorrentsList([]);
-			toast.error('Error fetching user torrents list');
+	async function readHashlist(): Promise<HashlistTorrent[]> {
+		const [jsonString, blocked] = await Promise.all([
+			decodeJsonStringFromUrl(),
+			fetchBlockedHashes(),
+		]);
+		const unblocked = (torrents: HashlistTorrent[]) =>
+			torrents.filter((torrent) => !blocked.has(torrent.hash?.toLowerCase()));
+		// No #fragment means no list was shared, not that reading one failed.
+		if (!jsonString) return [];
+		if (jsonString.charAt(0) !== '[') {
+			const hashlist = JSON.parse(jsonString) as Hashlist;
+			setHashlistTitle(hashlist.title);
+			return unblocked(hashlist.torrents);
 		}
+
+		const torrents = JSON.parse(jsonString) as HashlistTorrent[];
+		setHashlistTitle('Share this page');
+		return unblocked(torrents);
 	}
+
+	// The hashes of the loaded list; availability checks start once it is set.
+	const [listHashes, setListHashes] = useState<string[]>([]);
+
+	async function fetchUserTorrentsList() {
+		let torrents: EnrichedHashlistTorrent[];
+		try {
+			torrents = await enrichInSlices(await readHashlist(), (partial) =>
+				setUserTorrentsList(uniqueByHash(partial))
+			);
+		} catch (error) {
+			console.error('Error fetching user torrents list:', error);
+			setUserTorrentsList([]);
+			toast.error(
+				error instanceof HashlistNotPublishedError
+					? 'This hash list is still being published; refresh in a minute or two.'
+					: 'Failed to fetch user torrents.'
+			);
+			return;
+		}
+		if (!torrents.length) return;
+		torrents = uniqueByHash(torrents);
+		setUserTorrentsList(torrents);
+		setListHashes(torrents.map((r) => r.hash));
+	}
+
+	// Each provider is checked once, when both the list and its key are there.
+	// A failed check only says so: it used to share the list's try block, so a
+	// failed token request emptied a list that had already loaded.
+	const startedChecks = useRef(new Set<string>());
+	useEffect(() => {
+		if (listHashes.length === 0) return;
+		const start = (service: string, key: unknown, check: () => Promise<number>) => {
+			if (!key || startedChecks.current.has(service)) return;
+			startedChecks.current.add(service);
+			wrapLoading(service, check()).catch((error) =>
+				console.error(`Error checking ${service} availability:`, error)
+			);
+		};
+		start('RD', rdKey, async () => {
+			const [tokenWithTimestamp, tokenHash] = await generateTokenAndHash();
+			return checkPlayableAvailabilityRd(
+				tokenWithTimestamp,
+				tokenHash,
+				listHashes,
+				setUserTorrentsList
+			);
+		});
+		start('AD', adKey, async () => {
+			const [tokenWithTimestamp, tokenHash] = await generateTokenAndHash();
+			return checkPlayableAvailabilityAd(
+				tokenWithTimestamp,
+				tokenHash,
+				listHashes,
+				setUserTorrentsList
+			);
+		});
+		start('TB', tbKey, () =>
+			checkDatabaseAvailabilityTb2(tbKey!, listHashes, setUserTorrentsList)
+		);
+		start('PM', pmKey, () => checkAvailabilityPm2(pmKey!, listHashes, setUserTorrentsList));
+		// Offcloud's cache is measured to be Premiumize's, hash for hash, but the
+		// probes stay independent: one vendor being down is not the other's
+		// answer, and a user may hold only one of the two keys.
+		start('OC', ocKey, () => checkAvailabilityOc2(ocKey!, listHashes, setUserTorrentsList));
+		// **No Debrid-Link probe on load, deliberately.** Its probe is a
+		// bare-hash add, which only succeeds when Debrid-Link already holds
+		// the content, so a hit puts the torrent in the user's library. That
+		// is a mutation, and DMM keeps mutating probes behind a button, the
+		// way RD's and AD's already are. There is no per-row check here, so
+		// `dlAvailable` stays unset on this page and `dlKey` is absent from
+		// the filter's OR-chain below for the same reason.
+	}, [listHashes, rdKey, adKey, tbKey, pmKey, ocKey]);
 
 	const [hashAndProgress, setHashAndProgress] = useState<Record<string, number>>({});
 	async function fetchHashAndProgress(hash?: string) {
+		libraryHashesRef.current = null;
 		const torrents = await torrentDB.all();
 		const records: Record<string, number> = {};
 		for (const t of torrents) {
@@ -108,7 +382,6 @@ function HashlistPage() {
 		`${service}:${hash}` in hashAndProgress && hashAndProgress[`${service}:${hash}`] < 100;
 	const isDownloaded = (service: string, hash: string) =>
 		`${service}:${hash}` in hashAndProgress && hashAndProgress[`${service}:${hash}`] === 100;
-	const inLibrary = (service: string, hash: string) => `${service}:${hash}` in hashAndProgress;
 	const notInLibrary = (service: string, hash: string) =>
 		!(`${service}:${hash}` in hashAndProgress);
 
@@ -145,30 +418,53 @@ function HashlistPage() {
 	}, [userTorrentsList]);
 
 	// set the list you see
+	// The library's hashes, read once and reused until the library changes:
+	// every availability batch re-filters the list, and each read pulls every
+	// torrent in the user's library out of IndexedDB.
+	const libraryHashesRef = useRef<Promise<Set<string>> | null>(null);
+	useEffect(() => {
+		libraryHashesRef.current = null;
+	}, [libraryFetchTime]);
 	async function filterOutAlreadyDownloaded(unfiltered: EnrichedHashlistTorrent[]) {
 		if (unfiltered.length <= 1) return unfiltered;
-		const hashes = await torrentDB.hashes();
+		libraryHashesRef.current ??= torrentDB.hashes();
+		const hashes = await libraryHashesRef.current;
 		return unfiltered.filter((t) => !hashes.has(t.hash));
 	}
 	function applyQuickSearch(unfiltered: EnrichedHashlistTorrent[]) {
 		let regexFilters: RegExp[] = [];
-		for (const q of query.split(' ')) {
+		for (const q of searchQuery.split(' ')) {
 			try {
 				regexFilters.push(new RegExp(q, 'i'));
 			} catch (error) {
 				continue;
 			}
 		}
-		return query
+		return searchQuery
 			? unfiltered.filter((t) => regexFilters.every((regex) => regex.test(t.filename)))
 			: unfiltered;
 	}
+	// Each availability batch starts a pass; only the latest may set the list.
+	const filterPassRef = useRef(0);
 	async function filterList() {
+		const pass = ++filterPassRef.current;
 		const notYetDownloaded = await filterOutAlreadyDownloaded(userTorrentsList);
+		if (pass !== filterPassRef.current) return;
+		// userTorrentsList is already unique by hash; see fetchUserTorrentsList
 		let tmpList = notYetDownloaded;
-		tmpList = tmpList.filter((t) => t.rdAvailable || t.adAvailable);
-		// ensure tmpList is also unique in terms of hash
-		tmpList = tmpList.filter((t, i, self) => self.findIndex((s) => s.hash === t.hash) === i);
+
+		// Filter for instantly available torrents if enabled and keys are present
+		if (showOnlyAvailable && (rdKey || adKey || tbKey || pmKey || ocKey)) {
+			tmpList = tmpList.filter(
+				(t) =>
+					t.rdAvailable ||
+					t.adAvailable ||
+					t.tbAvailable ||
+					t.pmAvailable ||
+					t.ocAvailable
+			);
+		}
+
 		if (Object.keys(router.query).length === 0) {
 			setFilteredList(applyQuickSearch(tmpList));
 			return;
@@ -187,7 +483,15 @@ function HashlistPage() {
 	useEffect(() => {
 		filterList();
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [query, userTorrentsList, movieGrouping, tvGroupingByEpisode, router.query]);
+	}, [
+		searchQuery,
+		libraryFetchTime,
+		userTorrentsList,
+		movieGrouping,
+		tvGroupingByEpisode,
+		router.query,
+		showOnlyAvailable,
+	]);
 
 	function handleSort(column: typeof sortBy.column) {
 		setSortBy({
@@ -196,14 +500,11 @@ function HashlistPage() {
 		});
 	}
 
-	function sortedData() {
-		// Check if sortBy.column is not set
-		// if (sortBy.column === 'hash') {
-		// 	// Randomize the list
-		// 	return filteredList.sort(() => Math.random() - 0.5);
-		// }
-		filteredList.sort((a, b) => {
-			const isAsc = sortBy.direction === 'asc';
+	// Sorted once per list or sort change; the render used to sort the whole
+	// list again for every page counter it drew.
+	const sortedList = useMemo(() => {
+		const isAsc = sortBy.direction === 'asc';
+		return [...filteredList].sort((a, b) => {
 			let comparison = 0;
 			if (a[sortBy.column] > b[sortBy.column]) {
 				comparison = 1;
@@ -212,8 +513,16 @@ function HashlistPage() {
 			}
 			return isAsc ? comparison : comparison * -1;
 		});
+	}, [filteredList, sortBy]);
+	const pageCount = Math.max(1, Math.ceil(sortedList.length / ITEMS_PER_PAGE));
+	// one page needs no pager, unless a narrowed list left the reader past its end
+	const showPager = pageCount > 1 || currentPage > 1;
 
-		return filteredList;
+	function currentPageData() {
+		return sortedList.slice(
+			(currentPage - 1) * ITEMS_PER_PAGE,
+			(currentPage - 1) * ITEMS_PER_PAGE + ITEMS_PER_PAGE
+		);
 	}
 
 	const getGroupings = (mediaType: EnrichedHashlistTorrent['mediaType']) =>
@@ -226,34 +535,69 @@ function HashlistPage() {
 	}
 
 	function wrapDownloadFilesInRdFn(t: EnrichedHashlistTorrent) {
-		return async () => await addRd(t.hash);
+		return async () => {
+			// A refusal comes back as a result, not a throw, and the bulk counter
+			// only counts throws: ten 451s read "Started 10 downloads" (card 455).
+			const result = await addRd(t.hash, t.filename);
+			if (result !== 'success')
+				throw new Error(`Real-Debrid did not add ${t.filename}: ${result}`);
+		};
 	}
+
 	async function downloadNonDupeTorrentsInRd() {
 		const libraryHashes = await torrentDB.hashes();
-		const yetToDownload = filteredList
+		const yetToDownload = rdBulkCandidates
 			.filter((t) => !libraryHashes.has(t.hash))
 			.map(wrapDownloadFilesInRdFn);
-		const [results, errors] = await runConcurrentFunctions(yetToDownload, 5, 500);
-		await fetchRealDebrid(
-			rdKey!,
-			async (torrents) => {
-				await torrentDB.addAll(torrents);
-				await fetchHashAndProgress();
-			},
-			results.length + 1
-		);
-		await fetchHashAndProgress();
-		if (errors.length) {
-			toast.error(
-				`Error downloading files on ${errors.length} torrents`,
+		if (yetToDownload.length === 0) {
+			toast.custom(
+				(t) => (
+					<div className="flex items-center rounded-lg bg-gray-800 px-4 py-3 text-white shadow-lg">
+						<CheckCircle className="mr-2 h-5 w-5 text-green-500" />
+						<span>Everything already downloaded</span>
+					</div>
+				),
 				genericToastOptions
 			);
+			return;
 		}
-		if (results.length) {
-			toast.success(`Started downloading ${results.length} torrents`, genericToastOptions);
-		}
-		if (!errors.length && !results.length) {
-			toast('Everything has been downloaded', { icon: '👏' });
+
+		const progressToast = toast.loading(
+			`Downloading 0/${yetToDownload.length} torrents...`,
+			genericToastOptions
+		);
+
+		const [results, errors] = await runConcurrentFunctions(
+			yetToDownload,
+			4,
+			0,
+			(completed, total, errorCount) => {
+				const message =
+					errorCount > 0
+						? `Downloading ${completed}/${total} torrents (${errorCount} errors)...`
+						: `Downloading ${completed}/${total} torrents...`;
+				toast.loading(message, { id: progressToast });
+			}
+		);
+
+		// Update the progress toast to show final result
+		if (errors.length && results.length) {
+			toast.error(`Downloaded ${results.length}; ${errors.length} failed.`, {
+				id: progressToast,
+				...genericToastOptions,
+			});
+		} else if (errors.length) {
+			toast.error(`Failed to download ${errors.length} torrents.`, {
+				id: progressToast,
+				...genericToastOptions,
+			});
+		} else if (results.length) {
+			toast.success(`Started ${results.length} downloads.`, {
+				id: progressToast,
+				...genericToastOptions,
+			});
+		} else {
+			toast.dismiss(progressToast);
 		}
 	}
 
@@ -265,36 +609,156 @@ function HashlistPage() {
 		const yetToDownload = filteredList
 			.filter((t) => !libraryHashes.has(t.hash))
 			.map(wrapDownloadFilesInAdFn);
-		const [results, errors] = await runConcurrentFunctions(yetToDownload, 5, 500);
-		if (errors.length) {
-			toast.error(`Error downloading files on ${errors.length} torrents`);
+		if (yetToDownload.length === 0) {
+			toast.custom(
+				(t) => (
+					<div className="flex items-center rounded-lg bg-gray-800 px-4 py-3 text-white shadow-lg">
+						<CheckCircle className="mr-2 h-5 w-5 text-green-500" />
+						<span>Everything already downloaded</span>
+					</div>
+				),
+				genericToastOptions
+			);
+			return;
 		}
-		if (results.length) {
-			toast.success(`Started downloading ${results.length} torrents`);
-		}
-		if (!errors.length && !results.length) {
-			toast('Everything has been downloaded', { icon: '👏' });
+
+		const progressToast = toast.loading(`Downloading 0/${yetToDownload.length} torrents...`);
+
+		const [results, errors] = await runConcurrentFunctions(
+			yetToDownload,
+			4,
+			0,
+			(completed, total, errorCount) => {
+				const message =
+					errorCount > 0
+						? `Downloading ${completed}/${total} torrents (${errorCount} errors)...`
+						: `Downloading ${completed}/${total} torrents...`;
+				toast.loading(message, { id: progressToast });
+			}
+		);
+
+		// Update the progress toast to show final result
+		if (errors.length && results.length) {
+			toast.error(`Downloaded ${results.length}; ${errors.length} failed.`, {
+				id: progressToast,
+			});
+		} else if (errors.length) {
+			toast.error(`Failed to download ${errors.length} torrents.`, { id: progressToast });
+		} else if (results.length) {
+			toast.success(`Started ${results.length} downloads.`, { id: progressToast });
+		} else {
+			toast.dismiss(progressToast);
 		}
 	}
 
-	async function addRd(hash: string) {
-		await handleAddAsMagnetInRd(rdKey!, hash);
-		await fetchRealDebrid(
+	function wrapDownloadFilesInTbFn(t: EnrichedHashlistTorrent) {
+		return async () => await addTb(t.hash);
+	}
+	async function downloadNonDupeTorrentsInTb() {
+		const libraryHashes = await torrentDB.hashes();
+		const yetToDownload = filteredList
+			.filter((t) => !libraryHashes.has(t.hash))
+			.map(wrapDownloadFilesInTbFn);
+		if (yetToDownload.length === 0) {
+			toast.custom(
+				(t) => (
+					<div className="flex items-center rounded-lg bg-gray-800 px-4 py-3 text-white shadow-lg">
+						<CheckCircle className="mr-2 h-5 w-5 text-green-500" />
+						<span>Everything already downloaded</span>
+					</div>
+				),
+				genericToastOptions
+			);
+			return;
+		}
+
+		const progressToast = toast.loading(`Downloading 0/${yetToDownload.length} torrents...`);
+
+		const [results, errors] = await runConcurrentFunctions(
+			yetToDownload,
+			4,
+			0,
+			(completed, total, errorCount) => {
+				const message =
+					errorCount > 0
+						? `Downloading ${completed}/${total} torrents (${errorCount} errors)...`
+						: `Downloading ${completed}/${total} torrents...`;
+				toast.loading(message, { id: progressToast });
+			}
+		);
+
+		// Update the progress toast to show final result
+		if (errors.length && results.length) {
+			toast.error(`Downloaded ${results.length}; ${errors.length} failed.`, {
+				id: progressToast,
+			});
+		} else if (errors.length) {
+			toast.error(`Failed to download ${errors.length} torrents.`, { id: progressToast });
+		} else if (results.length) {
+			toast.success(`Started ${results.length} downloads.`, { id: progressToast });
+		} else {
+			toast.dismiss(progressToast);
+		}
+	}
+
+	async function addRd(hash: string, filename: string) {
+		return await handleAddAsMagnetInRd(
 			rdKey!,
-			async (torrents) => {
-				await torrentDB.addAll(torrents);
+			hash,
+			async (info) => {
+				const userTorrent = convertToUserTorrent({
+					...info,
+					id: info.id,
+					filename: info.filename,
+					bytes: info.bytes,
+					status: info.status,
+					added: info.added,
+					links: info.links,
+					hash: info.hash,
+				});
+				await torrentDB.addAll([userTorrent]);
+				addToCache(userTorrent);
 				await fetchHashAndProgress(hash);
 			},
-			2
+			true,
+			0,
+			false,
+			filename
 		);
 	}
 
 	async function addAd(hash: string) {
-		await handleAddAsMagnetInAd(adKey!, hash);
-		await fetchAllDebrid(adKey!, async (torrents) => {
-			await torrentDB.addAll(torrents);
-			await fetchHashAndProgress(hash);
-		});
+		try {
+			// AllDebrid removed /magnet/instant, so the upload *is* the cache
+			// probe: `ready` tells us whether it was already cached, and a miss
+			// has to be deleted again because uploading added it to the account.
+			const magnetUri = hash.startsWith('magnet:?') ? hash : `magnet:?xt=urn:btih:${hash}`;
+			const resp = await uploadMagnet(adKey!, [magnetUri]);
+			if (resp.magnets.length === 0 || resp.magnets[0].error) {
+				toast.error('Failed to add hash to AD.', genericToastOptions);
+				return;
+			}
+			if (!resp.magnets[0].ready) {
+				if (resp.magnets[0].id) {
+					await deleteMagnetAd(adKey!, resp.magnets[0].id).catch(() => {});
+				}
+				toast.error('Torrent not instant in AD; skipped.', genericToastOptions);
+				return;
+			}
+			if (resp.magnets[0].id) {
+				const statusResp = await getMagnetStatus(adKey!, String(resp.magnets[0].id));
+				if (statusResp.data?.magnets?.[0]) {
+					const userTorrent = convertToAllDebridUserTorrent(statusResp.data.magnets[0]);
+					await torrentDB.addAll([userTorrent]);
+					addToCache(userTorrent);
+					await fetchHashAndProgress(hash);
+					toast.success('Torrent added to AD.', genericToastOptions);
+				}
+			}
+		} catch (error) {
+			console.error('Error adding magnet to AllDebrid:', error);
+			toast.error('Failed to add hash to AD.', genericToastOptions);
+		}
 	}
 
 	async function deleteRd(hash: string) {
@@ -303,6 +767,7 @@ function HashlistPage() {
 			if (!t.id.startsWith('rd:')) continue;
 			await handleDeleteRdTorrent(rdKey!, t.id);
 			await torrentDB.deleteByHash('rd', hash);
+			removeFromCache(t.id); // Update global cache
 			setHashAndProgress((prev) => {
 				const newHashAndProgress = { ...prev };
 				delete newHashAndProgress[`rd:${hash}`];
@@ -315,8 +780,9 @@ function HashlistPage() {
 		const torrents = await torrentDB.getAllByHash(hash);
 		for (const t of torrents) {
 			if (!t.id.startsWith('ad:')) continue;
-			await handleDeleteAdTorrent(rdKey!, t.id);
+			await handleDeleteAdTorrent(adKey!, t.id);
 			await torrentDB.deleteByHash('ad', hash);
+			removeFromCache(t.id); // Update global cache
 			setHashAndProgress((prev) => {
 				const newHashAndProgress = { ...prev };
 				delete newHashAndProgress[`ad:${hash}`];
@@ -325,30 +791,356 @@ function HashlistPage() {
 		}
 	}
 
+	async function addTb(hash: string) {
+		try {
+			// Check if instant first
+			const instantResp = await checkCachedStatus(
+				{ hash: [hash], format: 'object', list_files: true },
+				tbKey!
+			);
+			const cachedData = instantResp.data as any;
+			if (!cachedData?.[hash]) {
+				toast.error('Torrent not instant in TorBox; skipped.', genericToastOptions);
+				return;
+			}
+
+			// Add the magnet
+			const magnetUri = hash.startsWith('magnet:?') ? hash : `magnet:?xt=urn:btih:${hash}`;
+			const resp = await createTorrent(tbKey!, { magnet: magnetUri });
+			if (!resp.success || !resp.data?.torrent_id) {
+				toast.error('Failed to add hash to TorBox.', genericToastOptions);
+				return;
+			}
+
+			const torrentInfo = await getTorrentList(tbKey!, { id: resp.data.torrent_id });
+			if (torrentInfo.success && torrentInfo.data) {
+				const info = torrentInfo.data as TorBoxTorrentInfo;
+				const userTorrent = convertToTbUserTorrent(info);
+				await torrentDB.addAll([userTorrent]);
+				addToCache(userTorrent);
+				await fetchHashAndProgress(hash);
+				toast.success('Torrent added to TorBox.', genericToastOptions);
+			}
+		} catch (error) {
+			console.error('Error adding magnet to TorBox:', error);
+			if (error instanceof TorBoxRateLimitError) {
+				toast.error(
+					'TorBox rate limit exceeded. Please wait and try again.',
+					genericToastOptions
+				);
+			} else {
+				toast.error('Failed to add hash to TorBox.', genericToastOptions);
+			}
+		}
+	}
+
+	async function deleteTb(hash: string) {
+		const torrents = await torrentDB.getAllByHash(hash);
+		for (const t of torrents) {
+			if (!t.id.startsWith('tb:')) continue;
+			await handleDeleteTbTorrent(tbKey!, t.id);
+			await torrentDB.deleteByHash('tb', hash);
+			removeFromCache(t.id); // Update global cache
+			setHashAndProgress((prev) => {
+				const newHashAndProgress = { ...prev };
+				delete newHashAndProgress[`tb:${hash}`];
+				return newHashAndProgress;
+			});
+		}
+	}
+
+	async function addPm(hash: string) {
+		try {
+			await handleAddAsMagnetInPm(pmKey!, hash, async (userTorrent) => {
+				await torrentDB.addAll([userTorrent]);
+				addToCache(userTorrent);
+				await fetchHashAndProgress(hash);
+			});
+		} catch {
+			// handleAddAsMagnetInPm reports its own failure
+		}
+	}
+
+	async function deletePm(hash: string) {
+		const torrents = await torrentDB.getAllByHash(hash);
+		for (const t of torrents) {
+			if (!t.id.startsWith('pm:')) continue;
+			await handleDeletePmTorrent(pmKey!, t.id);
+			await torrentDB.deleteByHash('pm', hash);
+			removeFromCache(t.id);
+			setHashAndProgress((prev) => {
+				const newHashAndProgress = { ...prev };
+				delete newHashAndProgress[`pm:${hash}`];
+				return newHashAndProgress;
+			});
+		}
+	}
+
+	/**
+	 * Adds one row to Debrid-Link, as a **full magnet**.
+	 *
+	 * The bulk button below deliberately sends bare hashes, because one click
+	 * there means hundreds of adds against a 50-a-day quota. A per-row click is
+	 * one release the user picked, which is the same intent the search page's
+	 * button carries - so it downloads for real rather than being refused with
+	 * `notAddTorrent` for not being cached.
+	 */
+	async function addDl(hash: string) {
+		try {
+			await handleAddAsMagnetInDl(dlKey!, hash, async (userTorrent) => {
+				await torrentDB.addAll([userTorrent]);
+				addToCache(userTorrent);
+				await fetchHashAndProgress(hash);
+			});
+		} catch {
+			// handleAddAsMagnetInDl reports its own failure
+		}
+	}
+
+	async function deleteDl(hash: string) {
+		const torrents = await torrentDB.getAllByHash(hash);
+		for (const t of torrents) {
+			if (!t.id.startsWith('dl:')) continue;
+			// Debrid-Link's remove never reports a failure, so the local row goes
+			// either way and the next library listing is what settles it.
+			await handleDeleteDlTorrent(dlKey!, t.id);
+			await torrentDB.deleteByHash('dl', hash);
+			removeFromCache(t.id);
+			setHashAndProgress((prev) => {
+				const newHashAndProgress = { ...prev };
+				delete newHashAndProgress[`dl:${hash}`];
+				return newHashAndProgress;
+			});
+		}
+	}
+
+	/**
+	 * Sweeps the shown list into Debrid-Link, **as bare hashes**.
+	 *
+	 * This is the one surface where "only land it if it is already cached" is
+	 * the right semantics: a hash list is hundreds of rows and the account's
+	 * whole day is 50 torrents, so sending magnets here would let one click
+	 * start fifty real downloads and burn the quota on releases nobody asked
+	 * for. `handleAddMultipleHashesInDl` paces the adds, counts the misses into
+	 * one summary toast instead of toasting each, and stops the sweep outright
+	 * on `maxTorrent` (every remaining add is refused for the day) or
+	 * `floodDetected` (the endpoint is locked for an hour) rather than spending
+	 * requests to collect the same refusal.
+	 */
+	async function downloadNonDupeTorrentsInDl() {
+		const libraryHashes = await torrentDB.hashes();
+		const yetToDownload = filteredList
+			.filter((t) => !libraryHashes.has(t.hash))
+			.map((t) => t.hash);
+		if (yetToDownload.length === 0) {
+			toast('Everything already downloaded', genericToastOptions);
+			return;
+		}
+
+		await handleAddMultipleHashesInDl(dlKey!, yetToDownload, async () => {
+			await fetchHashAndProgress();
+		});
+	}
+
+	async function addOc(hash: string) {
+		try {
+			await handleAddAsMagnetInOc(ocKey!, hash, async (userTorrent) => {
+				await torrentDB.addAll([userTorrent]);
+				addToCache(userTorrent);
+				await fetchHashAndProgress(hash);
+			});
+		} catch {
+			// handleAddAsMagnetInOc reports its own failure
+		}
+	}
+
+	async function deleteOc(hash: string) {
+		const torrents = await torrentDB.getAllByHash(hash);
+		for (const t of torrents) {
+			if (!t.id.startsWith('oc:')) continue;
+			await handleDeleteOcTorrent(ocKey!, t.id);
+			await torrentDB.deleteByHash('oc', hash);
+			removeFromCache(t.id);
+			setHashAndProgress((prev) => {
+				const newHashAndProgress = { ...prev };
+				delete newHashAndProgress[`oc:${hash}`];
+				return newHashAndProgress;
+			});
+		}
+	}
+
+	function wrapDownloadFilesInOcFn(t: EnrichedHashlistTorrent) {
+		return async () => await addOc(t.hash);
+	}
+
+	async function downloadNonDupeTorrentsInOc() {
+		const libraryHashes = await torrentDB.hashes();
+		const yetToDownload = filteredList
+			.filter((t) => !libraryHashes.has(t.hash))
+			.map(wrapDownloadFilesInOcFn);
+		if (yetToDownload.length === 0) {
+			toast('Everything already downloaded', genericToastOptions);
+			return;
+		}
+
+		const progressToast = toast.loading(`Downloading 0/${yetToDownload.length} torrents...`);
+		const [results, errors] = await runConcurrentFunctions(
+			yetToDownload,
+			4,
+			0,
+			(completed, total, errorCount) => {
+				toast.loading(
+					`Downloading ${completed}/${total} torrents...` +
+						(errorCount ? ` (${errorCount} failed)` : ''),
+					{ id: progressToast }
+				);
+			}
+		);
+		toast.dismiss(progressToast);
+		if (errors.length) {
+			toast.error(`Error downloading ${errors.length} torrents`, genericToastOptions);
+		}
+		if (results.length) {
+			toast.success(
+				`Successfully downloaded ${results.length} torrents`,
+				genericToastOptions
+			);
+		}
+	}
+
+	function wrapDownloadFilesInPmFn(t: EnrichedHashlistTorrent) {
+		return async () => await addPm(t.hash);
+	}
+
+	async function downloadNonDupeTorrentsInPm() {
+		const libraryHashes = await torrentDB.hashes();
+		const yetToDownload = filteredList
+			.filter((t) => !libraryHashes.has(t.hash))
+			.map(wrapDownloadFilesInPmFn);
+		if (yetToDownload.length === 0) {
+			toast('Everything already downloaded', genericToastOptions);
+			return;
+		}
+
+		const progressToast = toast.loading(`Downloading 0/${yetToDownload.length} torrents...`);
+		const [results, errors] = await runConcurrentFunctions(
+			yetToDownload,
+			4,
+			0,
+			(completed, total, errorCount) => {
+				toast.loading(
+					`Downloading ${completed}/${total} torrents...` +
+						(errorCount ? ` (${errorCount} failed)` : ''),
+					{ id: progressToast }
+				);
+			}
+		);
+		toast.dismiss(progressToast);
+		if (errors.length) {
+			toast.error(`Error downloading ${errors.length} torrents`, genericToastOptions);
+		}
+		if (results.length) {
+			toast.success(
+				`Successfully downloaded ${results.length} torrents`,
+				genericToastOptions
+			);
+		}
+	}
+
+	const handlePrevPage = useCallback(() => {
+		setCurrentPage((prev) => prev - 1);
+	}, []);
+
+	const handleNextPage = useCallback(() => {
+		setCurrentPage((prev) => prev + 1);
+	}, []);
+
 	return (
-		<div className="mx-2 my-1">
+		<div className="mx-2 my-1 min-h-screen bg-gray-900 text-gray-100">
 			<Head>
-				<title>
-					Debrid Media Manager - Hash list:{' '}
-					{(totalBytes / ONE_GIGABYTE / 1024).toFixed(1)} TB
-				</title>
+				<title>{`Debrid Media Manager - Hash list (${userTorrentsList.length} files)`}</title>
 			</Head>
-			<Toaster position="bottom-right" />
-			<div className="flex justify-between items-center mb-2">
-				<h1 className="text-xl font-bold">
-					Share this page ({userTorrentsList.length} files in total; size:{' '}
-					{(totalBytes / ONE_GIGABYTE / 1024).toFixed(1)} TB)
+			<Toaster position={toasterPosition()} />
+
+			{/* Hashlist Navigation Bar (when browsing from /hashlists) */}
+			{mounted && navState && (
+				<div className="mb-2 flex items-center justify-between border-b border-gray-700 bg-gray-800 px-2 py-2">
+					<div className="flex items-center gap-2">
+						<button
+							onClick={handleNavPrevious}
+							disabled={navState.currentIndex <= 0 || navLoading}
+							className={`rounded border-2 border-indigo-500 bg-indigo-900/30 p-1.5 text-indigo-100 transition-colors hover:bg-indigo-800/50 ${
+								navState.currentIndex <= 0 || navLoading
+									? 'cursor-not-allowed opacity-50'
+									: ''
+							}`}
+							title="Previous Hashlist"
+						>
+							<ChevronLeft className="h-4 w-4" />
+						</button>
+						<button
+							onClick={handleNavRandom}
+							disabled={navState.files.length <= 1 || navLoading}
+							className={`rounded border-2 border-purple-500 bg-purple-900/30 p-1.5 text-purple-100 transition-colors hover:bg-purple-800/50 ${
+								navState.files.length <= 1 || navLoading
+									? 'cursor-not-allowed opacity-50'
+									: ''
+							}`}
+							title="Random Hashlist"
+						>
+							<Shuffle className="h-4 w-4" />
+						</button>
+						<button
+							onClick={handleNavNext}
+							disabled={
+								navState.currentIndex >= navState.files.length - 1 || navLoading
+							}
+							className={`rounded border-2 border-indigo-500 bg-indigo-900/30 p-1.5 text-indigo-100 transition-colors hover:bg-indigo-800/50 ${
+								navState.currentIndex >= navState.files.length - 1 || navLoading
+									? 'cursor-not-allowed opacity-50'
+									: ''
+							}`}
+							title="Next Hashlist"
+						>
+							<ChevronRight className="h-4 w-4" />
+						</button>
+						<span
+							className="ml-2 text-sm text-gray-300"
+							title={navState.names[navState.currentIndex]}
+						>
+							{navLoading
+								? 'Loading...'
+								: `List ${navState.currentIndex + 1} of ${navState.files.length}`}
+						</span>
+					</div>
+					<button
+						onClick={clearNavState}
+						className="rounded border-2 border-red-500 bg-red-900/30 p-1.5 text-red-100 transition-colors hover:bg-red-800/50"
+						title="Exit Browser Mode"
+					>
+						<X className="h-4 w-4" />
+					</button>
+				</div>
+			)}
+
+			<div className="mb-2 flex items-center justify-between gap-2">
+				<h1 className="min-w-0 text-xl font-bold break-words text-white">
+					{hashlistTitle}{' '}
+					<span className="text-sm font-normal whitespace-nowrap text-gray-400">
+						· {userTorrentsList.length} files ·{' '}
+						{(totalBytes / ONE_GIGABYTE / 1024).toFixed(1)} TB
+					</span>
 				</h1>
 				<Link
 					href="/"
-					className="text-sm bg-cyan-800 hover:bg-cyan-700 text-white py-1 px-2 rounded"
+					className="shrink-0 rounded border-2 border-cyan-500 bg-cyan-900/30 px-2 py-1 text-sm text-cyan-100 transition-colors hover:bg-cyan-800/50"
 				>
 					Go Home
 				</Link>
 			</div>
-			<div className="flex items-center border-b-2 border-gray-500 py-2 mb-4">
+			<div className="mb-4 flex items-center border-b-2 border-gray-600 py-2">
 				<input
-					className="appearance-none bg-transparent border-none w-full text-white mr-3 py-1 px-2 leading-tight focus:outline-none"
+					className="mr-3 w-full appearance-none border-none bg-transparent px-2 py-1 leading-tight text-gray-100 focus:outline-hidden"
 					type="text"
 					id="query"
 					placeholder="quick search on filename, hash, or id; supports regex"
@@ -358,70 +1150,174 @@ function HashlistPage() {
 					}}
 				/>
 			</div>
-			<div className="mb-4">
+			<div className="mb-4 flex flex-wrap items-center gap-1 max-sm:mb-2 max-sm:flex-nowrap max-sm:overflow-x-auto max-sm:[&>*]:mb-0 max-sm:[&>*]:shrink-0 max-sm:[&>*]:text-xs max-sm:[&>*]:whitespace-nowrap">
+				{showPager && (
+					<>
+						<button
+							className={`mr-1 mb-2 rounded border-2 border-indigo-500 bg-indigo-900/30 px-1 py-1 text-indigo-100 transition-colors hover:bg-indigo-800/50 ${
+								currentPage <= 1 ? 'cursor-not-allowed opacity-60' : ''
+							}`}
+							onClick={handlePrevPage}
+							disabled={currentPage <= 1}
+						>
+							<ChevronLeft className="h-4 w-4" />
+						</button>
+						<span className="w-16 text-center">
+							{currentPage}/{pageCount}
+						</span>
+						<button
+							className={`mr-2 mb-2 ml-1 rounded border-2 border-indigo-500 bg-indigo-900/30 px-1 py-1 text-xs text-indigo-100 transition-colors hover:bg-indigo-800/50 ${
+								currentPage >= Math.ceil(sortedList.length / ITEMS_PER_PAGE)
+									? 'cursor-not-allowed opacity-60'
+									: ''
+							}`}
+							onClick={handleNextPage}
+							disabled={currentPage >= Math.ceil(sortedList.length / ITEMS_PER_PAGE)}
+						>
+							<ChevronRight className="h-4 w-4" />
+						</button>
+					</>
+				)}
 				<Link
 					href="/hashlist?mediaType=movie"
-					className="mr-2 mb-2 bg-sky-800 hover:bg-sky-700 text-white font-bold py-1 px-2 rounded"
+					className="mr-2 mb-2 rounded border-2 border-sky-500 bg-sky-900/30 px-2 py-1 text-sky-100 transition-colors hover:bg-sky-800/50"
 				>
-					Show {movieCount} movies
+					{movieCount} Movies
 				</Link>
 				<Link
 					href="/hashlist?mediaType=tv"
-					className="mr-2 mb-2 bg-sky-800 hover:bg-sky-700 text-white font-bold py-1 px-2 rounded"
+					className="mr-2 mb-2 rounded border-2 border-sky-500 bg-sky-900/30 px-2 py-1 text-sky-100 transition-colors hover:bg-sky-800/50"
 				>
-					Show {tvCount} TV shows
+					{tvCount} TV Shows
 				</Link>
-				{rdKey && (
+				{mounted && (rdKey || adKey || tbKey) && (
 					<button
-						className={`mr-2 mb-2 bg-blue-700 hover:bg-blue-600 text-white font-bold py-1 px-2 rounded ${
-							filteredList.length === 0 || !rdKey
-								? 'opacity-60 cursor-not-allowed'
-								: ''
-						}`}
-						onClick={downloadNonDupeTorrentsInRd}
-						disabled={filteredList.length === 0 || !rdKey}
+						className={`mr-2 mb-2 rounded border-2 ${
+							showOnlyAvailable
+								? 'border-green-500 bg-green-900/30 text-green-100'
+								: 'border-gray-500 bg-gray-900/30 text-gray-100'
+						} px-2 py-1 transition-colors`}
+						onClick={() => {
+							setShowOnlyAvailable(!showOnlyAvailable);
+							setCurrentPage(1);
+						}}
 					>
-						Download {filteredList.length} in Real-Debrid
+						{showOnlyAvailable ? 'Show All' : 'Show Instant'}
 					</button>
 				)}
-				{adKey && (
+				{mounted && rdKey && (
+					<>
+						<button
+							className={`mr-2 mb-2 rounded border-2 border-blue-500 bg-blue-900/30 px-2 py-1 text-blue-100 transition-colors hover:bg-blue-800/50 ${
+								rdBulkCandidates.length === 0 || !rdKey
+									? 'cursor-not-allowed opacity-60'
+									: ''
+							}`}
+							onClick={downloadNonDupeTorrentsInRd}
+							disabled={rdBulkCandidates.length === 0 || !rdKey}
+						>
+							RD Download ({rdBulkCandidates.length})
+						</button>
+					</>
+				)}
+				{mounted && adKey && (
+					<>
+						<button
+							className={`mr-2 mb-2 rounded border-2 border-blue-500 bg-blue-900/30 px-2 py-1 text-blue-100 transition-colors hover:bg-blue-800/50 ${
+								filteredList.length === 0 || !adKey
+									? 'cursor-not-allowed opacity-60'
+									: ''
+							}`}
+							onClick={downloadNonDupeTorrentsInAd}
+							disabled={filteredList.length === 0 || !adKey}
+						>
+							AD Download ({filteredList.length})
+						</button>
+					</>
+				)}
+				{mounted && tbKey && (
+					<>
+						<button
+							className={`mr-2 mb-2 rounded border-2 border-purple-500 bg-purple-900/30 px-2 py-1 text-purple-100 transition-colors hover:bg-purple-800/50 ${
+								filteredList.length === 0 || !tbKey
+									? 'cursor-not-allowed opacity-60'
+									: ''
+							}`}
+							onClick={downloadNonDupeTorrentsInTb}
+							disabled={filteredList.length === 0 || !tbKey}
+						>
+							TB Download ({filteredList.length})
+						</button>
+					</>
+				)}
+
+				{mounted && pmKey && (
 					<button
-						className={`mr-2 mb-2 bg-blue-700 hover:bg-blue-600 text-white font-bold py-1 px-2 rounded ${
-							filteredList.length === 0 || !adKey
-								? 'opacity-60 cursor-not-allowed'
-								: ''
+						className={`mr-2 mb-2 rounded border-2 border-[#aa0000] bg-[#aa0000]/30 px-2 py-1 text-red-100 transition-colors hover:bg-[#aa0000]/50 ${
+							filteredList.length === 0 ? 'cursor-not-allowed opacity-60' : ''
 						}`}
-						onClick={downloadNonDupeTorrentsInAd}
-						disabled={filteredList.length === 0 || !adKey}
+						onClick={downloadNonDupeTorrentsInPm}
+						disabled={filteredList.length === 0}
 					>
-						Download {filteredList.length} in AllDebrid
+						PM Download ({filteredList.length})
+					</button>
+				)}
+
+				{mounted && ocKey && (
+					<button
+						className={`mr-2 mb-2 rounded border-2 border-[#f97316] bg-[#f97316]/30 px-2 py-1 text-orange-100 transition-colors hover:bg-[#f97316]/50 ${
+							filteredList.length === 0 ? 'cursor-not-allowed opacity-60' : ''
+						}`}
+						onClick={downloadNonDupeTorrentsInOc}
+						disabled={filteredList.length === 0}
+					>
+						OC Download ({filteredList.length})
+					</button>
+				)}
+
+				{mounted && dlKey && (
+					<button
+						className={`mr-2 mb-2 rounded border-2 border-[#38bdf8] bg-[#38bdf8]/30 px-2 py-1 text-sky-100 transition-colors hover:bg-[#38bdf8]/50 ${
+							filteredList.length === 0 ? 'cursor-not-allowed opacity-60' : ''
+						}`}
+						onClick={downloadNonDupeTorrentsInDl}
+						disabled={filteredList.length === 0}
+					>
+						DL Download ({filteredList.length})
 					</button>
 				)}
 
 				{Object.keys(router.query).length !== 0 && (
 					<Link
 						href="/hashlist"
-						className="mr-2 mb-2 bg-yellow-400 hover:bg-yellow-500 text-black py-1 px-2 rounded"
+						className="mr-2 mb-2 rounded border-2 border-yellow-500 bg-yellow-900/30 px-2 py-1 text-yellow-100 transition-colors hover:bg-yellow-800/50"
 					>
 						Reset
 					</Link>
 				)}
 
-				{(rdKey || adKey) && (
-					<span className="px-2.5 py-1 text-s bg-green-100 text-green-800 mr-2">
-						<strong>
-							{userTorrentsList.length - filteredList.length} torrents hidden
-						</strong>{' '}
-						because its already in your library or its not cached in RD/AD
+				{mounted && !rdKey && !adKey && !tbKey && !pmKey && !ocKey && !dlKey && (
+					<>
+						<span className="mr-2 mb-2 rounded px-2 py-1 text-white">
+							Login to RD/AD/TB/PM/OC/DL to download
+						</span>
+					</>
+				)}
+
+				{mounted && (rdKey || adKey || tbKey || pmKey || ocKey || dlKey) && (
+					<span className="text-s mr-2 bg-green-100 px-2.5 py-1 text-green-800">
+						<strong>{userTorrentsList.length - filteredList.length}</strong> hidden
 					</span>
 				)}
 			</div>
 			<div className="overflow-x-auto">
-				<table className="w-full">
-					<thead>
-						<tr>
+				{/* Below sm each row is a card: the title takes the width, size and the
+				    download buttons sit beneath it. */}
+				<table className="w-full max-sm:block">
+					<thead className="max-sm:block">
+						<tr className="border-b border-gray-700 max-sm:flex max-sm:gap-3 max-sm:text-xs max-sm:[&>th]:px-1 max-sm:[&>th:last-child]:hidden">
 							<th
-								className="px-4 py-2 cursor-pointer"
+								className="cursor-pointer px-4 py-2 text-gray-300"
 								onClick={() => handleSort('title')}
 							>
 								Title{' '}
@@ -429,57 +1325,52 @@ function HashlistPage() {
 									(sortBy.direction === 'asc' ? '↑' : '↓')}
 							</th>
 							<th
-								className="px-4 py-2 cursor-pointer"
+								className="cursor-pointer px-4 py-2 text-gray-300"
 								onClick={() => handleSort('bytes')}
 							>
 								Size{' '}
 								{sortBy.column === 'bytes' &&
 									(sortBy.direction === 'asc' ? '↑' : '↓')}
 							</th>
-							<th className="px-4 py-2">Actions</th>
+							<th className="px-4 py-2 text-gray-300">Actions</th>
 						</tr>
 					</thead>
-					<tbody>
-						{sortedData().map((t, i) => {
-							const groupCount = getGroupings(t.mediaType)[t.filename];
+					<tbody className="max-sm:block">
+						{currentPageData().map((t, i) => {
+							// grouped by title in the aggregate above, so looked up by title
+							const groupCount = getGroupings(t.mediaType)[t.title];
 							const filterText =
 								groupCount > 1 && !router.query.filter
-									? `${groupCount - 1} other file${groupCount === 1 ? '' : 's'}`
+									? `${groupCount - 1} other file${groupCount === 2 ? '' : 's'}`
 									: '';
 							return (
 								<tr
 									key={i}
-									className={`
-									hover:bg-purple-900
-									border-t-2
-									${
-										isDownloaded('rd', t.hash) || isDownloaded('ad', t.hash)
+									className={`border-b border-gray-800 hover:bg-gray-800/50 max-sm:flex max-sm:flex-wrap max-sm:items-center max-sm:py-1 ${
+										isDownloaded('rd', t.hash) ||
+										isDownloaded('ad', t.hash) ||
+										isDownloaded('tb', t.hash)
 											? 'bg-green-900'
 											: isDownloading('rd', t.hash) ||
-												  isDownloading('ad', t.hash)
+												  isDownloading('ad', t.hash) ||
+												  isDownloading('tb', t.hash)
 												? 'bg-red-900'
 												: ''
-									}
-								`}
+									} `}
 								>
-									<td className="border px-4 py-2">
+									<td className="border-0 px-4 py-2 max-sm:basis-full max-sm:px-1 max-sm:py-0.5 max-sm:[overflow-wrap:anywhere]">
 										{!['Invalid Magnet', 'Magnet'].includes(t.filename) && (
 											<>
 												<span className="cursor-pointer">
-													{t.mediaType === 'tv' ? '📺' : '🎥'}
+													{t.mediaType === 'tv' ? (
+														<Tv className="inline-block h-4 w-4 text-cyan-400" />
+													) : (
+														<Film className="inline-block h-4 w-4 text-yellow-400" />
+													)}
 												</span>
-												&nbsp;<strong>{t.title}</strong>{' '}
-												{filterText && (
-													<Link
-														href={`/library?filter=${encodeURIComponent(
-															t.title
-														)}`}
-														className="inline-block bg-green-600 hover:bg-green-800 text-white font-bold py-0 px-1 rounded text-xs cursor-pointer"
-														onClick={(e) => e.stopPropagation()}
-													>
-														{filterText}
-													</Link>
-												)}
+												&nbsp;<strong>{t.title}</strong>
+												{/* glued to the title so the icon never wraps onto a line alone */}
+												{'\u00a0'}
 												<Link
 													href={`/search?query=${encodeURIComponent(
 														(
@@ -489,74 +1380,199 @@ function HashlistPage() {
 														).trim() || t.title
 													)}`}
 													target="_blank"
-													className="inline-block bg-blue-600 hover:bg-blue-800 text-white font-bold py-0 px-1 rounded text-xs cursor-pointer ml-1"
+													aria-label="Search again"
+													title="Search again"
+													className="inline-block align-text-bottom text-blue-400 hover:text-blue-300"
 													onClick={(e) => e.stopPropagation()}
 												>
-													Search again
-												</Link>
+													<Search className="h-4 w-4" />
+												</Link>{' '}
+												{filterText && (
+													<Link
+														href={`/hashlist?filter=${encodeURIComponent(
+															t.title
+														)}`}
+														className="inline-block cursor-pointer rounded border-2 border-green-500 bg-green-900/30 px-1 py-0 text-xs text-green-100 transition-colors hover:bg-green-800/50"
+														onClick={(e) => e.stopPropagation()}
+													>
+														{filterText}
+													</Link>
+												)}
 												<br />
 											</>
 										)}
 										{t.filename}
 									</td>
 
-									<td className="border px-4 py-2">
+									<td className="border-0 px-4 py-2 whitespace-nowrap max-sm:px-1 max-sm:py-0.5 max-sm:text-xs max-sm:text-gray-300">
 										{(t.bytes / ONE_GIGABYTE).toFixed(1)} GB
 									</td>
-									<td className="border px-4 py-2">
-										{rdKey && isDownloading('rd', t.hash) && (
+									<td className="border-0 px-4 py-2 max-sm:ml-auto max-sm:px-1 max-sm:py-0.5">
+										{mounted && rdKey && isDownloading('rd', t.hash) && (
 											<button
-												className="bg-red-500 hover:bg-red-700 text-white font-bold py-1 px-2 rounded"
+												className="rounded border-2 border-red-500 bg-red-900/30 px-2 py-1 text-red-100 transition-colors hover:bg-red-800/50"
 												onClick={() => deleteRd(t.hash)}
 											>
-												<FaTimes />
-												RD ({hashAndProgress[`rd:${t.hash}`] + '%'})
+												<X className="mr-1 inline h-3 w-3" />
+												RD ({hashAndProgress[`rd:${t.hash}`] || 0}%)
 											</button>
 										)}
-										{rdKey && !t.rdAvailable && notInLibrary('rd', t.hash) && (
-											<button
-												className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-1 px-2 rounded"
-												onClick={() => addRd(t.hash)}
-											>
-												<FaDownload />
-												RD
-											</button>
-										)}
-										{rdKey && t.rdAvailable && notInLibrary('rd', t.hash) && (
-											<button
-												className="bg-green-500 hover:bg-green-700 text-white font-bold py-1 px-2 rounded"
-												onClick={() => addRd(t.hash)}
-											>
-												<FaDownload />
-												RD
-											</button>
-										)}
+										{mounted &&
+											rdKey &&
+											!t.rdAvailable &&
+											notInLibrary('rd', t.hash) && (
+												<button
+													className="rounded border-2 border-blue-500 bg-blue-900/30 px-2 py-1 text-blue-100 transition-colors hover:bg-blue-800/50"
+													onClick={() => addRd(t.hash, t.filename)}
+												>
+													<Download className="mr-1 inline h-3 w-3" />
+													RD
+												</button>
+											)}
+										{mounted &&
+											rdKey &&
+											t.rdAvailable &&
+											notInLibrary('rd', t.hash) && (
+												<button
+													className="rounded border-2 border-green-500 bg-green-900/30 px-2 py-1 text-green-100 transition-colors hover:bg-green-800/50"
+													onClick={() => addRd(t.hash, t.filename)}
+												>
+													<Download className="mr-1 inline h-3 w-3" />
+													RD
+												</button>
+											)}
 
-										{adKey && isDownloading('ad', t.hash) && (
+										{mounted && adKey && isDownloading('ad', t.hash) && (
 											<button
-												className="bg-red-500 hover:bg-red-700 text-white font-bold py-1 px-2 rounded"
+												className="ml-2 rounded border-2 border-red-500 bg-red-900/30 px-2 py-1 text-red-100 transition-colors hover:bg-red-800/50"
 												onClick={() => deleteAd(t.hash)}
 											>
-												<FaTimes />
+												<X className="mr-1 inline h-3 w-3" />
 												AD ({hashAndProgress[`ad:${t.hash}`] + '%'})
 											</button>
 										)}
-										{adKey && !t.adAvailable && notInLibrary('ad', t.hash) && (
+										{mounted &&
+											adKey &&
+											!t.adAvailable &&
+											notInLibrary('ad', t.hash) && (
+												<button
+													className="ml-2 rounded border-2 border-blue-500 bg-blue-900/30 px-2 py-1 text-blue-100 transition-colors hover:bg-blue-800/50"
+													onClick={() => addAd(t.hash)}
+												>
+													<Download className="mr-1 inline h-3 w-3" />
+													AD
+												</button>
+											)}
+										{mounted &&
+											adKey &&
+											t.adAvailable &&
+											notInLibrary('ad', t.hash) && (
+												<button
+													className="ml-2 rounded border-2 border-green-500 bg-green-900/30 px-2 py-1 text-green-100 transition-colors hover:bg-green-800/50"
+													onClick={() => addAd(t.hash)}
+												>
+													<Download className="mr-1 inline h-3 w-3" />
+													AD
+												</button>
+											)}
+
+										{mounted && tbKey && isDownloading('tb', t.hash) && (
 											<button
-												className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-1 px-2 rounded"
-												onClick={() => addAd(t.hash)}
+												className="ml-2 rounded border-2 border-red-500 bg-red-900/30 px-2 py-1 text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() => deleteTb(t.hash)}
 											>
-												<FaDownload />
-												AD
+												<X className="mr-1 inline h-3 w-3" />
+												TB ({hashAndProgress[`tb:${t.hash}`] || 0}%)
 											</button>
 										)}
-										{adKey && t.adAvailable && notInLibrary('ad', t.hash) && (
+										{mounted &&
+											tbKey &&
+											!t.tbAvailable &&
+											notInLibrary('tb', t.hash) && (
+												<button
+													className="ml-2 rounded border-2 border-purple-500 bg-purple-900/30 px-2 py-1 text-purple-100 transition-colors hover:bg-purple-800/50"
+													onClick={() => addTb(t.hash)}
+												>
+													<Download className="mr-1 inline h-3 w-3" />
+													TB
+												</button>
+											)}
+										{mounted &&
+											tbKey &&
+											t.tbAvailable &&
+											notInLibrary('tb', t.hash) && (
+												<button
+													className="ml-2 rounded border-2 border-green-500 bg-green-900/30 px-2 py-1 text-green-100 transition-colors hover:bg-green-800/50"
+													onClick={() => addTb(t.hash)}
+												>
+													<Download className="mr-1 inline h-3 w-3" />
+													TB
+												</button>
+											)}
+										{mounted && pmKey && isDownloading('pm', t.hash) && (
 											<button
-												className="bg-green-500 hover:bg-green-700 text-white font-bold py-1 px-2 rounded"
-												onClick={() => addAd(t.hash)}
+												className="ml-2 rounded border-2 border-red-500 bg-red-900/30 px-2 py-1 text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() => deletePm(t.hash)}
 											>
-												<FaDownload />
-												AD
+												<X className="mr-1 inline h-3 w-3" />
+												PM ({hashAndProgress[`pm:${t.hash}`] || 0}%)
+											</button>
+										)}
+										{mounted && pmKey && notInLibrary('pm', t.hash) && (
+											<button
+												className={`ml-2 rounded border-2 px-2 py-1 transition-colors ${
+													t.pmAvailable
+														? 'border-green-500 bg-green-900/30 text-green-100 hover:bg-green-800/50'
+														: 'border-[#aa0000] bg-[#aa0000]/30 text-red-100 hover:bg-[#aa0000]/50'
+												}`}
+												onClick={() => addPm(t.hash)}
+											>
+												<Download className="mr-1 inline h-3 w-3" />
+												PM
+											</button>
+										)}
+										{mounted && ocKey && isDownloading('oc', t.hash) && (
+											<button
+												className="ml-2 rounded border-2 border-red-500 bg-red-900/30 px-2 py-1 text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() => deleteOc(t.hash)}
+											>
+												<X className="mr-1 inline h-3 w-3" />
+												OC ({hashAndProgress[`oc:${t.hash}`] || 0}%)
+											</button>
+										)}
+										{mounted && ocKey && notInLibrary('oc', t.hash) && (
+											<button
+												className={`ml-2 rounded border-2 px-2 py-1 transition-colors ${
+													t.ocAvailable
+														? 'border-green-500 bg-green-900/30 text-green-100 hover:bg-green-800/50'
+														: 'border-[#f97316] bg-[#f97316]/30 text-orange-100 hover:bg-[#f97316]/50'
+												}`}
+												onClick={() => addOc(t.hash)}
+											>
+												<Download className="mr-1 inline h-3 w-3" />
+												OC
+											</button>
+										)}
+										{mounted && dlKey && isDownloading('dl', t.hash) && (
+											<button
+												className="ml-2 rounded border-2 border-red-500 bg-red-900/30 px-2 py-1 text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() => deleteDl(t.hash)}
+											>
+												<X className="mr-1 inline h-3 w-3" />
+												DL ({hashAndProgress[`dl:${t.hash}`] || 0}%)
+											</button>
+										)}
+										{mounted && dlKey && notInLibrary('dl', t.hash) && (
+											<button
+												className={`ml-2 rounded border-2 px-2 py-1 transition-colors ${
+													t.dlAvailable
+														? 'border-green-500 bg-green-900/30 text-green-100 hover:bg-green-800/50'
+														: 'border-[#38bdf8] bg-[#38bdf8]/30 text-sky-100 hover:bg-[#38bdf8]/50'
+												}`}
+												onClick={() => addDl(t.hash)}
+											>
+												<Download className="mr-1 inline h-3 w-3" />
+												DL
 											</button>
 										)}
 									</td>
@@ -566,6 +1582,34 @@ function HashlistPage() {
 					</tbody>
 				</table>
 			</div>
+			{/* Bottom pagination */}
+			<div className={`mt-4 flex items-center ${showPager ? '' : 'hidden'}`}>
+				<button
+					className={`mr-1 rounded border-2 border-indigo-500 bg-indigo-900/30 px-1 py-1 text-indigo-100 transition-colors hover:bg-indigo-800/50 ${
+						currentPage <= 1 ? 'cursor-not-allowed opacity-60' : ''
+					}`}
+					onClick={handlePrevPage}
+					disabled={currentPage <= 1}
+				>
+					<ChevronLeft className="h-4 w-4" />
+				</button>
+				<span className="w-16 text-center">
+					{currentPage}/{pageCount}
+				</span>
+				<button
+					className={`ml-1 rounded border-2 border-indigo-500 bg-indigo-900/30 px-1 py-1 text-xs text-indigo-100 transition-colors hover:bg-indigo-800/50 ${
+						currentPage >= Math.ceil(sortedList.length / ITEMS_PER_PAGE)
+							? 'cursor-not-allowed opacity-60'
+							: ''
+					}`}
+					onClick={handleNextPage}
+					disabled={currentPage >= Math.ceil(sortedList.length / ITEMS_PER_PAGE)}
+				>
+					<ChevronRight className="h-4 w-4" />
+				</button>
+			</div>
+			{/* Spacer for floating library indicator */}
+			<div className="pb-20" />
 		</div>
 	);
 }

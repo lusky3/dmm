@@ -1,0 +1,1853 @@
+import type { AnimeIdSource } from '@/services/database/anime';
+import type { AvailabilityUpsert } from '@/services/database/availability';
+import type { RexDirectOwner } from '@/services/database/rexDirect';
+import type { ScrapedTrueReadOptions } from '@/services/database/scraped';
+import type { SnapshotPost } from '@/services/database/torrentSnapshot';
+import type { RdCastCredentials } from '@/utils/castRdToken';
+import type { TorznabLiveService } from '@/utils/sponsorProviders';
+import { Prisma } from '@prisma/client';
+import {
+	AllDebridCastService,
+	AnimeService,
+	AvailabilityService,
+	CastService,
+	ContentRequestService,
+	DebridLinkCastService,
+	DebridUploaderMapService,
+	HashImdbService,
+	HashSearchService,
+	HistoryAggregationService,
+	ImdbSearchService,
+	NewznabApiCacheService,
+	Nzb2rdMapService,
+	type Nzb2rdWaiter,
+	NzbSearchCacheService,
+	OffcloudCastService,
+	PremiumizeCastService,
+	RdOperationalService,
+	ReportService,
+	RexDirectService,
+	ScrapedService,
+	SearchService,
+	SponsorProviderKeysService,
+	SponsorsService,
+	StreamHealthService,
+	TorBoxCastService,
+	TorBoxCdnService,
+	TorBoxOperationalService,
+	TorrentSnapshotService,
+	TransferFilingService,
+	type TransferMetaRecord,
+	TransferMetaService,
+	type TransferMetaSource,
+	WantedItemsService,
+	ZurgKeysService,
+} from './database';
+import type { FilenameIdentification } from './database/hashImdb';
+import { HashSearchParams } from './database/hashSearch';
+import { RealDebridOperation } from './database/rdOperational';
+import { StreamServerStatus, TorrentioUrlCheckResult } from './database/streamHealth';
+import { TorBoxCdnSample } from './database/torboxCdn';
+import { TorBoxOperation } from './database/torboxOperational';
+import { ScrapeSearchResult } from './mediasearch';
+import type { ReportType } from './reporterId';
+import { isHashBlocked, withoutBlockedHashList, withoutBlockedHashes } from './takedown/blocklist';
+import { TorrentInfoResponse } from './types';
+
+// Scrapers often strip the dot, so "...H264-DJT exe" counts too.
+const EXECUTABLE_TITLE = /[.\s_-]exe\s*$/i;
+
+export type RepositoryDependencies = Partial<{
+	availabilityService: AvailabilityService;
+	scrapedService: ScrapedService;
+	searchService: SearchService;
+	animeService: AnimeService;
+	castService: CastService;
+	torboxCastService: TorBoxCastService;
+	allDebridCastService: AllDebridCastService;
+	premiumizeCastService: PremiumizeCastService;
+	offcloudCastService: OffcloudCastService;
+	debridLinkCastService: DebridLinkCastService;
+	reportService: ReportService;
+	torrentSnapshotService: TorrentSnapshotService;
+	hashImdbService: HashImdbService;
+	hashSearchService: HashSearchService;
+	zurgKeysService: ZurgKeysService;
+	sponsorsService: SponsorsService;
+	rexDirectService: RexDirectService;
+	sponsorProviderKeysService: SponsorProviderKeysService;
+	wantedItemsService: WantedItemsService;
+	streamHealthService: StreamHealthService;
+	historyAggregationService: HistoryAggregationService;
+	rdOperationalService: RdOperationalService;
+	torboxOperationalService: TorBoxOperationalService;
+	torboxCdnService: TorBoxCdnService;
+	imdbSearchService: ImdbSearchService;
+	debridUploaderMapService: DebridUploaderMapService;
+	nzb2rdMapService: Nzb2rdMapService;
+	nzbSearchCacheService: NzbSearchCacheService;
+	newznabApiCacheService: NewznabApiCacheService;
+	transferMetaService: TransferMetaService;
+	transferFilingService: TransferFilingService;
+	contentRequestService: ContentRequestService;
+}>;
+
+export class Repository {
+	private availabilityService: AvailabilityService;
+	private scrapedService: ScrapedService;
+	private searchService: SearchService;
+	private animeService: AnimeService;
+	private castService: CastService;
+	private torboxCastService: TorBoxCastService;
+	private allDebridCastService: AllDebridCastService;
+	private premiumizeCastService: PremiumizeCastService;
+	private offcloudCastService: OffcloudCastService;
+	private debridLinkCastService: DebridLinkCastService;
+	private reportService: ReportService;
+	private torrentSnapshotService: TorrentSnapshotService;
+	private hashImdbService: HashImdbService;
+	private hashSearchService: HashSearchService;
+	private zurgKeysService: ZurgKeysService;
+	private sponsorsService: SponsorsService;
+	private rexDirectService: RexDirectService;
+	private sponsorProviderKeysService: SponsorProviderKeysService;
+	private wantedItemsService: WantedItemsService;
+	private streamHealthService: StreamHealthService;
+	private historyAggregationService: HistoryAggregationService;
+	private rdOperationalService: RdOperationalService;
+	private torboxOperationalService: TorBoxOperationalService;
+	private torboxCdnService: TorBoxCdnService;
+	private imdbSearchService: ImdbSearchService;
+	private debridUploaderMapService: DebridUploaderMapService;
+	private nzb2rdMapService: Nzb2rdMapService;
+	private nzbSearchCacheService: NzbSearchCacheService;
+	private newznabApiCacheService: NewznabApiCacheService;
+	private transferMetaService: TransferMetaService;
+	private transferFilingService: TransferFilingService;
+	private contentRequestService: ContentRequestService;
+
+	constructor({
+		availabilityService,
+		scrapedService,
+		searchService,
+		animeService,
+		castService,
+		torboxCastService,
+		allDebridCastService,
+		premiumizeCastService,
+		offcloudCastService,
+		debridLinkCastService,
+		reportService,
+		torrentSnapshotService,
+		hashImdbService,
+		hashSearchService,
+		zurgKeysService,
+		sponsorsService,
+		rexDirectService,
+		sponsorProviderKeysService,
+		wantedItemsService,
+		streamHealthService,
+		historyAggregationService,
+		rdOperationalService,
+		torboxOperationalService,
+		torboxCdnService,
+		imdbSearchService,
+		debridUploaderMapService,
+		nzb2rdMapService,
+		nzbSearchCacheService,
+		newznabApiCacheService,
+		transferMetaService,
+		transferFilingService,
+		contentRequestService,
+	}: RepositoryDependencies = {}) {
+		this.availabilityService = availabilityService ?? new AvailabilityService();
+		this.scrapedService = scrapedService ?? new ScrapedService();
+		this.searchService = searchService ?? new SearchService();
+		this.animeService = animeService ?? new AnimeService();
+		this.castService = castService ?? new CastService();
+		this.torboxCastService = torboxCastService ?? new TorBoxCastService();
+		this.allDebridCastService = allDebridCastService ?? new AllDebridCastService();
+		this.premiumizeCastService = premiumizeCastService ?? new PremiumizeCastService();
+		this.offcloudCastService = offcloudCastService ?? new OffcloudCastService();
+		this.debridLinkCastService = debridLinkCastService ?? new DebridLinkCastService();
+		this.reportService = reportService ?? new ReportService();
+		this.torrentSnapshotService = torrentSnapshotService ?? new TorrentSnapshotService();
+		this.hashImdbService = hashImdbService ?? new HashImdbService();
+		this.hashSearchService = hashSearchService ?? new HashSearchService();
+		this.zurgKeysService = zurgKeysService ?? new ZurgKeysService();
+		this.sponsorsService = sponsorsService ?? new SponsorsService();
+		this.sponsorProviderKeysService =
+			sponsorProviderKeysService ?? new SponsorProviderKeysService();
+		this.wantedItemsService = wantedItemsService ?? new WantedItemsService();
+		this.rexDirectService = rexDirectService ?? new RexDirectService();
+		this.streamHealthService = streamHealthService ?? new StreamHealthService();
+		this.historyAggregationService =
+			historyAggregationService ?? new HistoryAggregationService();
+		this.rdOperationalService = rdOperationalService ?? new RdOperationalService();
+		this.torboxOperationalService = torboxOperationalService ?? new TorBoxOperationalService();
+		this.torboxCdnService = torboxCdnService ?? new TorBoxCdnService();
+		this.imdbSearchService = imdbSearchService ?? new ImdbSearchService();
+		this.debridUploaderMapService = debridUploaderMapService ?? new DebridUploaderMapService();
+		this.nzb2rdMapService = nzb2rdMapService ?? new Nzb2rdMapService();
+		this.nzbSearchCacheService = nzbSearchCacheService ?? new NzbSearchCacheService();
+		this.newznabApiCacheService = newznabApiCacheService ?? new NewznabApiCacheService();
+		this.transferMetaService = transferMetaService ?? new TransferMetaService();
+		this.transferFilingService = transferFilingService ?? new TransferFilingService();
+		this.contentRequestService = contentRequestService ?? new ContentRequestService();
+	}
+
+	// Ensure connection is properly closed when repository is no longer needed
+	public async disconnect(): Promise<void> {
+		await Promise.all([
+			this.availabilityService.disconnect(),
+			this.scrapedService.disconnect(),
+			this.searchService.disconnect(),
+			this.animeService.disconnect(),
+			this.castService.disconnect(),
+			this.torboxCastService.disconnect(),
+			this.allDebridCastService.disconnect(),
+			this.reportService.disconnect(),
+			this.torrentSnapshotService.disconnect(),
+			this.hashImdbService.disconnect(),
+			this.hashSearchService.disconnect(),
+			this.zurgKeysService.disconnect(),
+			this.sponsorsService.disconnect(),
+			this.sponsorProviderKeysService.disconnect(),
+			this.wantedItemsService.disconnect(),
+			this.streamHealthService.disconnect(),
+			this.historyAggregationService.disconnect(),
+			this.rdOperationalService.disconnect(),
+			this.torboxOperationalService.disconnect(),
+			this.imdbSearchService.disconnect(),
+			this.debridUploaderMapService.disconnect(),
+			this.nzb2rdMapService.disconnect(),
+			this.nzbSearchCacheService.disconnect(),
+			this.newznabApiCacheService.disconnect(),
+			this.transferMetaService.disconnect(),
+			this.transferFilingService.disconnect(),
+			this.contentRequestService.disconnect(),
+		]);
+	}
+
+	// Content request board (RD-only users ask; TB/AD users fulfil)
+	public createContentRequest(input: Parameters<ContentRequestService['createRequest']>[0]) {
+		return this.contentRequestService.createRequest(input);
+	}
+
+	public getContentRequest(id: string) {
+		return this.contentRequestService.getRequest(id);
+	}
+
+	public async listOpenContentRequests(limit: number, offset = 0) {
+		return withoutBlockedHashes(
+			await this.contentRequestService.listOpenRequests(limit, offset)
+		);
+	}
+
+	public listContentRequestsFor(requesterId: string, limit: number) {
+		return this.contentRequestService.listRequestsFor(requesterId, limit);
+	}
+
+	public claimContentRequest(id: string, fulfillerId: string) {
+		return this.contentRequestService.claimRequest(id, fulfillerId);
+	}
+
+	public attachContentRequestJob(id: string, jobId: string, jobHost: string) {
+		return this.contentRequestService.attachJob(id, jobId, jobHost);
+	}
+
+	public releaseContentRequest(id: string, error: string, jobId?: string) {
+		return this.contentRequestService.releaseRequest(id, error, jobId);
+	}
+
+	public markContentRequestDelivered(id: string) {
+		return this.contentRequestService.markDelivered(id);
+	}
+
+	public settleContentRequestDelivered(id: string, jobId: string) {
+		return this.contentRequestService.settleDelivered(id, jobId);
+	}
+
+	public listClaimedContentRequests(limit: number) {
+		return this.contentRequestService.listClaimedRequests(limit);
+	}
+
+	public touchClaimedContentRequest(id: string) {
+		return this.contentRequestService.touchClaimed(id);
+	}
+
+	public stallContentRequest(id: string, error: string) {
+		return this.contentRequestService.stallRequest(id, error);
+	}
+
+	public returnContentRequestClaim(id: string) {
+		return this.contentRequestService.returnClaim(id);
+	}
+
+	public cancelContentRequest(id: string, requesterId: string) {
+		return this.contentRequestService.cancelRequest(id, requesterId);
+	}
+
+	public async listContentRequestBoard(limit: number, offset: number, viewerId: string | null) {
+		return withoutBlockedHashes(
+			await this.contentRequestService.listOpenBoard(limit, offset, viewerId)
+		);
+	}
+
+	public listContentRequestSendsBy(fulfillerIds: string[]) {
+		return this.contentRequestService.listSendsBy(fulfillerIds);
+	}
+
+	public countContentRequestSendsByFulfiller(since: Date | null, limit: number) {
+		return this.contentRequestService.countSendsByFulfiller(since, limit);
+	}
+
+	public thankContentRequest(id: string, requesterId: string) {
+		return this.contentRequestService.thankRequest(id, requesterId);
+	}
+
+	public linkFulfillers(fulfillerIds: string[], shortId: string, showName: boolean) {
+		return this.contentRequestService.linkFulfillers(fulfillerIds, shortId, showName);
+	}
+
+	public getFulfillerLinks(fulfillerIds: string[]) {
+		return this.contentRequestService.getFulfillerLinks(fulfillerIds);
+	}
+
+	public getFulfillerLinksForSponsors(shortIds: string[]) {
+		return this.contentRequestService.getLinksForSponsors(shortIds);
+	}
+
+	public getSponsorEarned(shortId: string) {
+		return this.contentRequestService.getEarned(shortId);
+	}
+
+	public paySponsorEarned(
+		shortId: string,
+		paidBlocks: number | null,
+		blocks: number,
+		earnedUntil: Date
+	) {
+		return this.contentRequestService.payEarned(shortId, paidBlocks, blocks, earnedUntil);
+	}
+
+	public getSponsorGithubNames(shortIds: string[]) {
+		return this.sponsorsService.githubNames(shortIds);
+	}
+
+	// Debrid Uploader (TB → RD transfer) mapping methods
+	public getDebridTransfer(originalHash: string) {
+		return this.debridUploaderMapService.getTransfer(originalHash);
+	}
+
+	public getDebridTransfers(originalHashes: string[]) {
+		return this.debridUploaderMapService.getTransfers(originalHashes);
+	}
+
+	public recordDebridTransferPending(originalHash: string, jobId: string, imdbId: string) {
+		return this.debridUploaderMapService.recordPending(originalHash, jobId, imdbId);
+	}
+
+	public recordDebridTransferCompleted(
+		originalHash: string,
+		jobId: string,
+		imdbId: string,
+		rewrittenHash: string
+	) {
+		return this.debridUploaderMapService.recordCompleted(
+			originalHash,
+			jobId,
+			imdbId,
+			rewrittenHash
+		);
+	}
+
+	public listPendingDebridTransfers(limit: number) {
+		return this.debridUploaderMapService.listPending(limit);
+	}
+
+	public listCompletedDebridTransfers(limit: number) {
+		return this.debridUploaderMapService.listCompleted(limit);
+	}
+
+	public touchDebridTransfer(record: Parameters<DebridUploaderMapService['touchTransfer']>[0]) {
+		return this.debridUploaderMapService.touchTransfer(record);
+	}
+
+	public removeDebridTransfer(originalHash: string) {
+		return this.debridUploaderMapService.removeTransfer(originalHash);
+	}
+
+	public recordDebridJobServer(jobId: string, serverUrl: string) {
+		return this.debridUploaderMapService.recordJobServer(jobId, serverUrl);
+	}
+
+	public getDebridJobServer(jobId: string) {
+		return this.debridUploaderMapService.getJobServer(jobId);
+	}
+
+	// nzb2rd (Usenet → RD transfer) mapping methods, keyed by indexer release id
+	public getNzb2rdTransfer(releaseId: string) {
+		return this.nzb2rdMapService.getTransfer(releaseId);
+	}
+
+	public getNzb2rdTransfers(releaseIds: string[]) {
+		return this.nzb2rdMapService.getTransfers(releaseIds);
+	}
+
+	public recordNzb2rdTransferPending(
+		releaseId: string,
+		jobId: string,
+		imdbId: string,
+		title?: string
+	) {
+		return this.nzb2rdMapService.recordPending(releaseId, jobId, imdbId, title);
+	}
+
+	public recordNzb2rdTransferCompleted(
+		releaseId: string,
+		jobId: string,
+		imdbId: string,
+		infoHash: string,
+		title?: string
+	) {
+		return this.nzb2rdMapService.recordCompleted(releaseId, jobId, imdbId, infoHash, title);
+	}
+
+	public recordNzb2rdTransferFailed(
+		releaseId: string,
+		jobId: string,
+		imdbId: string,
+		error?: string,
+		title?: string
+	) {
+		return this.nzb2rdMapService.recordFailed(releaseId, jobId, imdbId, error, title);
+	}
+
+	public removeNzb2rdTransfer(releaseId: string, jobId: string) {
+		return this.nzb2rdMapService.removeTransfer(releaseId, jobId);
+	}
+
+	// Users parked on someone else's in-flight job, to be given the content when it lands
+	public addNzb2rdWaiter(
+		releaseId: string,
+		rdKey: string,
+		imdbId: string,
+		oauth?: Nzb2rdWaiter['oauth']
+	) {
+		return this.nzb2rdMapService.addWaiter(releaseId, rdKey, imdbId, oauth);
+	}
+
+	public takeNzb2rdWaiters(releaseId: string) {
+		return this.nzb2rdMapService.takeWaiters(releaseId);
+	}
+
+	public getNzb2rdWaiters(releaseId: string) {
+		return this.nzb2rdMapService.getWaiters(releaseId);
+	}
+
+	public clearNzb2rdWaiters(releaseId: string) {
+		return this.nzb2rdMapService.clearWaiters(releaseId);
+	}
+
+	// The cron's view of the same rows: every waiter list, and a sample of the
+	// markers still reading `pending`, to settle against nzb2rd.
+	public listNzb2rdWaiterLists(limit: number) {
+		return this.nzb2rdMapService.listWaiterLists(limit);
+	}
+
+	public pruneNzb2rdWaiters(releaseId: string, keep: Nzb2rdWaiter[], seen: Date) {
+		return this.nzb2rdMapService.pruneWaiters(releaseId, keep, seen);
+	}
+
+	public sampleNzb2rdPendingMarkers(limit: number) {
+		return this.nzb2rdMapService.samplePendingMarkers(limit);
+	}
+
+	// Page context for a transfer — the DMM title and the content page it started
+	// from — which neither uploader service stores and localStorage used to hold.
+	public recordTransferMeta(meta: Omit<TransferMetaRecord, 'updatedAt'>) {
+		return this.transferMetaService.record(meta);
+	}
+
+	public getTransferMeta(jobs: { source: TransferMetaSource; jobId: string }[]) {
+		return this.transferMetaService.getMany(jobs);
+	}
+
+	// What the completion sweep already did with a finished transfer, so it
+	// neither re-asks about a refusal nor undoes an eviction from search.
+	public getTransferFilings(jobs: { source: TransferMetaSource; jobId: string }[]) {
+		return this.transferFilingService.getMany(jobs);
+	}
+
+	public recordTransferFiling(
+		record: Parameters<TransferFilingService['record']>[0],
+		at?: number
+	) {
+		return this.transferFilingService.record(record, at);
+	}
+
+	public pruneTransferFilings(cutoff: Date) {
+		return this.transferFilingService.pruneBefore(cutoff);
+	}
+
+	// Newznab search cache, so one indexer call serves a title for a whole TTL
+	public getCachedNzbSearch(imdbId: string, seasonNum?: number) {
+		return this.nzbSearchCacheService.get(imdbId, seasonNum);
+	}
+
+	public setCachedNzbSearch(
+		imdbId: string,
+		seasonNum: number | undefined,
+		results: Parameters<NzbSearchCacheService['set']>[2]
+	) {
+		return this.nzbSearchCacheService.set(imdbId, seasonNum, results);
+	}
+
+	// Newznab aggregation cache. Separate from the one above because the clock is
+	// different: an *arr polls the same searches on a timer, so the TTL scales
+	// with the age of the content rather than being fixed per title.
+	public getCachedNewznabApiSearch(key: string, maxTtlMs?: number) {
+		return this.newznabApiCacheService.get(key, Date.now(), maxTtlMs);
+	}
+
+	public setCachedNewznabApiSearch(
+		key: string,
+		results: Parameters<NewznabApiCacheService['set']>[1]
+	) {
+		return this.newznabApiCacheService.set(key, results);
+	}
+
+	// Availability Service Methods
+	public getIMDBIdByHash(hash: string) {
+		return this.availabilityService.getIMDBIdByHash(hash);
+	}
+
+	public saveIMDBIdMapping(hash: string, imdbId: string) {
+		return this.availabilityService.saveIMDBIdMapping(hash, imdbId);
+	}
+
+	public async handleDownloadedTorrent(
+		torrentInfo: TorrentInfoResponse,
+		hash: string,
+		imdbId: string
+	) {
+		if (await isHashBlocked(hash)) return;
+		return this.availabilityService.handleDownloadedTorrent(torrentInfo, hash, imdbId);
+	}
+
+	public async upsertAvailability(data: AvailabilityUpsert) {
+		if (await isHashBlocked(data.hash)) return;
+		return this.availabilityService.upsertAvailability(data);
+	}
+
+	/**
+	 * Files a finished transfer into search: its entry on the library page and
+	 * its `Available` row, in one transaction, so a failure leaves neither.
+	 *
+	 * Written one after the other, a failed `Available` insert left the entry on
+	 * the page: search listed the release without knowing it was cached, every
+	 * retry rewrote the page and failed again, and the backfill took the
+	 * leftover entry for a false-positive eviction and skipped it for good.
+	 * Measured 2026-10-06: seven releases with 199-260 character names were on
+	 * their page and not in `Available`, one of them failing every cron tick.
+	 */
+	public async fileTransferRelease(
+		scrapedKey: string,
+		entry: ScrapeSearchResult,
+		availability: AvailabilityUpsert
+	) {
+		const blocked = await isHashBlocked(availability.hash);
+		await this.scrapedService.saveScrapedTrueResultsWith(
+			scrapedKey,
+			await withoutBlockedHashes([entry]),
+			async (tx) => {
+				if (!blocked) await this.availabilityService.upsertAvailability(availability, tx);
+			}
+		);
+	}
+
+	public async saveInstantAvailability(
+		imdbId: string,
+		rows: Array<{ hash: string; filename: string; bytes: number }>
+	) {
+		return this.availabilityService.saveInstantAvailability(
+			imdbId,
+			await withoutBlockedHashes(rows)
+		);
+	}
+
+	public getDebridioRefreshedAt(key: string) {
+		return this.availabilityService.getDebridioRefreshedAt(key);
+	}
+
+	public markDebridioRefreshed(key: string) {
+		return this.availabilityService.markDebridioRefreshed(key);
+	}
+
+	public async saveInstantAvailabilityAd(
+		imdbId: string,
+		rows: Array<{ hash: string; filename: string; bytes: number }>
+	) {
+		return this.availabilityService.saveInstantAvailabilityAd(
+			imdbId,
+			await withoutBlockedHashes(rows)
+		);
+	}
+
+	public async checkAvailability(imdbId: string, hashes: string[]) {
+		return this.availabilityService.checkAvailability(
+			imdbId,
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	public async checkAvailabilityByHashes(hashes: string[]) {
+		return this.availabilityService.checkAvailabilityByHashes(
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	public async getCachedRdNames(hashes: string[]) {
+		return this.availabilityService.getCachedRdNames(await withoutBlockedHashList(hashes));
+	}
+
+	public async filterCachedHashesAd(hashes: string[]) {
+		return this.availabilityService.filterCachedHashesAd(await withoutBlockedHashList(hashes));
+	}
+
+	public async filterPlayableCachedHashes(hashes: string[]) {
+		return this.availabilityService.filterPlayableCachedHashes(
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	public async filterPlayableCachedHashesAd(hashes: string[]) {
+		return this.availabilityService.filterPlayableCachedHashesAd(
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	public removeAvailability(hash: string) {
+		return this.availabilityService.removeAvailability(hash);
+	}
+
+	public getHashByLink(link: string) {
+		return this.availabilityService.getHashByLink(link);
+	}
+
+	public removeAvailableFileByLinkPrefix(linkPrefix: string) {
+		return this.availabilityService.removeAvailableFileByLinkPrefix(linkPrefix);
+	}
+
+	public deleteCastsByLinkPrefix(linkPrefix: string) {
+		return this.castService.deleteCastsByLinkPrefix(linkPrefix);
+	}
+
+	// AllDebrid Availability Service Methods
+	public async upsertAvailabilityAd(data: {
+		hash: string;
+		imdbId: string;
+		filename: string;
+		size: number;
+		status: string;
+		statusCode: number;
+		completionDate: number;
+		files: Array<{ n: string; s: number; l: string }>;
+	}) {
+		if (await isHashBlocked(data.hash)) return;
+		return this.availabilityService.upsertAvailabilityAd(data);
+	}
+
+	public async checkAvailabilityAd(imdbId: string, hashes: string[]) {
+		return this.availabilityService.checkAvailabilityAd(
+			imdbId,
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	public async checkAvailabilityAdByHashes(hashes: string[]) {
+		return this.availabilityService.checkAvailabilityAdByHashes(
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	public removeAvailabilityAd(hash: string) {
+		return this.availabilityService.removeAvailabilityAd(hash);
+	}
+
+	public getIMDBIdByHashAd(hash: string) {
+		return this.availabilityService.getIMDBIdByHashAd(hash);
+	}
+
+	// Scraped Service Methods
+	// Every read of a scraped page drops what a takedown blocked, and every
+	// save below refuses it, so a crawl cannot put it back either.
+	public async getScrapedTrueResults<T>(
+		key: string,
+		maxSizeGB?: number,
+		page?: number,
+		options?: ScrapedTrueReadOptions
+	) {
+		return this.withoutExecutables(
+			await withoutBlockedHashes(
+				await this.scrapedService.getScrapedTrueResults<T>(key, maxSizeGB, page, options)
+			)
+		);
+	}
+
+	public async getAllScrapedTrueResults(key: string) {
+		return this.withoutExecutables(
+			await withoutBlockedHashes(await this.scrapedService.getAllScrapedTrueResults(key))
+		);
+	}
+
+	public async getScrapedTrueRow(key: string) {
+		const row = await this.scrapedService.getScrapedTrueRow(key);
+		return (
+			row && {
+				...row,
+				results: await this.withoutExecutables(await withoutBlockedHashes(row.results)),
+			}
+		);
+	}
+
+	/**
+	 * Drops fake releases that are an executable, not a video: by title, and by
+	 * RD's cached file list, since most of them carry a clean video-like title.
+	 */
+	private async withoutExecutables<T>(value: T): Promise<T> {
+		if (!Array.isArray(value) || value.length === 0) return value;
+		let fakes = new Set<string>();
+		try {
+			fakes = await this.availabilityService.filterExecutableOnlyHashes(
+				value.map((row) => row?.hash).filter(Boolean)
+			);
+		} catch (error) {
+			// A failed lookup must not take the search page down; the title check still runs.
+			console.warn(
+				'Executable-only lookup failed:',
+				error instanceof Error ? error.message : 'Unknown error'
+			);
+		}
+		return value.filter(
+			(row) =>
+				!EXECUTABLE_TITLE.test(row?.title ?? '') &&
+				!fakes.has(String(row?.hash).toLowerCase())
+		) as T;
+	}
+
+	public getScrapedTrueSeasonKeys(imdbId: string) {
+		return this.scrapedService.getScrapedTrueSeasonKeys(imdbId);
+	}
+
+	public getRecentScrapedTrueKeys(limit: number) {
+		return this.scrapedService.getRecentScrapedTrueKeys(limit);
+	}
+
+	public async getScrapedResults<T>(key: string, maxSizeGB?: number, page?: number) {
+		return this.withoutExecutables(
+			await withoutBlockedHashes(
+				await this.scrapedService.getScrapedResults<T>(key, maxSizeGB, page)
+			)
+		);
+	}
+
+	public async saveScrapedTrueResults(
+		key: string,
+		value: ScrapeSearchResult[],
+		updateUpdatedAt?: boolean,
+		replaceOldScrape?: boolean
+	) {
+		return this.scrapedService.saveScrapedTrueResults(
+			key,
+			await withoutBlockedHashes(value),
+			updateUpdatedAt,
+			replaceOldScrape
+		);
+	}
+
+	public async saveScrapedResults(
+		key: string,
+		value: ScrapeSearchResult[],
+		updateUpdatedAt?: boolean,
+		replaceOldScrape?: boolean
+	) {
+		return this.scrapedService.saveScrapedResults(
+			key,
+			await withoutBlockedHashes(value),
+			updateUpdatedAt,
+			replaceOldScrape
+		);
+	}
+
+	public keyExists(key: string) {
+		return this.scrapedService.keyExists(key);
+	}
+
+	public isOlderThan(imdbId: string, daysAgo: number) {
+		return this.scrapedService.isOlderThan(imdbId, daysAgo);
+	}
+
+	public getOldestRequest(olderThan?: Date | null) {
+		return this.scrapedService.getOldestRequest(olderThan);
+	}
+
+	public processingMoreThanAnHour() {
+		return this.scrapedService.processingMoreThanAnHour();
+	}
+
+	public getOldestScrapedMedia(mediaType: 'tv' | 'movie', quantity?: number) {
+		return this.scrapedService.getOldestScrapedMedia(mediaType, quantity);
+	}
+
+	public getAllImdbIds(mediaType: 'tv' | 'movie') {
+		return this.scrapedService.getAllImdbIds(mediaType);
+	}
+
+	public markAsDone(imdbId: string) {
+		return this.scrapedService.markAsDone(imdbId);
+	}
+
+	public getRecentlyUpdatedContent() {
+		return this.scrapedService.getRecentlyUpdatedContent();
+	}
+
+	// Search Service Methods
+	public saveSearchResults<T>(key: string, value: T) {
+		return this.searchService.saveSearchResults(key, value);
+	}
+
+	public getSearchResults<T>(key: string) {
+		return this.searchService.getSearchResults<T>(key);
+	}
+
+	// Anime Service Methods
+	public getAnimeByKitsuIds(kitsuIds: number[]) {
+		return this.animeService.getAnimeByKitsuIds(kitsuIds);
+	}
+
+	public getAnimeByExternalId(source: AnimeIdSource, id: number) {
+		return this.animeService.getAnimeByExternalId(source, id);
+	}
+
+	public getAnimeEntryRows(ids: { anidbIds: number[]; imdbIds: string[] }) {
+		return this.animeService.getAnimeEntryRows(ids);
+	}
+
+	public getAnimeTitles(anidbIds: number[]) {
+		return this.animeService.getAnimeTitles(anidbIds);
+	}
+
+	public getRecentlyUpdatedAnime(take: number) {
+		return this.animeService.getRecentlyUpdatedAnime(take);
+	}
+
+	// Cast Service Methods
+	public saveCastProfile(
+		userId: string,
+		credentials: RdCastCredentials,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.castService.saveCastProfile(
+			userId,
+			credentials,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public getLatestCast(imdbId: string, userId: string) {
+		return this.castService.getLatestCast(imdbId, userId);
+	}
+
+	public getCastURLs(imdbId: string, userId: string) {
+		return this.castService.getCastURLs(imdbId, userId);
+	}
+
+	public getCastProfile(userId: string) {
+		return this.castService.getCastProfile(userId);
+	}
+
+	public saveCast(
+		imdbId: string,
+		userId: string,
+		hash: string,
+		url: string,
+		rdLink: string,
+		fileSize: number
+	) {
+		return this.castService.saveCast(imdbId, userId, hash, url, rdLink, fileSize);
+	}
+
+	public fetchCastedMovies(userId: string) {
+		return this.castService.fetchCastedMovies(userId);
+	}
+
+	public fetchCastedShows(userId: string) {
+		return this.castService.fetchCastedShows(userId);
+	}
+
+	public fetchAllCastedLinks(userId: string) {
+		return this.castService.fetchAllCastedLinks(userId);
+	}
+
+	public deleteCastedLink(imdbId: string, userId: string, hash: string) {
+		return this.castService.deleteCastedLink(imdbId, userId, hash);
+	}
+
+	public getAllUserCasts(userId: string) {
+		return this.castService.getAllUserCasts(userId);
+	}
+
+	public getUserCastStreams(imdbId: string, userId: string, limit?: number) {
+		return this.castService.getUserCastStreams(imdbId, userId, limit);
+	}
+
+	public async getOtherStreams(imdbId: string, userId: string, limit?: number, maxSize?: number) {
+		return withoutBlockedHashes(
+			await this.castService.getOtherStreams(imdbId, userId, limit, maxSize)
+		);
+	}
+
+	// TorBox Cast Service Methods
+	public saveTorBoxCastProfile(
+		userId: string,
+		apiKey: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.torboxCastService.saveCastProfile(
+			userId,
+			apiKey,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public getTorBoxLatestCast(imdbId: string, userId: string) {
+		return this.torboxCastService.getLatestCast(imdbId, userId);
+	}
+
+	public getTorBoxCastURLs(imdbId: string, userId: string) {
+		return this.torboxCastService.getCastURLs(imdbId, userId);
+	}
+
+	public getTorBoxCastProfile(userId: string) {
+		return this.torboxCastService.getCastProfile(userId);
+	}
+
+	public saveTorBoxCast(
+		imdbId: string,
+		userId: string,
+		hash: string,
+		url: string,
+		tbLink: string,
+		fileSize: number,
+		torrentId?: number,
+		fileId?: number
+	) {
+		return this.torboxCastService.saveCast(
+			imdbId,
+			userId,
+			hash,
+			url,
+			tbLink,
+			fileSize,
+			torrentId,
+			fileId
+		);
+	}
+
+	public fetchTorBoxCastedMovies(userId: string) {
+		return this.torboxCastService.fetchCastedMovies(userId);
+	}
+
+	public fetchTorBoxCastedShows(userId: string) {
+		return this.torboxCastService.fetchCastedShows(userId);
+	}
+
+	public fetchAllTorBoxCastedLinks(userId: string) {
+		return this.torboxCastService.fetchAllCastedLinks(userId);
+	}
+
+	public deleteTorBoxCastedLink(imdbId: string, userId: string, hash: string) {
+		return this.torboxCastService.deleteCastedLink(imdbId, userId, hash);
+	}
+
+	public getAllTorBoxUserCasts(userId: string) {
+		return this.torboxCastService.getAllUserCasts(userId);
+	}
+
+	public getTorBoxUserCastStreams(imdbId: string, userId: string, limit?: number) {
+		return this.torboxCastService.getUserCastStreams(imdbId, userId, limit);
+	}
+
+	public async getTorBoxOtherStreams(
+		imdbId: string,
+		userId: string,
+		limit?: number,
+		maxSize?: number
+	) {
+		return withoutBlockedHashes(
+			await this.torboxCastService.getOtherStreams(imdbId, userId, limit, maxSize)
+		);
+	}
+
+	// AllDebrid Cast Service Methods
+	public saveAllDebridCastProfile(
+		userId: string,
+		apiKey: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.allDebridCastService.saveCastProfile(
+			userId,
+			apiKey,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public updateAllDebridCastSettings(
+		userId: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.allDebridCastService.updateCastSettings(
+			userId,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public getAllDebridLatestCast(imdbId: string, userId: string) {
+		return this.allDebridCastService.getLatestCast(imdbId, userId);
+	}
+
+	public getAllDebridCastURLs(imdbId: string, userId: string) {
+		return this.allDebridCastService.getCastURLs(imdbId, userId);
+	}
+
+	public getAllDebridCastProfile(userId: string) {
+		return this.allDebridCastService.getCastProfile(userId);
+	}
+
+	public saveAllDebridCast(
+		imdbId: string,
+		userId: string,
+		hash: string,
+		url: string,
+		adLink: string,
+		fileSize: number,
+		magnetId?: number,
+		fileIndex?: number
+	) {
+		return this.allDebridCastService.saveCast(
+			imdbId,
+			userId,
+			hash,
+			url,
+			adLink,
+			fileSize,
+			magnetId,
+			fileIndex
+		);
+	}
+
+	public fetchAllDebridCastedMovies(userId: string) {
+		return this.allDebridCastService.fetchCastedMovies(userId);
+	}
+
+	public fetchAllDebridCastedShows(userId: string) {
+		return this.allDebridCastService.fetchCastedShows(userId);
+	}
+
+	public fetchAllAllDebridCastedLinks(userId: string) {
+		return this.allDebridCastService.fetchAllCastedLinks(userId);
+	}
+
+	public deleteAllDebridCastedLink(imdbId: string, userId: string, hash: string) {
+		return this.allDebridCastService.deleteCastedLink(imdbId, userId, hash);
+	}
+
+	public getAllAllDebridUserCasts(userId: string) {
+		return this.allDebridCastService.getAllUserCasts(userId);
+	}
+
+	// Premiumize Cast Methods
+	public savePremiumizeCastProfile(
+		userId: string,
+		apiKey: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.premiumizeCastService.saveCastProfile(
+			userId,
+			apiKey,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public updatePremiumizeCastSettings(
+		userId: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.premiumizeCastService.updateCastSettings(
+			userId,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public getPremiumizeCastProfile(userId: string) {
+		return this.premiumizeCastService.getCastProfile(userId);
+	}
+
+	public savePremiumizeCast(
+		imdbId: string,
+		userId: string,
+		hash: string,
+		filename: string,
+		fileSize: number,
+		path?: string
+	) {
+		return this.premiumizeCastService.saveCast(imdbId, userId, hash, filename, fileSize, path);
+	}
+
+	public fetchPremiumizeCastedMovies(userId: string) {
+		return this.premiumizeCastService.fetchCastedMovies(userId);
+	}
+
+	public fetchPremiumizeCastedShows(userId: string) {
+		return this.premiumizeCastService.fetchCastedShows(userId);
+	}
+
+	public fetchAllPremiumizeCastedLinks(userId: string) {
+		return this.premiumizeCastService.fetchAllCastedLinks(userId);
+	}
+
+	public deletePremiumizeCastedLink(imdbId: string, userId: string, hash: string) {
+		return this.premiumizeCastService.deleteCastedLink(imdbId, userId, hash);
+	}
+
+	public getPremiumizeUserCastStreams(imdbId: string, userId: string, limit?: number) {
+		return this.premiumizeCastService.getUserCastStreams(imdbId, userId, limit);
+	}
+
+	public async getPremiumizeOtherStreams(
+		imdbId: string,
+		userId: string,
+		limit?: number,
+		maxSize?: number
+	) {
+		return withoutBlockedHashes(
+			await this.premiumizeCastService.getOtherStreams(imdbId, userId, limit, maxSize)
+		);
+	}
+
+	// Offcloud Cast Methods
+	public saveOffcloudCastProfile(
+		userId: string,
+		apiKey: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.offcloudCastService.saveCastProfile(
+			userId,
+			apiKey,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public updateOffcloudCastSettings(
+		userId: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.offcloudCastService.updateCastSettings(
+			userId,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public getOffcloudCastProfile(userId: string) {
+		return this.offcloudCastService.getCastProfile(userId);
+	}
+
+	public saveOffcloudCast(
+		imdbId: string,
+		userId: string,
+		hash: string,
+		filename: string,
+		fileSize: number,
+		path?: string
+	) {
+		return this.offcloudCastService.saveCast(imdbId, userId, hash, filename, fileSize, path);
+	}
+
+	public fetchOffcloudCastedMovies(userId: string) {
+		return this.offcloudCastService.fetchCastedMovies(userId);
+	}
+
+	public fetchOffcloudCastedShows(userId: string) {
+		return this.offcloudCastService.fetchCastedShows(userId);
+	}
+
+	public fetchAllOffcloudCastedLinks(userId: string) {
+		return this.offcloudCastService.fetchAllCastedLinks(userId);
+	}
+
+	public deleteOffcloudCastedLink(imdbId: string, userId: string, hash: string) {
+		return this.offcloudCastService.deleteCastedLink(imdbId, userId, hash);
+	}
+
+	public getOffcloudUserCastStreams(imdbId: string, userId: string, limit?: number) {
+		return this.offcloudCastService.getUserCastStreams(imdbId, userId, limit);
+	}
+
+	public async getOffcloudOtherStreams(
+		imdbId: string,
+		userId: string,
+		limit?: number,
+		maxSize?: number
+	) {
+		return withoutBlockedHashes(
+			await this.offcloudCastService.getOtherStreams(imdbId, userId, limit, maxSize)
+		);
+	}
+
+	// Debrid-Link Cast Methods
+	public saveDebridLinkCastProfile(
+		userId: string,
+		apiKey: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean,
+		refreshToken?: string | null
+	) {
+		return this.debridLinkCastService.saveCastProfile(
+			userId,
+			apiKey,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption,
+			refreshToken
+		);
+	}
+
+	public updateDebridLinkCastSettings(
+		userId: string,
+		movieMaxSize?: number,
+		episodeMaxSize?: number,
+		otherStreamsLimit?: number,
+		hideCastOption?: boolean
+	) {
+		return this.debridLinkCastService.updateCastSettings(
+			userId,
+			movieMaxSize,
+			episodeMaxSize,
+			otherStreamsLimit,
+			hideCastOption
+		);
+	}
+
+	public getDebridLinkCastProfile(userId: string) {
+		return this.debridLinkCastService.getCastProfile(userId);
+	}
+
+	public saveDebridLinkCast(
+		imdbId: string,
+		userId: string,
+		hash: string,
+		filename: string,
+		fileSize: number,
+		path?: string,
+		downloadUrl?: string
+	) {
+		return this.debridLinkCastService.saveCast(
+			imdbId,
+			userId,
+			hash,
+			filename,
+			fileSize,
+			path,
+			downloadUrl
+		);
+	}
+
+	public fetchDebridLinkCastedMovies(userId: string) {
+		return this.debridLinkCastService.fetchCastedMovies(userId);
+	}
+
+	public fetchDebridLinkCastedShows(userId: string) {
+		return this.debridLinkCastService.fetchCastedShows(userId);
+	}
+
+	public fetchAllDebridLinkCastedLinks(userId: string) {
+		return this.debridLinkCastService.fetchAllCastedLinks(userId);
+	}
+
+	public deleteDebridLinkCastedLink(imdbId: string, userId: string, hash: string) {
+		return this.debridLinkCastService.deleteCastedLink(imdbId, userId, hash);
+	}
+
+	public getDebridLinkUserCastStreams(imdbId: string, userId: string, limit?: number) {
+		return this.debridLinkCastService.getUserCastStreams(imdbId, userId, limit);
+	}
+
+	public async getDebridLinkOtherStreams(
+		imdbId: string,
+		userId: string,
+		limit?: number,
+		maxSize?: number
+	) {
+		return withoutBlockedHashes(
+			await this.debridLinkCastService.getOtherStreams(imdbId, userId, limit, maxSize)
+		);
+	}
+
+	/**
+	 * The play route's last resort. See `DebridLinkCastService` - the value is a
+	 * permanent unauthenticated capability, so this is the only read that returns
+	 * it and the only caller is the redirect.
+	 */
+	public getDebridLinkStoredDownloadUrl(hash: string, path?: string | null) {
+		return this.debridLinkCastService.getStoredDownloadUrl(hash, path);
+	}
+
+	public getAllDebridCastLink(magnetId: number, fileIndex: number) {
+		return this.allDebridCastService.getCastLink(magnetId, fileIndex);
+	}
+
+	public getAllDebridUserCastStreams(imdbId: string, userId: string, limit?: number) {
+		return this.allDebridCastService.getUserCastStreams(imdbId, userId, limit);
+	}
+
+	public async getAllDebridOtherStreams(
+		imdbId: string,
+		userId: string,
+		limit?: number,
+		maxSize?: number
+	) {
+		return withoutBlockedHashes(
+			await this.allDebridCastService.getOtherStreams(imdbId, userId, limit, maxSize)
+		);
+	}
+
+	// Torrent Snapshot Methods
+	public async upsertTorrentSnapshot({
+		id,
+		hash,
+		addedDate,
+		payload,
+	}: {
+		id: string;
+		hash: string;
+		addedDate: Date;
+		payload: Prisma.InputJsonValue;
+	}) {
+		if (await isHashBlocked(hash)) return null;
+		return this.torrentSnapshotService.upsertSnapshot({
+			id,
+			hash,
+			addedDate,
+			payload,
+		});
+	}
+
+	// A zurg post: merged into the stored snapshot rather than replacing it.
+	public async mergeTorrentSnapshot(post: SnapshotPost) {
+		if (await isHashBlocked(post.hash)) return null;
+		return this.torrentSnapshotService.mergeSnapshot(post);
+	}
+
+	public async getLatestTorrentSnapshot(hash: string) {
+		if (await isHashBlocked(hash)) return null;
+		return this.torrentSnapshotService.getLatestSnapshot(hash);
+	}
+
+	public async getSnapshotsByHashes(hashes: string[]) {
+		return this.torrentSnapshotService.getSnapshotsByHashes(
+			await withoutBlockedHashList(hashes)
+		);
+	}
+
+	// Hash-IMDB Mapping Methods
+	public async upsertHashImdbBatch(pairs: { hash: string; imdbId: string }[]) {
+		return this.hashImdbService.upsertBatch(await withoutBlockedHashes(pairs));
+	}
+
+	public getHashImdbByHash(hash: string) {
+		return this.hashImdbService.getByHash(hash);
+	}
+
+	public getHashImdbByHashes(hashes: string[]) {
+		return this.hashImdbService.getByHashes(hashes);
+	}
+
+	public identifyLibraryHashes(hashes: string[]) {
+		return this.hashImdbService.identifyHashes(hashes);
+	}
+
+	public getHashTitleIds(hashes: string[]) {
+		return this.hashImdbService.getHashTitleIds(hashes);
+	}
+
+	public getImdbEpisodeShow(tconst: string) {
+		return this.hashImdbService.getEpisodeShow(tconst);
+	}
+
+	public getImdbSeries(tconst: string) {
+		return this.hashImdbService.getImdbSeries(tconst);
+	}
+
+	public getImdbSeasonEpisodeIds(show: string, season: number) {
+		return this.hashImdbService.getSeasonEpisodeIds(show, season);
+	}
+
+	public getFilenameIdentifications(keys: { hash: string; titleKey: string }[]) {
+		return this.hashImdbService.getFilenameIdentifications(keys);
+	}
+
+	public confirmFilenameIdentifications(rows: FilenameIdentification[]) {
+		return this.hashImdbService.confirmFilenameIdentifications(rows);
+	}
+
+	public async saveFilenameIdentifications(rows: FilenameIdentification[]) {
+		return this.hashImdbService.saveFilenameIdentifications(await withoutBlockedHashes(rows));
+	}
+
+	// Report Service Methods
+	public reportContent(hash: string, imdbId: string, userId: string, type: ReportType) {
+		return this.reportService.reportContent(hash, imdbId, userId, type);
+	}
+
+	public getEmptyMedia(quantity?: number) {
+		return this.reportService.getEmptyMedia(quantity);
+	}
+
+	public getReportedHashes(imdbId: string) {
+		return this.reportService.getReportedHashes(imdbId);
+	}
+
+	// Database Size Methods
+	public getContentSize() {
+		return this.scrapedService.getContentSize();
+	}
+
+	public getProcessingCount() {
+		return this.scrapedService.getProcessingCount();
+	}
+
+	public getRequestedCount() {
+		return this.scrapedService.getRequestedCount();
+	}
+
+	// Hash Search Service Methods
+	public async getHashesByImdbId(params: HashSearchParams) {
+		return withoutBlockedHashes(await this.hashSearchService.getHashesByImdbId(params));
+	}
+
+	// Zurg Keys Service Methods
+	public createZurgApiKey(validUntilDate: Date) {
+		return this.zurgKeysService.createApiKey(validUntilDate);
+	}
+
+	public validateZurgApiKey(apiKey: string) {
+		return this.zurgKeysService.validateApiKey(apiKey);
+	}
+
+	public getZurgApiKey(apiKey: string) {
+		return this.zurgKeysService.getApiKey(apiKey);
+	}
+
+	public deleteZurgApiKey(apiKey: string) {
+		return this.zurgKeysService.deleteApiKey(apiKey);
+	}
+
+	public deleteExpiredZurgKeys() {
+		return this.zurgKeysService.deleteExpiredKeys();
+	}
+
+	public listZurgApiKeys() {
+		return this.zurgKeysService.listApiKeys();
+	}
+
+	// Sponsors Service Methods
+	public getSponsorByDmmApiKey(apiKey: string) {
+		return this.sponsorsService.getByDmmApiKey(apiKey);
+	}
+
+	public getSponsorByLegacyZurgKey(apiKey: string) {
+		return this.sponsorsService.getByLegacyZurgKey(apiKey);
+	}
+
+	public getSponsorByShortId(shortId: string) {
+		return this.sponsorsService.getByShortId(shortId);
+	}
+
+	public rexDirectGetOrAssignHash(machineIdentifier: string, owner: RexDirectOwner) {
+		return this.rexDirectService.getOrAssignHash(machineIdentifier, owner);
+	}
+
+	public rexDirectExists(machineIdentifier: string) {
+		return this.rexDirectService.exists(machineIdentifier);
+	}
+
+	public rexDirectCountByPlexAccount(plexAccountId: string) {
+		return this.rexDirectService.countByPlexAccount(plexAccountId);
+	}
+
+	public rexDirectServerCert(machineIdentifier: string) {
+		return this.rexDirectService.serverCert(machineIdentifier);
+	}
+
+	public rexDirectStartIssuing(machineIdentifier: string) {
+		return this.rexDirectService.startIssuing(machineIdentifier);
+	}
+
+	public rexDirectStoreServerCert(
+		machineIdentifier: string,
+		certificate: string,
+		privateKey: string,
+		expiresAt: Date
+	) {
+		return this.rexDirectService.storeServerCert(
+			machineIdentifier,
+			certificate,
+			privateKey,
+			expiresAt
+		);
+	}
+
+	public rexDirectBackOffIssuing(machineIdentifier: string) {
+		return this.rexDirectService.backOffIssuing(machineIdentifier);
+	}
+
+	public rexDirectLastIp(machineIdentifier: string) {
+		return this.rexDirectService.lastIp(machineIdentifier);
+	}
+
+	public rexDirectRecordIp(machineIdentifier: string, ip: string) {
+		return this.rexDirectService.recordIp(machineIdentifier, ip);
+	}
+
+	public rexDirectGetCert() {
+		return this.rexDirectService.getCert();
+	}
+
+	public rexDirectSetCert(fullchain: string, privkey: string) {
+		return this.rexDirectService.setCert(fullchain, privkey);
+	}
+
+	public getCastSponsorGrant(service: string, userId: string) {
+		return this.sponsorsService.getCastGrant(service, userId);
+	}
+
+	public setCastSponsorGrant(service: string, userId: string, shortId: string | null) {
+		return this.sponsorsService.setCastGrant(service, userId, shortId);
+	}
+
+	/**
+	 * A sponsor's own provider key for a live Torznab availability filter.
+	 *
+	 * Returned raw because its only caller hands it straight to that provider's
+	 * cache probe. Nothing on a response path may read it.
+	 */
+	public getSponsorProviderKey(shortId: string, service: TorznabLiveService) {
+		return this.sponsorProviderKeysService.getKey(shortId, service);
+	}
+
+	public listSponsorProviderKeys(shortId: string) {
+		return this.sponsorProviderKeysService.listLinked(shortId);
+	}
+
+	public setSponsorProviderKey(shortId: string, service: TorznabLiveService, apiKey: string) {
+		return this.sponsorProviderKeysService.setKey(shortId, service, apiKey);
+	}
+
+	public removeSponsorProviderKey(shortId: string, service: TorznabLiveService) {
+		return this.sponsorProviderKeysService.removeKey(shortId, service);
+	}
+
+	// Wanted list: titles a sponsor's zurg fetches
+	public listWanted(shortId: string) {
+		return this.wantedItemsService.list(shortId);
+	}
+
+	public want(shortId: string, item: Parameters<WantedItemsService['want']>[1]) {
+		return this.wantedItemsService.want(shortId, item);
+	}
+
+	public wantMany(shortId: string, items: Parameters<WantedItemsService['wantMany']>[1]) {
+		return this.wantedItemsService.wantMany(shortId, items);
+	}
+
+	public unwant(shortId: string, imdbId: string) {
+		return this.wantedItemsService.remove(shortId, imdbId);
+	}
+
+	public markWantedFulfilled(shortId: string, id: string) {
+		return this.wantedItemsService.markFulfilled(shortId, id);
+	}
+
+	public touchWantedPolled(shortId: string) {
+		return this.wantedItemsService.touchPolled(shortId);
+	}
+
+	// Stream Health Service Methods
+	public upsertStreamHealthResults(results: StreamServerStatus[]) {
+		return this.streamHealthService.upsertHealthResults(results);
+	}
+
+	public getAllStreamStatuses() {
+		return this.streamHealthService.getAllStatuses();
+	}
+
+	public getStreamHealthMetrics() {
+		return this.streamHealthService.getMetrics();
+	}
+
+	public deleteStreamHealthHosts(hosts: string[]) {
+		return this.streamHealthService.deleteHosts(hosts);
+	}
+
+	public deleteDeprecatedStreamHosts(validHosts: string[]) {
+		return this.streamHealthService.deleteDeprecatedHosts(validHosts);
+	}
+
+	public cleanupOldStreamHealth(olderThanHours?: number) {
+		return this.streamHealthService.cleanupOldEntries(olderThanHours);
+	}
+
+	public getStreamHealthCount() {
+		return this.streamHealthService.getCount();
+	}
+
+	public recordStreamCheckResult(result: {
+		ok: boolean;
+		latencyMs: number | null;
+		server: string | null;
+		error: string | null;
+	}) {
+		return this.streamHealthService.recordCheckResult(result);
+	}
+
+	public getRecentStreamChecks(limit?: number) {
+		return this.streamHealthService.getRecentChecks(limit);
+	}
+
+	public recordTorrentioCheckResult(result: {
+		ok: boolean;
+		latencyMs: number | null;
+		error: string | null;
+		urls: TorrentioUrlCheckResult[];
+	}) {
+		return this.streamHealthService.recordTorrentioCheckResult(result);
+	}
+
+	public getRecentTorrentioChecks(limit?: number) {
+		return this.streamHealthService.getRecentTorrentioChecks(limit);
+	}
+
+	// History Aggregation Service Methods
+	public recordStreamHealthSnapshot(data: {
+		totalServers: number;
+		workingServers: number;
+		avgLatencyMs: number | null;
+		minLatencyMs: number | null;
+		maxLatencyMs: number | null;
+		fastestServer: string | null;
+		failedServers: string[];
+	}) {
+		return this.historyAggregationService.recordStreamHealthSnapshot(data);
+	}
+
+	public recordServerReliability(
+		statuses: Array<{ host: string; ok: boolean; latencyMs: number | null }>
+	) {
+		return this.historyAggregationService.recordServerReliability(statuses);
+	}
+
+	public rollupStreamDaily(targetDate?: Date) {
+		return this.historyAggregationService.rollupStreamDaily(targetDate);
+	}
+
+	public cleanupOldHistoryData() {
+		return this.historyAggregationService.cleanupOldData();
+	}
+
+	public getStreamHourlyHistory(hoursBack?: number) {
+		return this.historyAggregationService.getStreamHourlyHistory(hoursBack);
+	}
+
+	public getStreamDailyHistory(daysBack?: number) {
+		return this.historyAggregationService.getStreamDailyHistory(daysBack);
+	}
+
+	public getServerReliability(
+		daysBack?: number,
+		sortBy?: 'reliability' | 'latency',
+		limit?: number
+	) {
+		return this.historyAggregationService.getServerReliability(daysBack, sortBy, limit);
+	}
+
+	public recordTorrentioHealthSnapshot(data: { ok: boolean; latencyMs: number | null }) {
+		return this.historyAggregationService.recordTorrentioHealthSnapshot(data);
+	}
+
+	public getTorrentioHourlyHistory(hoursBack?: number) {
+		return this.historyAggregationService.getTorrentioHourlyHistory(hoursBack);
+	}
+
+	public getTorrentioDailyHistory(daysBack?: number) {
+		return this.historyAggregationService.getTorrentioDailyHistory(daysBack);
+	}
+
+	public rollupTorrentioDaily(targetDate?: Date) {
+		return this.historyAggregationService.rollupTorrentioDaily(targetDate);
+	}
+
+	public runHistoryAggregation() {
+		return this.historyAggregationService.runAggregation();
+	}
+
+	public runDailyRollup(targetDate?: Date) {
+		return this.historyAggregationService.runDailyRollup(targetDate);
+	}
+
+	// TorBox Operational Service Methods (real DMM-user TorBox API calls)
+	public recordTorBoxOperation(operation: TorBoxOperation, status: number) {
+		return this.torboxOperationalService.recordOperation(operation, status);
+	}
+
+	public getTorBoxOperationalStats(hoursBack?: number) {
+		return this.torboxOperationalService.getStats(hoursBack);
+	}
+
+	public getTorBoxOperationalHourlyHistory(hoursBack?: number) {
+		return this.torboxOperationalService.getHourlyHistory(hoursBack);
+	}
+
+	public getTorBoxOperationalDailyHistory(daysBack?: number) {
+		return this.torboxOperationalService.getDailyHistory(daysBack);
+	}
+
+	public rollupTorBoxOperationalDaily(targetDate?: Date) {
+		return this.torboxOperationalService.rollupDaily(targetDate);
+	}
+
+	public cleanupOldTorBoxOperationalData() {
+		return this.torboxOperationalService.cleanupOldData();
+	}
+
+	// TorBox CDN Service Methods (reachability measured in readers' own browsers)
+	public recordTorBoxCdnSamples(samples: TorBoxCdnSample[]) {
+		return this.torboxCdnService.recordSamples(samples);
+	}
+
+	public getTorBoxCdnHourlyHistory(hoursBack?: number) {
+		return this.torboxCdnService.getHourlyHistory(hoursBack);
+	}
+
+	public getTorBoxCdnDailyHistory(daysBack?: number) {
+		return this.torboxCdnService.getDailyHistory(daysBack);
+	}
+
+	public getTorBoxCdnRegionSummary(hoursBack?: number) {
+		return this.torboxCdnService.getRegionSummary(hoursBack);
+	}
+
+	public rollupTorBoxCdnDaily(targetDate?: Date) {
+		return this.torboxCdnService.rollupDaily(targetDate);
+	}
+
+	public cleanupOldTorBoxCdnData() {
+		return this.torboxCdnService.cleanupOldData();
+	}
+
+	// RD Operational Service Methods
+	public recordRdOperation(operation: RealDebridOperation, status: number) {
+		return this.rdOperationalService.recordOperation(operation, status);
+	}
+
+	public getRdStats(hoursBack?: number) {
+		return this.rdOperationalService.getStats(hoursBack);
+	}
+
+	public getRdHourlyHistory(hoursBack?: number) {
+		return this.rdOperationalService.getHourlyHistory(hoursBack);
+	}
+
+	public getRdDailyHistory(daysBack?: number) {
+		return this.rdOperationalService.getDailyHistory(daysBack);
+	}
+
+	public rollupRdDaily(targetDate?: Date) {
+		return this.rdOperationalService.rollupDaily(targetDate);
+	}
+
+	public cleanupOldRdData() {
+		return this.rdOperationalService.cleanupOldData();
+	}
+
+	// IMDB Search Service Methods
+	public searchImdbTitles(
+		keyword: string,
+		options?: { limit?: number; year?: number; mediaType?: 'movie' | 'show' }
+	) {
+		return this.imdbSearchService.searchTitles(keyword, options);
+	}
+
+	public getImdbTitleById(imdbId: string) {
+		return this.imdbSearchService.getTitleById(imdbId);
+	}
+
+	public getImdbTitleType(imdbId: string) {
+		return this.imdbSearchService.getTitleType(imdbId);
+	}
+}
+
+// Export singleton instance to ensure only one PrismaClient exists
+export const repository = new Repository();

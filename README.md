@@ -1,4 +1,4 @@
-![ChatGPT made this logo](./dmm-logo.svg)
+![DMM Logo](./dmm-logo.svg)
 
 # Debrid Media Manager
 
@@ -6,64 +6,129 @@ Start building your media library with truly unlimited storage size!
 
 ## What is this?
 
-Do you want a movie and TV show library that has unlimited size? Consider using a Debrid service, like Real-Debrid or AllDebrid. These services work like a shared storage space for downloading torrents. You can download as much as you want without worrying about storage limits, because the files are shared among all users. You only "own" the file when you download it to your account.
+Do you want a movie and TV show library that has unlimited size? Consider using a Debrid service, like Real-Debrid, AllDebrid, or TorBox. These services work like a shared storage space for downloading torrents. You can download as much as you want without worrying about storage limits, because the files are shared among all users. You only "own" the file when you download it to your account.
 
-These Debrid services also offer a feature called a WebDAV API. Think of it as a special tool that lets you connect your media library to different devices or software. It's like your Windows Samba share but better.
+These Debrid services also offer a WebDAV interface that lets you mount your library as a network drive. You can connect it to media players like [Infuse](https://firecore.com/infuse) (Mac, iPhone, Apple TV, iPad) or media server software like Plex, Emby, or Jellyfin. This way, your media library can be accessed and played from anywhere!
 
-You can use this WebDAV API to connect your media library to different media players that support it, like [Infuse](https://firecore.com/infuse), which works on Apple devices like Mac, iPhone, Apple TV, and iPad. You can also connect it to your server and use it with media server software like Plex, Emby, or Jellyfin. This way, your media library can be accessed and played from anywhere!
-
-To make this process even easier, I've developed this **free** and open source website called [Debrid Media Manager](https://debridmediamanager.com/). With this app, you can easily download movies and TV shows directly to your Debrid library. You can build and curate your media collection without ever worrying about storage limits.
+[Debrid Media Manager](https://debridmediamanager.com/) is a **free** and open source web app that makes it easy to download movies and TV shows directly to your Debrid library. Build and curate your media collection without ever worrying about storage limits.
 
 ## Features
 
-This builds on top of the amazing service brought by [Real-Debrid](http://real-debrid.com/?id=9783846) and [AllDebrid](https://alldebrid.com/?uid=1kk5i&lang=en).
+This builds on top of the amazing service brought by [Real-Debrid](https://real-debrid.com/?id=20475782), [AllDebrid](https://alldebrid.com/?uid=1kk5i&lang=en), and [TorBox](https://torbox.app/subscription?referral=74ffa560-7381-4a18-adb1-cef97378c670).
 
 ### Library management
 
-You can see all your torrents in one page, sort them by name, by size, by "quality score", etc. It groups all your torrents by title and delete duplicate files. It can show you failed or slow downloads and delete them.
+See all your torrents in one page, sort them by name, size, status, or date added. It groups torrents by title and helps you delete duplicates. It can show you failed or slow downloads and delete them.
+
+Duplicate badges, filters, and size/date cleanup share one title grouping. Known IMDb IDs keep different films separate; unidentified film releases join a known title only when the parsed name has a single known match. Parsed-title links keep working while identification finishes.
+
+The library's **Add** buttons accept full magnet links, standalone v1 info hashes, and native `.torrent` files for Real-Debrid, AllDebrid, TorBox, Premiumize, Offcloud, and Debrid-Link. Pasted magnets retain their names, duplicate trackers, webseeds, and other parameters. Hexadecimal and base32 exact topics are recognized, including percent-encoded query parameters, and normalized to literal hexadecimal `urn:btih:` topics at provider boundaries for compatibility. Files are uploaded as-is rather than reduced to a hash, and mixed submissions run their file and magnet batches sequentially.
+
+On Debrid-Link, standalone hash lists remain **cached-only**; full magnets and `.torrent` files explicitly request a download and may consume the account's quota. TorBox also accepts direct HTTP(S) download links in its Add dialog.
+
+On Real-Debrid, Save Selection leaves a cached torrent intact when a strict subset would download again. Selecting different files remains an explicit replacement, even when the new selection is smaller.
+
+Shared progress and error notifications let pointer clicks reach the controls underneath them; dismissible episode summaries remain interactive. Backup restores count provider refusals as failures and finish their progress notification even if the final library refresh fails.
+
+Native uploads routed through anticors require its byte-preserving request streaming (`c4159f5` or later). Deploy and probe that Worker before deploying DMM; decoding multipart bodies as text corrupts binary torrent pieces. Premiumize uploads instead stream through DMM's same-origin `/api/premiumize/upload` endpoint.
 
 ### Torrent search
 
-You can add more content to your library by searching the DHT (powered by BtDigg). It detects what you already have downloaded and currently downloading in your library too.
+Add content to your library by searching for torrents. It detects what you already have downloaded and currently downloading in your library.
+
+The hashlist's bulk RD Download action targets only releases marked available in Real-Debrid, including with Show All enabled. Its count reflects those eligible releases; individual release downloads remain separate. Nameless stored release rows are omitted rather than crashing a title page.
+
+Filename parsing enriches display without deciding whether a shared release belongs in the list; yearless releases remain searchable and available for checking.
+
+### Movie and TV show info pages
+
+Browse detailed information about movies and TV shows including cast, crew, trailers, and related content. View comprehensive person filmography pages to explore an actor's or director's complete work.
+
+The final Every Episode totals stay visible until dismissed or until you leave the title/season. An older in-flight action may finish its provider work, but cannot bring its summary back on another page.
+
+### Stremio integration
+
+Use DMM as a Stremio addon to stream your debrid library directly through Stremio. Includes a Cast addon for sharing your library streams.
+
+### Trakt integration
+
+Sync with your Trakt watchlist, collection, and custom lists to easily add content to your library.
+
+Custom-list selection is stored in the URL, so opening a title and using Back returns to the selected list. Choosing the empty list-picker option clears that selection.
 
 ### Share your library and mirror other libraries
 
-You can share your whole collection or select specific items you want to share. Head over to [r/debridmediamanager](https://www.reddit.com/r/debridmediamanager/) and see other people's media collections and easily mirror their content to yours.
+Share your whole collection or select specific items. Head over to [r/debridmediamanager](https://www.reddit.com/r/debridmediamanager/) to see other people's media collections and easily mirror their content to yours.
+
+If the browser blocks the new tab after publishing a library share, DMM opens the resulting list in the current tab instead.
 
 ## Setup
 
-0. Signup for a free tier plan at [PlanetScale](https://planetscale.com/) - this is a serverless MySQL database hosted in the cloud
-1. Have Tor running at `127.0.0.1:9050` (needed for DHT search; if you don't need your own search database then refer to the secion `External Search API`)
-2. Clone this repository and go to the directory
-3. Create a copy of the `.env` file `cp .env .env.local` and fill in the details
-4. Fill in required settings in `.env.local` (e.g. `PROXY=socks5h://127.0.0.1:9050` if tor is running on your host machine)
-5. Get your Prisma database connection string from PlanetScale console and put that in your `.env.local` file
-6. Install the dependencies `npm i`
-7. This is a Next.js project so either go with `npm run dev` or `npm run build && npm run start`
-8. Head to `localhost:3000` and login
+1. Have a MySQL database ready
+2. Clone this repository
+3. Create your local env file: `cp .env.example .env.local` and fill in the details
+4. Fill in required settings in `.env.local`:
+    - `DATABASE_URL` - Your MySQL connection string
+5. (Optional) Configure additional integrations in `.env.local`:
+    - `TMDB_KEY`, `OMDB_KEY`, `MDBLIST_KEY` - For enhanced movie/show metadata
+    - `TRAKT_CLIENT_ID` and `TRAKT_CLIENT_SECRET` - For Trakt integration
+    - `PROXY` - SOCKS5 proxy for stream proxying (e.g. `localhost:9050`)
+    - See `.env.example` for all available options
+6. Install the dependencies: `npm install`
+7. Run the app: `npm run dev` (development) or `npm run build && npm run start` (production)
+8. Head to `http://localhost:3000`
 
-### External Search API
+Use Node.js 24 and npm 11 for installation, builds and tests. `npm run build`
+first runs the required full-source ESLint and Oxlint checks, then Next.js runs
+type checking and the production build; invoking `next build` directly bypasses
+that required lint gate.
+Typed ESLint uses `tsconfig.eslint.json` to cover the application and tool
+configuration files, including `vitest.config.ts`, during normal staged-file
+hooks without changing the application type-check project's exclusions.
 
-If you don't want to build your own library, edit the config `EXTERNAL_SEARCH_API_HOSTNAME` in your `.env.local` and set it to `https://corsproxy.org/?https://debridmediamanager.com`
+### Offline installation and UI utilities
 
-### Docker Swarm
+Production builds generate the Serwist service worker. Application HTML documents
+are cached on full navigation and completed frontend routes, with an offline
+fallback for uncached documents. API responses remain network-only, including
+credential-bearing navigation URLs; worker upgrades remove API entries left by
+the previous page cache. Public assets under `noprecache/` are deliberately
+excluded from installation downloads, so Cast notice MP4s load only when used.
 
-```
-cp .env .env.local
+Tailwind 4 requires Safari 16.4+, Chrome 111+ or Firefox 128+; see its
+[browser support requirements](https://tailwindcss.com/docs/upgrade-guide#browser-requirements).
+Use the official `outline-hidden` utility when a focus ring needs a
+forced-colors outline fallback. Existing visible-sibling layouts use
+`sibling-space-x-*` and `sibling-space-y-*`: one spacing owner applies margins
+only to following non-hidden siblings, preserving independent trailing margins.
+Do not re-register Tailwind's built-in outline or spacing utility names.
+The service-worker and library Cypress specs exercise installed caches,
+frontend HTML caching, computed spacing and forced-colors keyboard focus.
+
+### Docker
+
+```bash
+cp .env.example .env.local
+# Fill in your settings in .env.local
 docker swarm init
-docker stack deploy -c docker-compose.yml
+docker stack deploy -c docker-compose.yml dmm
 ```
 
 The website will be accessible at `http://localhost:3000`
+
+### Log archives
+
+The logship container merges late daily-log lines as complete gzip members. It validates an existing archive before replacing it; an unreadable archive and its late log remain intact for recovery. Maintenance works with POSIX `sh` and does not depend on `pipefail`.
 
 ## FAQ
 
 ### I just don't know where to start or why do I need this?
 
-[Read the guide here](https://docs.google.com/document/d/13enrfVXcGEEd0Yqb0PBTpGYrIvQpSfeIaAMZ_LiBDzM/edit). I highlighted my tested setup in green.
+[Read the guide here](https://docs.google.com/document/d/13enrfVXcGEEd0Yqb0PBTpGYrIvQpSfeIaAMZ_LiBDzM/edit).
+
 ### But with Kodi and FEN and Stremio being available, why would I ever need this?
 
-If you want some level of curation on your library. I personally prefer watching only 100+ GB remux release. Don't ask me about -arr apps and/or Usenet. I also came from that setup and found it too much time consuming to maintain.
+If you want some level of curation on your library. I personally prefer watching only 100+ GB remux releases. Don't ask me about -arr apps and/or Usenet. I also came from that setup and found it too time consuming to maintain.
 
 ### How does it monitor what's in your library?
 
@@ -71,4 +136,8 @@ It doesn't do any sort of monitoring. It gets that information when you open the
 
 ### When I share my library, is it linked to my account's identity?
 
-No. It's completely anonymous. What's only shared are 3 things: filename, magnet hash, file size. It's not even stored in any database. The way it works is that all these data are compressed and stored in the URL. A "webpage" is then created over at https://hashlists.debridmediamanager.com that loads via iframe this (usually very long) list of magnet hashes.
+Account credentials and account identifiers are not included. A shared list contains the chosen title, filenames, magnet hashes, and file sizes, so check those names before sharing. Published pages are public at https://hashlists.debridmediamanager.com. Small lists are compressed into the page's DMM URL; larger lists load a compressed file published beside the page.
+
+## License
+
+This project is licensed under the [AGPL-3.0](LICENSE).

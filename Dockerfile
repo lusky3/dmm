@@ -1,28 +1,40 @@
-FROM node:18-alpine AS dependencies
+# Use the same base image for all stages
+FROM node:24-bookworm-slim AS base
+RUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
-COPY package*.json ./
-RUN npm ci
 
-FROM node:18-alpine AS build
-WORKDIR /app
-COPY --from=dependencies /app/node_modules ./node_modules
+# Dependencies stage - this will cache node_modules
+FROM base AS deps
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+COPY package*.json ./
+# Local packages that package.json installs with file:
+COPY vendor ./vendor
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+
+# Build stage
+FROM base AS build
+COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npx prisma generate && npm run build
 
-FROM node:18-alpine AS deploy
+# Deploy stage
+FROM base AS deploy
+ENV NODE_ENV=production
 WORKDIR /app
-ENV NODE_ENV production
 COPY --from=build /app/public ./public
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/prisma ./prisma
 COPY --from=build /app/.next/static ./.next/static
+# Copy the entire .next directory to ensure PWA files are included
+COPY --from=build /app/.next ./.next
 COPY --from=build /app/.next/standalone .
+RUN apt-get update && apt-get install -y curl grep && rm -rf /var/lib/apt/lists/*
 EXPOSE 3000
-ENV PORT 3000
-ENV HOSTNAME "0.0.0.0"
+ENV PORT=3000
+ENV HOSTNAME="0.0.0.0"
 CMD ["node", "server.js"]
-# Combine RUN instructions and install packages
-RUN apk --no-cache add curl grep
-# Healthcheck as before
-HEALTHCHECK --interval=30s --timeout=1s --start-period=3s --retries=1 \
-  CMD curl -s http://localhost:3000/api/healthz | grep -qm1 ok
+
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD curl -sf -m 5 http://localhost:3000/api/healthz | grep -qm1 ok

@@ -1,73 +1,206 @@
-import { useCurrentUser } from '@/hooks/auth';
+import { BrowseSection } from '@/components/BrowseSection';
+import { CommunityLinks, InfoSection } from '@/components/InfoSection';
+import { Logo } from '@/components/Logo';
+import { MainActions } from '@/components/MainActions';
+import { SearchBar } from '@/components/SearchBar';
+import { ServiceCard } from '@/components/ServiceCard';
+import { SiteLinks } from '@/components/SiteLinks';
+import { TraktSection } from '@/components/TraktSection';
+import { ZurgBanner } from '@/components/ZurgBanner';
+import { useAllDebridCastToken } from '@/hooks/allDebridCastToken';
+import { useCurrentUser, useDebridLogin } from '@/hooks/auth';
+import { useCastToken } from '@/hooks/castToken';
+import { useTorBoxCastToken } from '@/hooks/torboxCastToken';
 import { getTerms } from '@/utils/browseTerms';
-import { showSettings } from '@/utils/settings';
-import { genericToastOptions } from '@/utils/toastOptions';
+import { useGuestMode } from '@/utils/guestMode';
+import { handleLogout } from '@/utils/logout';
+import { checkPremiumStatus } from '@/utils/premiumCheck';
+import { genericToastOptions, toasterPosition } from '@/utils/toastOptions';
 import { withAuth } from '@/utils/withAuth';
+import { Settings } from 'lucide-react';
 import Head from 'next/head';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
 import { useEffect, useState } from 'react';
 import { Toaster, toast } from 'react-hot-toast';
 
+const PROFILE_WAIT_MS = 5000;
+
+// Indexers first, torrent before Usenet as everywhere else in DMM, then the
+// media server plugins, then the wanted list zurg fetches.
+const sponsorLinks = [
+	{
+		href: '/torznab',
+		label: 'Torrent Indexer',
+		description: "DMM's library as a Torznab indexer, for sponsors",
+	},
+	{
+		href: '/newznab',
+		label: 'Usenet Indexer',
+		description: 'Prowlarr-compatible endpoint for sponsors',
+	},
+	{
+		href: '/jellyfin',
+		label: 'Jellyfin plugins',
+		description: 'Your library in Jellyfin, for sponsors',
+	},
+	{ href: '/emby', label: 'Emby plugins', description: 'Your library in Emby, for sponsors' },
+	{
+		href: '/wanted',
+		label: 'Wanted list',
+		description: 'Titles your zurg fetches, for sponsors',
+	},
+];
+
 function IndexPage() {
 	const router = useRouter();
-	const { rdUser, adUser, rdError, adError, traktUser, traktError } = useCurrentUser();
-	const [deleting, setDeleting] = useState(false);
+	const {
+		rdUser,
+		adUser,
+		tbUser,
+		pmUser,
+		ocUser,
+		dlUser,
+		rdError,
+		adError,
+		tbError,
+		pmError,
+		ocError,
+		dlError,
+		traktUser,
+		traktError,
+		hasRDAuth,
+		hasADAuth,
+		hasTBAuth,
+		hasPMAuth,
+		hasOCAuth,
+		hasDLAuth,
+		hasTraktAuth,
+		isLoading,
+	} = useCurrentUser();
+	const {
+		loginWithRealDebrid,
+		loginWithAllDebrid,
+		loginWithTorbox,
+		loginWithPremiumize,
+		loginWithOffcloud,
+		loginWithDebridLink,
+	} = useDebridLogin();
+	const isGuest = useGuestMode();
 	const [browseTerms] = useState(getTerms(2));
 
+	// A provider has settled once it has answered - either a profile or an
+	// error. The page used to wait for every configured provider to *succeed*,
+	// which made a failed provider indistinguishable from one still in flight;
+	// since nothing retries, that wait never ended and the page sat on
+	// "Debrid Media Manager is loading..." for good.
+	const servicesSettled =
+		(!hasRDAuth || !!rdUser || !!rdError) &&
+		(!hasADAuth || !!adUser || !!adError) &&
+		(!hasTBAuth || !!tbUser || !!tbError) &&
+		(!hasPMAuth || !!pmUser || !!pmError) &&
+		(!hasOCAuth || !!ocUser || !!ocError) &&
+		(!hasDLAuth || !!dlUser || !!dlError) &&
+		(!hasTraktAuth || !!traktUser || !!traktError);
+
+	// Settling still depends on a promise resolving, and a provider can park one
+	// for minutes - TorBox answers a 429 by pausing every one of its calls for
+	// five. Bound the wait: a profile that never arrives degrades to that one
+	// service looking disconnected, which beats a page that never appears.
+	const [profileWaitElapsed, setProfileWaitElapsed] = useState(false);
 	useEffect(() => {
+		const timer = setTimeout(() => setProfileWaitElapsed(true), PROFILE_WAIT_MS);
+		return () => clearTimeout(timer);
+	}, []);
+
+	// Each of these no-ops without that service's credentials. They also resync the
+	// cast profile, so settings that failed to reach the server heal on any visit
+	// instead of only on the service's own cast page.
+	useCastToken();
+	useAllDebridCastToken();
+	useTorBoxCastToken();
+
+	// Loading state tracking
+	useEffect(() => {
+		// Loading state managed by auth system
+	}, [isLoading]);
+
+	useEffect(() => {
+		if (typeof window !== 'undefined') {
+			(window as any).registerMagnetHandler = () => {
+				if ('registerProtocolHandler' in navigator) {
+					try {
+						navigator.registerProtocolHandler(
+							'magnet',
+							`${window.location.origin}/library?addMagnet=%s`
+						);
+					} catch (error) {
+						console.error('Error registering protocol handler:', error);
+					}
+				}
+			};
+		}
+	}, []);
+
+	useEffect(() => {
+		// Every one of these points at the provider's own card, because that is
+		// the only place sign-in and a single-provider logout exist. The two
+		// destinations previously offered both dead-ended: Settings holds
+		// playback and cast preferences and cannot show, replace or clear a
+		// credential, and "clear site data" drops all seven accounts to fix one.
+		//
+		// Real-Debrid and Debrid-Link drop their own keys on a rejected
+		// credential (`clearRdKeys` / `clearDlKeys`, both then setting error to
+		// null), so those two only ever reach here on a transient failure and
+		// Retry really is their answer. The other five park on the card until
+		// the user acts, which is the case this whole flow was built for.
 		if (rdError) {
-			toast.error(
-				'Real-Debrid get user info failed, try clearing DMM site data and login again'
-			);
+			toast.error('Real-Debrid load failed. Use the Real-Debrid card below.');
 		}
 		if (adError) {
-			toast.error(
-				'AllDebrid get user info failed, check your email and confirm the login coming from DMM'
-			);
+			toast.error('AllDebrid fetch failed. Use the AllDebrid card below.');
+		}
+		if (tbError) {
+			toast.error('Torbox profile failed. Use the Torbox card below.');
+		}
+		if (pmError) {
+			toast.error('Premiumize profile failed. Use the Premiumize card below.');
+		}
+		if (ocError) {
+			toast.error('Offcloud profile failed. Use the Offcloud card below.');
+		}
+		if (dlError) {
+			toast.error('Debrid-Link profile failed. Use the Debrid-Link card below.');
 		}
 		if (traktError) {
-			toast.error('Trakt get user info failed');
+			toast.error('Trakt profile fetch failed. Use the Trakt card below.');
 		}
 		if (localStorage.getItem('next_action') === 'clear_cache') {
-			setDeleting(true);
 			localStorage.removeItem('next_action');
 			const request = window.indexedDB.deleteDatabase('DMMDB');
-			setDeleting(true);
 			request.onsuccess = function () {
 				window.location.assign('/');
 			};
 			request.onerror = function () {
-				setDeleting(false);
-				toast.error('Database deletion failed', genericToastOptions);
+				toast.error('Failed to delete local cache.', genericToastOptions);
 			};
 			request.onblocked = function () {
-				setDeleting(false);
-				toast(
-					'Database is still open, refresh the page first and then try deleting again',
-					genericToastOptions
-				);
+				toast('Local DB still open. Refresh and retry.', genericToastOptions);
 			};
 		}
-	}, [rdError, adError, traktError]);
+	}, [rdError, adError, tbError, pmError, ocError, dlError, traktError]);
 
-	const handleLogout = (prefix?: string) => {
-		if (prefix) {
-			let i = localStorage.length - 1;
-			while (i >= 0) {
-				const key = localStorage.key(i);
-				if (key && key.startsWith(prefix)) localStorage.removeItem(key);
-				i--;
-			}
-			router.reload();
-		} else {
-			localStorage.clear();
-			router.push('/start');
+	useEffect(() => {
+		if (rdUser) {
+			checkPremiumStatus(rdUser).then(async ({ shouldLogout }) => {
+				if (shouldLogout) {
+					await handleLogout('rd:', router);
+				}
+			});
 		}
-	};
+	}, [rdUser, router]);
 
-	const handleTraktLogin = async () => {
-		// generate authorization url
+	const loginWithTrakt = async () => {
 		const authUrl = `/api/trakt/auth?redirect=${window.location.origin}`;
 		router.push(authUrl);
 	};
@@ -77,308 +210,220 @@ function IndexPage() {
 		window.location.assign('/');
 	};
 
+	const handleClearLocalStorage = () => {
+		localStorage.clear();
+		// Dispatch logout event to update UI immediately
+		window.dispatchEvent(new Event('logout'));
+		window.location.reload();
+	};
+
+	const actionButtonGroupClasses = 'grid w-full max-w-md gap-3 sm:grid-cols-2 md:grid-cols-3';
+	const maintenanceLinkClasses = 'haptic-sm underline hover:text-gray-200';
+	const actionButtonClasses =
+		'haptic-sm w-full rounded border-2 border-gray-500 bg-gray-800/30 px-4 py-2 text-sm font-medium text-gray-100 transition-colors hover:bg-gray-700/50';
+
+	const debridServiceFailed = !!(rdError || adError || tbError || pmError || ocError || dlError);
+
+	const debridServiceCards = (
+		<>
+			<ServiceCard
+				service="rd"
+				error={rdError}
+				user={rdUser}
+				onTraktLogin={loginWithRealDebrid}
+				onLogout={async (prefix) => await handleLogout(prefix, router)}
+			/>
+			<ServiceCard
+				service="ad"
+				error={adError}
+				user={adUser}
+				onTraktLogin={loginWithAllDebrid}
+				onLogout={async (prefix) => await handleLogout(prefix, router)}
+			/>
+			<ServiceCard
+				service="tb"
+				error={tbError}
+				user={tbUser}
+				onTraktLogin={loginWithTorbox}
+				onLogout={async (prefix) => await handleLogout(prefix, router)}
+			/>
+			<ServiceCard
+				service="pm"
+				error={pmError}
+				user={pmUser}
+				onTraktLogin={loginWithPremiumize}
+				onLogout={async (prefix) => await handleLogout(prefix, router)}
+			/>
+			<ServiceCard
+				service="oc"
+				error={ocError}
+				user={ocUser}
+				onTraktLogin={loginWithOffcloud}
+				onLogout={async (prefix) => await handleLogout(prefix, router)}
+			/>
+			<ServiceCard
+				service="dl"
+				error={dlError}
+				user={dlUser}
+				onTraktLogin={loginWithDebridLink}
+				onLogout={async (prefix) => await handleLogout(prefix, router)}
+			/>
+		</>
+	);
+
 	return (
-		<div className="flex flex-col items-center justify-center min-h-screen">
+		<div className="flex min-h-screen flex-col items-center justify-center bg-gray-900 p-4">
 			<Head>
 				<title>Debrid Media Manager - Home</title>
+				<meta name="robots" content="noindex, nofollow" />
 			</Head>
-			<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 200 200">
-				<rect x="25" y="25" width="150" height="150" fill="#2C3E50" rx="20" ry="20" />
-				<circle cx="100" cy="100" r="60" fill="#00A0B0" />
-				<path d="M85,65 L85,135 L135,100 Z" fill="#ECF0F1" />
-				<path d="M60,90 Q80,60 100,90 T140,90" fill="#CC333F" />
-				<path
-					d="M75,121 L80,151 L90,136 L100,151 L110,136 L120,151 L125,121 Z"
-					fill="#EDC951"
-				/>
-			</svg>
-			<Toaster position="bottom-right" />
-			{/* this is made by ChatGPT */}
-			{!deleting && (rdUser || adUser) ? (
+			<Toaster position={toasterPosition()} />
+			{servicesSettled || profileWaitElapsed ? (
 				<>
-					<h1 className="text-2xl font-bold mb-4">Debrid Media Manager</h1>
-					<div className="flex flex-col items-center">
-						<div className="text-md font-bold mb-4 w-screen text-center">
-							{rdUser ? (
-								<>
-									<span className="bg-[#b5d496] text-green-800 text-sm px-1">
-										Real-Debrid
-									</span>{' '}
-									{rdUser.username} {rdUser.premium ? '✅' : '❌'}
-								</>
-							) : (
-								<Link
-									href="/realdebrid/login"
-									className="px-1 py-1 ml-2 text-xs text-white bg-gray-500 rounded hover:bg-gray-600 whitespace-nowrap"
-								>
-									Login with Real-Debrid
-								</Link>
-							)}{' '}
-							{adUser ? (
-								<>
-									<span className="bg-[#fbc730] text-yellow-800 text-sm px-1">
-										AllDebrid
-									</span>{' '}
-									{adUser.username} {adUser.isPremium ? '✅' : '❌'}
-								</>
-							) : (
-								<Link
-									href="/alldebrid/login"
-									className="px-1 py-1 ml-2 text-xs text-white bg-gray-500 rounded hover:bg-gray-600 whitespace-nowrap"
-								>
-									Login with AllDebrid
-								</Link>
-							)}{' '}
-							{traktUser ? (
-								<>
-									<span className="bg-[#ed161f] text-white text-sm px-1">
-										Trakt
-									</span>{' '}
-									{traktUser.user.username}{' '}
-									<span className="text-green-500">✅</span>
-								</>
-							) : (
-								<button
-									onClick={() => handleTraktLogin()}
-									className="px-1 py-1 ml-2 text-xs text-white bg-red-500 rounded hover:bg-red-600 whitespace-nowrap"
-								>
-									Login with Trakt
-								</button>
-							)}
+					<div className="mb-3 flex items-center justify-center gap-2">
+						<Logo className="h-11 w-11 shrink-0" />
+						<h1 className="text-xl font-bold text-white">Debrid Media Manager</h1>
+					</div>
+
+					<ZurgBanner />
+
+					{/* Search Bar */}
+					<div className="mb-4 w-full max-w-md">
+						<SearchBar />
+					</div>
+
+					<div className="flex w-full max-w-md flex-col items-center gap-6">
+						{isGuest && (
+							<div className="w-full rounded border-2 border-amber-500/40 bg-amber-900/20 px-4 py-3 text-sm text-amber-100">
+								<p className="font-medium">You are browsing as a guest</p>
+								<p className="mt-1 text-xs text-amber-200/80">
+									Search, settings and the indexer setup pages are open. Your
+									library, music, casting and transfers need a debrid account -
+									connect one below whenever you want them.
+								</p>
+							</div>
+						)}
+						<MainActions
+							rdUser={rdUser}
+							tbUser={tbUser}
+							adUser={!!adUser}
+							pmUser={!!pmUser}
+							ocUser={!!ocUser}
+							dlUser={!!dlUser}
+							isLoading={isLoading}
+							isGuest={isGuest}
+						/>
+						{/* Settings and the sponsor features share a row. The features are
+						    folded like the guest-mode debrid cards: four always-open rows
+						    pushed the rest of the page down for everyone, sponsor or not.
+						    Opened, the disclosure wraps onto a row of its own. */}
+						<div className="flex w-full flex-wrap items-start gap-3">
+							<Link
+								href="/settings"
+								className="haptic-sm flex flex-1 items-center justify-center rounded border-2 border-gray-500 bg-gray-800/30 px-2 py-2 text-sm font-medium whitespace-nowrap text-gray-100 transition-colors hover:bg-gray-700/50"
+							>
+								<Settings className="mr-2 inline-block h-4 w-4 text-gray-400" />
+								Settings
+							</Link>
+							<details className="flex-1 rounded border-2 border-pink-500/40 bg-gray-800/30 open:basis-full">
+								<summary className="haptic-sm cursor-pointer px-2 py-2 text-center text-sm font-medium whitespace-nowrap text-gray-100 transition-colors hover:bg-gray-700/50">
+									Sponsor features
+								</summary>
+								<div className="grid grid-cols-1 gap-3 p-3 pt-0">
+									{sponsorLinks.map(({ href, label, description }) => (
+										<Link
+											key={href}
+											href={href}
+											className="haptic-sm flex w-full items-center justify-between gap-3 rounded border-2 border-pink-500/40 bg-gray-800/30 px-4 py-2 text-sm font-medium text-gray-100 transition-colors hover:bg-gray-700/50"
+										>
+											<span className="shrink-0">{label}</span>
+											<span className="text-right text-xs text-gray-400">
+												{description}
+											</span>
+										</Link>
+									))}
+								</div>
+							</details>
 						</div>
-
-						<div className="mb-2 h-max text-center leading-10">
-							<Link
-								href="/library"
-								className="text-md m-1 bg-cyan-800 hover:bg-cyan-700 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
+						<BrowseSection terms={browseTerms} />
+						<TraktSection traktUser={traktUser} />
+						<div className="grid w-full grid-cols-1 gap-3">
+							{/* Folded for everyone: six login buttons nobody needs twice
+							    took most of the page. Folded rather than dropped, so connecting
+							    another service stays one click away, and opened whenever a
+							    provider failed, because its toast points at its card. */}
+							<details
+								open={debridServiceFailed}
+								className="w-full rounded border-2 border-gray-500 bg-gray-800/30"
 							>
-								📚 Library
-							</Link>
-
-							<Link
-								href="https://hashlists.debridmediamanager.com"
-								target="_blank"
-								className="text-md m-1 bg-indigo-700 hover:bg-indigo-600 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								🚀 Hash lists
-							</Link>
-
-							<Link
-								href="/search"
-								className="text-md m-1 bg-fuchsia-800 hover:bg-fuchsia-700 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								🔎 Search
-							</Link>
-
-							<Link
-								href="/animesearch"
-								className="text-md m-1 bg-pink-500 hover:bg-pink-400 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								🌸 Anime
-							</Link>
-
-							{rdUser && (
-								<Link
-									href="/stremio"
-									className="text-md m-1 bg-purple-800 hover:bg-purple-700 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-								>
-									🔮 Stremio
-								</Link>
-							)}
-
-							<Link
-								href=""
-								onClick={() => showSettings()}
-								className="text-md m-1 bg-gray-800 hover:bg-gray-700 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								⚙️ Settings
-							</Link>
+								<summary className="haptic-sm cursor-pointer px-4 py-2 text-sm font-medium text-gray-100 transition-colors hover:bg-gray-700/50">
+									{isGuest ? 'Connect a debrid service' : 'Debrid services'}
+								</summary>
+								<div className="grid grid-cols-1 gap-3 p-3 pt-0">
+									{debridServiceCards}
+								</div>
+							</details>
+							<ServiceCard
+								service="trakt"
+								error={traktError}
+								user={traktUser}
+								onTraktLogin={loginWithTrakt}
+								onLogout={async (prefix) => await handleLogout(prefix, router)}
+							/>
 						</div>
+						<InfoSection />
+						<SiteLinks>
+							<CommunityLinks />
+						</SiteLinks>
 
-						<div className="mb-2 h-max text-center leading-10">
-							<Link
-								href="/browse"
-								className="text-sm m-1 bg-blue-600 hover:bg-blue-400 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								🏆 top
-							</Link>
-
-							<Link
-								href="/browse/recent"
-								className="text-sm m-1 bg-blue-600 hover:bg-blue-400 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								⏰ recent
-							</Link>
-
-							{browseTerms.map((term) => (
-								<Link
-									href={`/browse/${term.replace(/\W/gi, '')}`}
-									className="text-sm m-1 bg-neutral-600 hover:bg-neutral-400 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-									key={term}
-								>
-									{term}
-								</Link>
-							))}
-
-							<Link
-								href={`/trakt/movies`}
-								className="text-sm m-1 bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								🎥 movies
-							</Link>
-							<Link
-								href={`/trakt/shows`}
-								className="text-sm m-1 bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-							>
-								📺 shows
-							</Link>
-							{traktUser && (
-								<Link
-									href={`/trakt/mylists`}
-									className="text-sm m-1 bg-red-500 hover:bg-red-600 text-white font-bold py-1 px-2 rounded whitespace-nowrap"
-								>
-									🧏🏻‍♀️ my lists
-								</Link>
-							)}
-						</div>
-
-						<div className="text-sm mb-1 text-center">
-							✨ Get DMM browser extensions for{' '}
-							<b>
-								<a
-									className="underline"
-									href="https://chromewebstore.google.com/detail/debrid-media-manager/fahmnboccjgkbeeianfdiohbbgmgoibb"
-									target="_blank"
-								>
-									Chrome
-								</a>
-							</b>{' '}
-							and{' '}
-							<b>
-								<a
-									className="underline"
-									href="https://addons.mozilla.org/en-US/firefox/addon/debrid-media-manager/"
-									target="_blank"
-								>
-									Firefox
-								</a>
-							</b>
-						</div>
-						<div className="text-sm mb-1 text-center">
-							✨
-							<a
-								className="underline"
-								href="https://github.com/debridmediamanager/zurg-testing"
-								target="_blank"
-							>
-								<b>zurg</b>
-							</a>{' '}
-							mounts your Real-Debrid library and play your files directly from your
-							computer or with Plex
-						</div>
-						<div className="text-sm mb-1 text-center">
-							✨
-							<a
-								className="underline"
-								href="https://elfhosted.com/guides/media/"
-								target="_blank"
-							>
-								<b>ElfHosted</b>
-							</a>{' '}
-							provides automated zurg+Plex (and friends) hosting with $10 free credit
-						</div>
-						<div className="text-sm mb-1 text-center">
-							✨
-							<a
-								className="text-azure bg-red-500 text-red-100 px-1"
-								href="https://www.reddit.com/r/debridmediamanager/"
-								target="_blank"
-							>
-								r/debridmediamanager
-							</a>{' '}
-							🤝 Sponsor this project&apos;s development on{' '}
-							<a
-								className="underline"
-								href="https://github.com/sponsors/debridmediamanager"
-								target="_blank"
-							>
-								Github
-							</a>{' '}
-							|{' '}
-							<a
-								className="underline"
-								href="https://www.patreon.com/debridmediamanager"
-								target="_blank"
-							>
-								Patreon
-							</a>{' '}
-							|{' '}
-							<a
-								className="underline"
-								href="https://paypal.me/yowmamasita"
-								target="_blank"
-							>
-								Paypal
-							</a>
-						</div>
-
-						<div className="mb-2 h-max text-center leading-10">
+						{/* Maintenance actions, as a text row like the footer below */}
+						<div className="flex flex-wrap justify-center gap-x-4 gap-y-1 text-xs text-gray-400">
 							<button
-								className="mx-1 bg-black hover:bg-red-700 text-white font-bold py-1 px-2 rounded text-xs"
+								onClick={() => window.location.reload()}
+								className={maintenanceLinkClasses}
+							>
+								↻&nbsp;Refresh
+							</button>
+							<button
 								onClick={() => handleClearCache()}
+								className={maintenanceLinkClasses}
 							>
 								Clear library cache
 							</button>
-							{rdUser && (
-								<button
-									className="mx-1 bg-black hover:bg-red-700 text-white font-bold py-1 px-2 rounded text-xs"
-									onClick={() => handleLogout('rd:')}
-								>
-									Logout Real-Debrid
-								</button>
-							)}
-							{adUser && (
-								<button
-									className="mx-1 bg-black hover:bg-red-700 text-white font-bold py-1 px-2 rounded text-xs"
-									onClick={() => handleLogout('ad:')}
-								>
-									Logout AllDebrid
-								</button>
-							)}
-							{traktUser && (
-								<button
-									className="mx-1 bg-black hover:bg-red-700 text-white font-bold py-1 px-2 rounded text-xs"
-									onClick={() => handleLogout('trakt:')}
-								>
-									Logout Trakt
-								</button>
-							)}
-							{(rdUser || adUser || traktUser) && (
-								<button
-									className="mx-1 bg-black hover:bg-red-700 text-white font-bold py-1 px-2 rounded text-xs"
-									onClick={() => handleLogout()}
-								>
-									Logout All
-								</button>
-							)}
+							{/* One button, whoever is looking at it. Guest mode used
+							    to have its own narrower exit next to this one, and
+							    the pair read as the same action: both landed on
+							    /start, and the difference - whether a linked DMM API
+							    key survived - was invisible from the labels. */}
+							<button
+								onClick={async () => await handleLogout(undefined, router)}
+								className={maintenanceLinkClasses}
+							>
+								Clear browser data
+							</button>
+						</div>
+						<div className="-mt-4 flex justify-center gap-4 text-xs text-gray-400">
+							<Link href="/api-docs" className="underline">
+								API
+							</Link>
+							<Link href="/copyright" className="underline">
+								Report copyright infringement
+							</Link>
 						</div>
 					</div>
 				</>
 			) : (
-				<>
-					<h1 className="text-xl text-center pb-4">Debrid Media Manager is loading...</h1>
-					{deleting && (
-						<h3 className="text-md text-center pb-4">
-							If it gets stuck here, close all DMM tabs first
-						</h3>
-					)}
-					<button
-						className="mx-1 bg-black hover:bg-red-700 text-white font-bold py-1 px-2 rounded text-xs"
-						onClick={() => handleLogout()}
-					>
-						Logout All
-					</button>
-				</>
+				<div className="flex flex-col items-center gap-4">
+					<Logo />
+					<h1 className="pb-4 text-center text-xl text-white">
+						Debrid Media Manager is loading...
+					</h1>
+					<div className={actionButtonGroupClasses}>
+						<button onClick={handleClearLocalStorage} className={actionButtonClasses}>
+							Clear Data and Reload
+						</button>
+					</div>
+				</div>
 			)}
 		</div>
 	);

@@ -1,0 +1,371 @@
+import handler from '@/pages/api/stremio/cast/library/[torrentIdPlusHash]';
+import { createMockRequest, createMockResponse } from '@/test/utils/api';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const {
+	mockGetTorrentInfo,
+	mockDbGetIMDBIdByHash,
+	mockDbSaveCast,
+	mockDbSaveIMDBIdMapping,
+	mockGenerateUserId,
+} = vi.hoisted(() => ({
+	mockGetTorrentInfo: vi.fn(),
+	mockDbGetIMDBIdByHash: vi.fn(),
+	mockDbSaveCast: vi.fn(),
+	mockDbSaveIMDBIdMapping: vi.fn(),
+	mockGenerateUserId: vi.fn(),
+}));
+
+vi.mock('@/services/realDebrid', () => ({
+	getTorrentInfo: mockGetTorrentInfo,
+}));
+
+vi.mock('@/services/repository', () => ({
+	repository: {
+		getIMDBIdByHash: mockDbGetIMDBIdByHash,
+		saveCast: mockDbSaveCast,
+		saveIMDBIdMapping: mockDbSaveIMDBIdMapping,
+	},
+}));
+
+vi.mock('@/utils/castApiHelpers', () => ({
+	generateUserId: mockGenerateUserId,
+}));
+
+const makeTorrentInfo = (overrides: Partial<any> = {}) => ({
+	hash: 'hash123',
+	filename: 'Movie.2024',
+	files: [
+		{ id: 1, path: 'Movie.2024.mkv', bytes: 1048576, selected: true },
+		{ id: 2, path: 'EpisodeTitle.mkv', bytes: 2097152, selected: true },
+	],
+	links: ['https://rd/link-1', 'https://rd/link-2'],
+	original_filename: 'Movie.2024',
+	original_bytes: 4096,
+	...overrides,
+});
+
+describe('/api/stremio/cast/library/[torrentIdPlusHash]', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockDbGetIMDBIdByHash.mockResolvedValue('tt1234567');
+		mockGetTorrentInfo.mockResolvedValue(makeTorrentInfo());
+		mockDbSaveIMDBIdMapping.mockResolvedValue(undefined);
+	});
+
+	it('validates rdToken', async () => {
+		const req = createMockRequest({ query: { torrentIdPlusHash: '1:hash' } });
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing or invalid RD token',
+		});
+	});
+
+	// Card 210: LibraryTorrentRow has sent the key as a bearer header since
+	// 2026-08-24; the last `?rdToken=` in dmm-01's access log was a stale tab on
+	// 2026-09-24. A key in the URL is no longer read.
+	it('ignores a key in the query string', async () => {
+		const req = createMockRequest({ query: { rdToken: 'token', torrentIdPlusHash: '1:hash' } });
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing or invalid RD token',
+		});
+		expect(mockGetTorrentInfo).not.toHaveBeenCalled();
+	});
+
+	it('validates torrentIdPlusHash', async () => {
+		const req = createMockRequest({ headers: { authorization: 'Bearer token' }, query: {} });
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing or invalid torrentid',
+		});
+	});
+
+	it('requires selected files to match RD links', async () => {
+		mockGetTorrentInfo.mockResolvedValue(
+			makeTorrentInfo({
+				files: [{ id: 1, path: 'Movie.mkv', bytes: 1, selected: true }],
+				links: ['https://rd/link-1', 'https://rd/link-2'],
+			})
+		);
+
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Cannot determine file link',
+		});
+	});
+
+	it('saves casts when imdb id exists in the database', async () => {
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockGetTorrentInfo).toHaveBeenCalledWith('token', '1', true);
+		// Neither file parses to a season/episode, so both used to be written to
+		// the bare imdb id - the same unique key - and the second overwrote the
+		// first. Only the biggest is kept now, and it keeps its own link.
+		expect(mockDbSaveCast).toHaveBeenCalledTimes(1);
+		expect(mockDbSaveCast).toHaveBeenCalledWith(
+			'tt1234567',
+			'user-1',
+			'hash123',
+			'EpisodeTitle.mkv',
+			'https://rd/link-2',
+			2
+		);
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'success',
+			redirectUrl: 'stremio:///detail/movie/tt1234567/tt1234567',
+			imdbId: 'tt1234567',
+			mediaType: 'movie',
+			season: undefined,
+			episode: undefined,
+		});
+	});
+
+	it('gives every episode its own key and its own link', async () => {
+		mockGetTorrentInfo.mockResolvedValue(
+			makeTorrentInfo({
+				files: [
+					{ id: 1, path: 'Show.S01E01.mkv', bytes: 1048576, selected: true },
+					{ id: 2, path: 'Show.S01E02.mkv', bytes: 2097152, selected: true },
+				],
+				links: ['https://rd/link-1', 'https://rd/link-2'],
+			})
+		);
+
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockDbSaveCast).toHaveBeenCalledTimes(2);
+		expect(mockDbSaveCast).toHaveBeenNthCalledWith(
+			1,
+			'tt1234567:1:1',
+			'user-1',
+			'hash123',
+			'Show.S01E01.mkv',
+			'https://rd/link-1',
+			1
+		);
+		expect(mockDbSaveCast).toHaveBeenNthCalledWith(
+			2,
+			'tt1234567:1:2',
+			'user-1',
+			'hash123',
+			'Show.S01E02.mkv',
+			'https://rd/link-2',
+			2
+		);
+	});
+
+	// `info.season && info.episode` read season 0 as absent, dropping specials
+	// onto the movie key together with every other unparsed file.
+	it('keeps a special numbered from zero on its own key', async () => {
+		mockGetTorrentInfo.mockResolvedValue(
+			makeTorrentInfo({
+				files: [{ id: 1, path: 'Show.S00E01.mkv', bytes: 1048576, selected: true }],
+				links: ['https://rd/link-1'],
+			})
+		);
+
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockDbSaveCast).toHaveBeenCalledWith(
+			'tt1234567:0:1',
+			'user-1',
+			'hash123',
+			'Show.S00E01.mkv',
+			'https://rd/link-1',
+			1
+		);
+	});
+
+	it('returns need_imdb_id when imdb id is not in database and not provided', async () => {
+		mockDbGetIMDBIdByHash.mockResolvedValue(null);
+
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'need_imdb_id',
+			torrentInfo: {
+				title: 'Movie.2024',
+				filename: 'Movie.2024',
+				hash: 'hash123',
+				files: [
+					{ path: 'Movie.2024.mkv', bytes: 1048576 },
+					{ path: 'EpisodeTitle.mkv', bytes: 2097152 },
+				],
+			},
+		});
+	});
+
+	it('saves imdb id mapping and processes cast when user provides valid imdb id', async () => {
+		mockDbGetIMDBIdByHash.mockResolvedValue(null);
+
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash', imdbId: 'tt7654321' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockDbSaveIMDBIdMapping).toHaveBeenCalledWith('hash123', 'tt7654321');
+		expect(mockDbSaveCast).toHaveBeenCalledTimes(1);
+		expect(mockDbSaveCast).toHaveBeenCalledWith(
+			'tt7654321',
+			'user-1',
+			'hash123',
+			'EpisodeTitle.mkv',
+			'https://rd/link-2',
+			2
+		);
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'success',
+			redirectUrl: 'stremio:///detail/movie/tt7654321/tt7654321',
+			imdbId: 'tt7654321',
+			mediaType: 'movie',
+			season: undefined,
+			episode: undefined,
+		});
+	});
+
+	// an id the library identified from the filename casts, but is not filed under the
+	// hash: it would come back as a page-add row agreeing with the identifier
+	it('casts with an identified imdb id without saving the mapping', async () => {
+		mockDbGetIMDBIdByHash.mockResolvedValue(null);
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash', imdbId: 'tt7654321', identified: '1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockDbSaveIMDBIdMapping).not.toHaveBeenCalled();
+		expect(mockDbSaveCast).toHaveBeenCalledTimes(1);
+		expect(mockDbSaveCast.mock.calls[0][0]).toBe('tt7654321');
+	});
+
+	it('validates imdb id format when user provides it', async () => {
+		mockDbGetIMDBIdByHash.mockResolvedValue(null);
+
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash', imdbId: 'invalid' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Invalid IMDB ID format. Expected format: tt1234567',
+		});
+	});
+
+	it('returns 500 when generateUserId fails', async () => {
+		mockGenerateUserId.mockRejectedValue(new Error('Invalid token'));
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(500);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage:
+				'Failed to generate user ID from RD token. Please check your RD token is valid.',
+			details: 'Invalid token',
+		});
+	});
+
+	it('returns 500 when database lookup fails', async () => {
+		mockDbGetIMDBIdByHash.mockRejectedValue(new Error('Database connection error'));
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(500);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Database error: Failed to retrieve IMDB ID from hash',
+			details: 'Database connection error',
+		});
+	});
+
+	it('returns 500 when database save fails', async () => {
+		mockDbSaveCast.mockRejectedValue(new Error('db down'));
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer token' },
+			query: { torrentIdPlusHash: '1:hash' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(500);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Database error: Failed to save cast information',
+			details: 'db down',
+		});
+	});
+});

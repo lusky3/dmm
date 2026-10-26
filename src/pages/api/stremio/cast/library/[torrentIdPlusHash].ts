@@ -1,0 +1,175 @@
+import { getTorrentInfo } from '@/services/realDebrid';
+import { repository as db } from '@/services/repository';
+import { generateUserId } from '@/utils/castApiHelpers';
+import { planLibraryCast } from '@/utils/castLibraryPlan';
+import { readProviderKey } from '@/utils/providerKeyHeader';
+import { getStremioDetailUrl } from '@/utils/stremioLinks';
+import { NextApiRequest, NextApiResponse } from 'next';
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+	res.setHeader('access-control-allow-origin', '*');
+
+	const { torrentIdPlusHash, imdbId: userProvidedImdbId } = req.query;
+	// Header only: `?rdToken=` wrote the key into the access log (card 210).
+	const rdToken = readProviderKey(req, []);
+
+	if (!rdToken) {
+		res.status(400).json({
+			status: 'error',
+			errorMessage: 'Missing or invalid RD token',
+		});
+		return;
+	}
+
+	if (!torrentIdPlusHash || typeof torrentIdPlusHash !== 'string') {
+		res.status(400).json({
+			status: 'error',
+			errorMessage: 'Missing or invalid torrentid',
+		});
+		return;
+	}
+
+	const [torrentId, hash] = torrentIdPlusHash.split(':');
+
+	// get torrent info
+	const tInfo = await getTorrentInfo(rdToken, torrentId, true);
+	const selectedFiles = tInfo.files.filter((f) => f.selected);
+	// check if length of selected files is equal to length of links
+	if (selectedFiles.length !== tInfo.links.length) {
+		res.status(400).json({
+			status: 'error',
+			errorMessage: 'Cannot determine file link',
+		});
+		return;
+	}
+
+	let imdbid = '';
+
+	// Step 1: Generate user ID from RD token
+	let userid: string;
+	try {
+		userid = await generateUserId(rdToken);
+	} catch (error) {
+		console.error('Failed to generate user ID:', error);
+		res.status(500).json({
+			status: 'error',
+			errorMessage:
+				'Failed to generate user ID from RD token. Please check your RD token is valid.',
+			details: error instanceof Error ? error.message : String(error),
+		});
+		return;
+	}
+
+	// Step 2: Get IMDB ID from database or user input
+	try {
+		imdbid = (await db.getIMDBIdByHash(hash)) || '';
+	} catch (error) {
+		console.error('Failed to retrieve IMDB ID from database:', error);
+		res.status(500).json({
+			status: 'error',
+			errorMessage: 'Database error: Failed to retrieve IMDB ID from hash',
+			details: error instanceof Error ? error.message : String(error),
+		});
+		return;
+	}
+
+	// If IMDB ID not in database, check if user provided it
+	if (!imdbid && userProvidedImdbId && typeof userProvidedImdbId === 'string') {
+		// Validate IMDB ID format (tt followed by 7+ digits)
+		if (!/^tt\d{7,}$/.test(userProvidedImdbId)) {
+			res.status(400).json({
+				status: 'error',
+				errorMessage: 'Invalid IMDB ID format. Expected format: tt1234567',
+			});
+			return;
+		}
+
+		// Save the mapping for future users (use tInfo.hash, not the URL hash parameter)
+		try {
+			// an id the library identified from the filename casts but is not filed under
+			// the hash: it would come back as a page-add row agreeing with the identifier
+			if (req.query.identified !== '1') {
+				await db.saveIMDBIdMapping(tInfo.hash, userProvidedImdbId);
+			}
+			imdbid = userProvidedImdbId;
+		} catch (error) {
+			console.error('Failed to save IMDB ID mapping:', error);
+			res.status(500).json({
+				status: 'error',
+				errorMessage: 'Database error: Failed to save IMDB ID mapping',
+				details: error instanceof Error ? error.message : String(error),
+			});
+			return;
+		}
+	}
+
+	// If still no IMDB ID, request user input
+	if (!imdbid) {
+		res.status(200).json({
+			status: 'need_imdb_id',
+			torrentInfo: {
+				title: tInfo.filename || tInfo.original_filename,
+				filename: tInfo.original_filename || tInfo.filename,
+				hash: tInfo.hash,
+				files: selectedFiles.map((f) => ({
+					path: f.path,
+					bytes: f.bytes,
+				})),
+			},
+		});
+		return;
+	}
+
+	// Step 3: Process files with IMDB ID
+	// `links[i]` pairs with `selectedFiles[i]`, so the index has to be carried
+	// through the planner rather than recomputed from the file.
+	const plan = planLibraryCast(
+		imdbid,
+		selectedFiles.map((file, index) => ({ file, index })),
+		({ file }) => ({ filename: file.path, size: file.bytes })
+	);
+
+	for (const { file: entry, stremioKey } of plan) {
+		try {
+			await db.saveCast(
+				stremioKey,
+				userid,
+				tInfo.hash,
+				entry.file.path,
+				tInfo.links[entry.index],
+				Math.ceil(entry.file.bytes / 1024 / 1024)
+			);
+		} catch (error) {
+			console.error('Failed to save cast information to database:', error);
+			res.status(500).json({
+				status: 'error',
+				errorMessage: 'Database error: Failed to save cast information',
+				details: error instanceof Error ? error.message : String(error),
+			});
+			return;
+		}
+	}
+
+	// Determine season/episode from the first cast row for redirect
+	const season = plan[0]?.season != null ? String(plan[0].season) : '';
+	const episode = plan[0]?.episode != null ? String(plan[0].episode) : '';
+
+	// Prepare redirect URL
+	let redirectUrl = getStremioDetailUrl(imdbid);
+	let mediaType = 'movie';
+
+	if (season && episode) {
+		redirectUrl = getStremioDetailUrl(imdbid, { season, episode });
+		mediaType = 'series';
+	}
+
+	// Return JSON response with redirect URL
+	res.status(200).json({
+		status: 'success',
+		redirectUrl,
+		imdbId: imdbid,
+		mediaType,
+		season: season || undefined,
+		episode: episode || undefined,
+	});
+}

@@ -1,88 +1,192 @@
-import axios from 'axios';
+import { delay as delayWithMessageChannel } from '@/utils/delay';
+import { toMagnetUri } from '@/utils/extractHashes';
+import axios, { InternalAxiosRequestConfig } from 'axios';
 import getConfig from 'next/config';
 
-const { publicRuntimeConfig: config } = getConfig();
-
-interface PinResponse {
-	status: string;
-	data: {
-		pin: string;
-		check: string;
-		expires_in: number;
-		user_url: string;
-		base_url: string;
-		check_url: string;
-	};
-}
-
-export const getPin = async () => {
-	try {
-		let endpoint = `${config.allDebridHostname}/v4/pin/get?agent=${config.allDebridAgent}`;
-		const response = await axios.get<PinResponse>(endpoint);
-		return response.data.data;
-	} catch (error) {
-		console.error('Error fetching PIN:', (error as any).message);
-		throw error;
-	}
+// Safely access Next.js runtime config in test/non-Next environments
+const fallbackRuntimeConfig = {
+	allDebridHostname: 'https://api.alldebrid.com',
 };
 
-interface PinCheckResponse {
-	status: string;
-	data: {
-		activated: boolean;
-		expires_in: number;
-		apikey?: string;
-	};
-}
-
-export const checkPin = async (pin: string, check: string) => {
-	let endpoint = `${config.allDebridHostname}/v4/pin/check?agent=${config.allDebridAgent}&check=${check}&pin=${pin}`;
+const config = (() => {
 	try {
-		let pinCheck = await axios.get<PinCheckResponse>(endpoint);
+		const cfg = (getConfig as any)?.();
+		return cfg?.publicRuntimeConfig ?? fallbackRuntimeConfig;
+	} catch {
+		return fallbackRuntimeConfig;
+	}
+})();
 
-		while (!pinCheck.data.data.activated) {
-			await new Promise((resolve) => setTimeout(resolve, 5000)); // Wait 5 seconds before polling again.
-			pinCheck = await axios.get<PinCheckResponse>(endpoint);
+// Constants for timeout and retry
+const REQUEST_TIMEOUT = 10000;
+const MIN_REQUEST_INTERVAL = (60 * 1000) / 250; // 240ms between requests (matching RealDebrid)
+
+// Global rate limiter for all AllDebrid API requests
+let globalRequestQueue: Promise<void> = Promise.resolve();
+let globalLastRequestTime = 0;
+
+// Shared rate limiting function that serializes all requests
+async function enforceRateLimit(): Promise<void> {
+	globalRequestQueue = globalRequestQueue.then(async () => {
+		const now = Date.now();
+		const timeSinceLastRequest = now - globalLastRequestTime;
+
+		if (timeSinceLastRequest < MIN_REQUEST_INTERVAL) {
+			await delayWithMessageChannel(MIN_REQUEST_INTERVAL - timeSinceLastRequest);
 		}
 
-		return pinCheck.data;
-	} catch (error) {
-		console.error('Error checking PIN:', (error as any).message);
-		throw error;
-	}
-};
+		globalLastRequestTime = Date.now();
+	});
 
-interface UserResponse {
-	status: string;
-	data: {
-		user: {
-			username: string;
-			email: string;
-			isPremium: boolean;
-			isSubscribed: boolean;
-			isTrial: boolean;
-			premiumUntil: number;
-			lang: string;
-			preferedDomain: string;
-			fidelityPoints: number;
-			limitedHostersQuotas: Record<string, number>;
-			remainingTrialQuota?: number;
-			notifications: string[];
-		};
+	await globalRequestQueue;
+}
+
+// Add a cache-aware ID generator to ensure unique cache entries for retries
+let requestCount = 0;
+function getUniqueRequestId() {
+	return `req-${Date.now()}-${requestCount++}`;
+}
+
+// Extend the Axios request config type to include our custom properties
+interface ExtendedAxiosRequestConfig extends InternalAxiosRequestConfig {
+	__isRetryRequest?: boolean;
+	__retryCount?: number;
+}
+
+// Helper function to calculate exponential backoff delay with jitter
+function calculateRetryDelay(retryCount: number): number {
+	// Base delay: 1s, doubled each attempt (1s, 2s, 4s, 8s, 16s)
+	const baseDelay = Math.pow(2, retryCount - 1) * 1000;
+
+	// Cap at 60s first
+	const cappedDelay = Math.min(baseDelay, 60000);
+
+	// Add ±20% jitter to prevent thundering herd
+	const jitterFactor = 0.8 + Math.random() * 0.4;
+	const delayWithJitter = cappedDelay * jitterFactor;
+
+	return delayWithJitter;
+}
+
+// Create a global axios instance for AllDebrid API requests
+const allDebridAxios = axios.create({
+	timeout: REQUEST_TIMEOUT,
+});
+
+// Add request interceptor for rate limiting and cache busting
+allDebridAxios.interceptors.request.use(async (config: ExtendedAxiosRequestConfig) => {
+	await enforceRateLimit();
+
+	// Add cache-busting parameter for retries to prevent hitting cached errors
+	if (config.__isRetryRequest && config.url) {
+		const url = new URL(config.url, 'http://dummy-base.com');
+		url.searchParams.set('_cache_buster', getUniqueRequestId());
+		config.url = config.url.startsWith('http') ? url.toString() : url.pathname + url.search;
+	}
+
+	return config;
+});
+
+// Add response interceptor for handling retries with exponential backoff
+allDebridAxios.interceptors.response.use(
+	(response) => response,
+	async (error) => {
+		const originalConfig = error.config as ExtendedAxiosRequestConfig;
+
+		if (!originalConfig) {
+			return Promise.reject(error);
+		}
+
+		if (originalConfig.__retryCount === undefined) {
+			originalConfig.__retryCount = 0;
+		}
+
+		// Max 7 retries (matching RealDebrid)
+		if (originalConfig.__retryCount >= 7) {
+			return Promise.reject(error);
+		}
+
+		// Retry on 5xx server errors OR 429 rate limit errors
+		const status = error.response?.status;
+		const shouldRetry = (status >= 500 && status < 600) || status === 429;
+
+		if (!shouldRetry) {
+			return Promise.reject(error);
+		}
+
+		originalConfig.__retryCount++;
+		originalConfig.__isRetryRequest = true;
+
+		const delay = calculateRetryDelay(originalConfig.__retryCount);
+
+		const errorType = error.response?.status === 429 ? 'rate limit' : 'server';
+		console.log(
+			`AllDebrid API request failed with ${error.response?.status} ${errorType} error. Retrying (attempt ${originalConfig.__retryCount}/7) after ${Math.round(delay)}ms delay...`
+		);
+
+		await delayWithMessageChannel(delay);
+
+		try {
+			return await allDebridAxios.request(originalConfig);
+		} catch (retryError) {
+			return Promise.reject(retryError);
+		}
+	}
+);
+
+// API Response wrapper
+interface ApiResponse<T> {
+	status: 'success' | 'error';
+	data?: T;
+	error?: {
+		code: string;
+		message: string;
 	};
 }
 
-export const getAllDebridUser = async (apikey: string) => {
-	let endpoint = `${config.allDebridHostname}/v4/user?agent=${config.allDebridAgent}&apikey=${apikey}`;
-	try {
-		const response = await axios.get<UserResponse>(endpoint);
-		return response.data.data.user;
-	} catch (error) {
-		console.error('Error fetching user info:', (error as any).message);
-		throw error;
-	}
-};
+/**
+ * An `{status: 'error'}` envelope as a thrown Error that keeps the vendor code.
+ * AllDebrid answers a refused key with HTTP 200, so `AUTH_BAD_APIKEY` in the
+ * code is the only thing that separates "sign in again" from "try later".
+ */
+const allDebridEnvelopeError = (error: ApiResponse<unknown>['error'], fallback: string) =>
+	Object.assign(new Error(error?.message || fallback), { code: error?.code });
 
+// Pin interfaces
+interface PinData {
+	pin: string;
+	check: string;
+	expires_in: number;
+	user_url: string;
+	base_url: string;
+	check_url?: string; // For backward compatibility
+}
+
+interface PinCheckData {
+	activated: boolean;
+	expires_in: number;
+	apikey?: string;
+}
+
+// User interfaces
+interface UserData {
+	user: {
+		username: string;
+		email: string;
+		isPremium: boolean;
+		isSubscribed: boolean;
+		isTrial: boolean;
+		premiumUntil: number;
+		lang: string;
+		preferedDomain: string;
+		fidelityPoints: number;
+		limitedHostersQuotas: Record<string, number>;
+		remainingTrialQuota?: number;
+		notifications: string[];
+	};
+}
+
+// Magnet interfaces
 interface MagnetObject {
 	magnet: string;
 	name?: string;
@@ -96,48 +200,15 @@ interface MagnetObject {
 	};
 }
 
-interface MagnetUploadResponse {
-	status: string;
-	data: {
-		magnets: MagnetObject[];
-	};
+interface MagnetUploadData {
+	magnets: MagnetObject[];
 }
 
-export const uploadMagnet = async (apikey: string, hashes: string[]) => {
-	try {
-		let endpoint = `${config.allDebridHostname}/v4/magnet/upload?agent=${config.allDebridAgent}&apikey=${apikey}`;
-		for (const hash of hashes) {
-			endpoint += `&magnets[]=${hash}`;
-		}
-		const response = await axios.post<MagnetUploadResponse>(endpoint);
-		return response.data;
-	} catch (error) {
-		console.error('Error uploading magnet:', (error as any).message);
-		throw error;
-	}
-};
-
-export interface MagnetStatus {
-	id: number;
-	filename: string;
-	size: number;
-	hash: string;
-	status: string;
-	statusCode: number;
-	downloaded: number;
-	uploaded: number;
-	processingPerc: number;
-	seeders: number;
-	downloadSpeed: number;
-	uploadSpeed: number;
-	uploadDate: number;
-	completionDate: number;
-	links: LinkObject[];
-	type: string;
-	notified: boolean;
-	version: number;
+interface MagnetFileUploadData {
+	files: MagnetObject[];
 }
 
+// For backward compatibility with existing code
 interface LinkObject {
 	link: string;
 	filename: string;
@@ -145,11 +216,252 @@ interface LinkObject {
 	files: { n: string; s?: number }[];
 }
 
+export interface MagnetStatus {
+	id: number;
+	filename: string;
+	size: number;
+	hash?: string;
+	status: string;
+	statusCode: number;
+	downloaded?: number;
+	uploaded?: number;
+	processingPerc?: number;
+	seeders?: number;
+	downloadSpeed?: number;
+	uploadSpeed?: number;
+	uploadDate?: number;
+	completionDate?: number;
+	links: LinkObject[]; // For backward compatibility
+	type?: string;
+	notified?: boolean;
+	version?: number;
+	files?: MagnetFile[]; // v4.1 structure
+}
+
+interface MagnetStatusData {
+	magnets: MagnetStatus[];
+	counter?: number;
+	fullsync?: boolean;
+}
+
+export interface MagnetFile {
+	n: string; // name
+	s?: number; // size
+	l?: string; // link
+	e?: MagnetFile[]; // sub-entries (folders)
+}
+
+interface MagnetFilesData {
+	magnets: Array<{
+		id: string;
+		files?: MagnetFile[];
+		error?: {
+			code: string;
+			message: string;
+		};
+	}>;
+}
+
+interface MagnetDeleteData {
+	message: string;
+}
+
+interface MagnetRestartData {
+	message?: string;
+	magnets?: Array<{
+		magnet: string;
+		message?: string;
+		error?: {
+			code: string;
+			message: string;
+		};
+	}>;
+}
+
+// Response type to maintain backward compatibility
 interface MagnetStatusResponse {
 	status: string;
 	data: {
 		magnets: MagnetStatus[];
 	};
+}
+
+// Public endpoints (no auth required)
+export const getPin = async (): Promise<PinData> => {
+	try {
+		const endpoint = `${config.allDebridHostname}/v4.1/pin/get`;
+		const response = await allDebridAxios.get<ApiResponse<PinData>>(endpoint);
+
+		if (response.data.status === 'error') {
+			throw new Error(response.data.error?.message || 'Unknown error');
+		}
+
+		return response.data.data!;
+	} catch (error) {
+		console.error('Error fetching PIN:', (error as any).message);
+		throw error;
+	}
+};
+
+/**
+ * One PIN check. `checkPin` waits out the whole activation on your behalf; this
+ * is the single request underneath it, for callers that have to own the waiting
+ * themselves - the login page stops polling when the user navigates away, which
+ * a loop buried in here cannot do.
+ */
+export const checkPinOnce = async (pin: string, check: string): Promise<PinCheckData> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/pin/check`;
+	const params = new URLSearchParams();
+	params.append('pin', pin);
+	params.append('check', check);
+
+	const pinCheck = await allDebridAxios.post<ApiResponse<PinCheckData>>(endpoint, params, {
+		headers: {
+			'Content-Type': 'application/x-www-form-urlencoded',
+		},
+	});
+
+	if (pinCheck.data.status === 'error') {
+		throw new Error(pinCheck.data.error?.message || 'Unknown error');
+	}
+
+	return pinCheck.data.data!;
+};
+
+export const checkPin = async (pin: string, check: string): Promise<PinCheckData> => {
+	try {
+		let pinCheck = await checkPinOnce(pin, check);
+
+		while (!pinCheck.activated) {
+			await delayWithMessageChannel(5000);
+			pinCheck = await checkPinOnce(pin, check);
+		}
+
+		return pinCheck;
+	} catch (error) {
+		console.error('Error checking PIN:', (error as any).message);
+		throw error;
+	}
+};
+
+// Authenticated endpoints
+export const getAllDebridUser = async (apikey: string) => {
+	const endpoint = `${config.allDebridHostname}/v4.1/user`;
+	try {
+		const response = await allDebridAxios.get<ApiResponse<UserData>>(endpoint, {
+			headers: { Authorization: `Bearer ${apikey}` },
+		});
+
+		if (response.data.status === 'error') {
+			// The code is what separates a key AllDebrid rejects outright
+			// (AUTH_BAD_APIKEY) from one it refuses for this caller or endpoint
+			// (AUTH_BLOCKED), and only the message survives an Error on its own.
+			throw Object.assign(new Error(response.data.error?.message || 'Unknown error'), {
+				code: response.data.error?.code,
+			});
+		}
+
+		return response.data.data!.user;
+	} catch (error) {
+		console.error('Error fetching user info:', (error as any).message);
+		throw error;
+	}
+};
+
+export const uploadMagnet = async (apikey: string, hashes: string[]): Promise<MagnetUploadData> => {
+	try {
+		const endpoint = `${config.allDebridHostname}/v4.1/magnet/upload`;
+
+		// Convert hashes to magnets (handles both formats)
+		const magnets = hashes.map(toMagnetUri).filter((magnet) => magnet.startsWith('magnet:?'));
+
+		if (!magnets.length) {
+			throw new Error('No valid magnets to upload');
+		}
+
+		// AllDebrid expects x-www-form-urlencoded with repeated magnets[] fields
+		const params = new URLSearchParams();
+		magnets.forEach((m) => params.append('magnets[]', m));
+
+		const response = await allDebridAxios.post<ApiResponse<MagnetUploadData>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apikey}`,
+				},
+			}
+		);
+
+		if (response.data.status === 'error') {
+			throw new Error(response.data.error?.message || 'Unknown error');
+		}
+
+		return response.data.data!;
+	} catch (error) {
+		console.error('Error uploading magnet:', (error as any).message);
+		throw error;
+	}
+};
+
+/** Uploads the original .torrent bytes through AllDebrid's multipart endpoint. */
+export const uploadTorrentFile = async (
+	apikey: string,
+	file: File
+): Promise<MagnetFileUploadData> => {
+	const endpoint = `${config.allDebridHostname}/v4/magnet/upload/file`;
+	const form = new FormData();
+	form.append('files[]', file);
+	const response = await allDebridAxios.post<ApiResponse<MagnetFileUploadData>>(endpoint, form, {
+		headers: { Authorization: `Bearer ${apikey}` },
+	});
+	if (response.data?.status !== 'success') {
+		throw Object.assign(
+			new Error(
+				response.data?.error?.message || 'AllDebrid returned an invalid upload response'
+			),
+			{ code: response.data?.error?.code }
+		);
+	}
+	const data = response.data.data;
+	if (!data || !Array.isArray(data.files) || data.files.length === 0) {
+		throw new Error('AllDebrid returned no uploaded torrent files');
+	}
+	const refused = data.files.find((uploaded) => uploaded.error);
+	if (refused?.error) {
+		throw Object.assign(new Error(refused.error.message || refused.error.code), {
+			code: refused.error.code,
+		});
+	}
+	return data;
+};
+
+// Helper function to convert MagnetFile structure to LinkObject for backward compatibility
+function convertFilesToLinks(files?: MagnetFile[]): LinkObject[] {
+	if (!files || files.length === 0) return [];
+
+	const links: LinkObject[] = [];
+
+	function processFile(file: MagnetFile, parentPath: string = ''): void {
+		const fullPath = parentPath ? `${parentPath}/${file.n}` : file.n;
+
+		if (file.l) {
+			// It's a file with a link
+			links.push({
+				link: file.l,
+				filename: fullPath,
+				size: file.s || 0,
+				files: [],
+			});
+		} else if (file.e) {
+			// It's a folder with sub-entries
+			file.e.forEach((subFile) => processFile(subFile, fullPath));
+		}
+	}
+
+	files.forEach((file) => processFile(file));
+	return links;
 }
 
 export const getMagnetStatus = async (
@@ -159,98 +471,463 @@ export const getMagnetStatus = async (
 	session?: number,
 	counter?: number
 ): Promise<MagnetStatusResponse> => {
-	let endpoint = `${config.allDebridHostname}/v4/magnet/status?agent=${config.allDebridAgent}&apikey=${apikey}`;
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/status`;
+
+	// Use URLSearchParams for form-urlencoded as required by AllDebrid API
+	const params = new URLSearchParams();
+	params.append('_fresh', Date.now().toString()); // Add cache-busting parameter for fresh uncached results
+
+	const requestMeta = {
+		hasMagnetId: Boolean(magnetId),
+		hasStatusFilter: Boolean(statusFilter),
+		session,
+		counter,
+	};
+	const requestStartedAt = Date.now();
+	console.log('[AllDebridAPI] getMagnetStatus start', requestMeta);
+
 	if (magnetId) {
-		endpoint += `&id=${magnetId}`;
+		params.append('id', magnetId);
 	} else if (statusFilter) {
-		endpoint += `&status=${statusFilter}`;
+		params.append('status', statusFilter);
 	}
-	if (session) {
-		endpoint += `&session=${session}`;
+
+	if (session !== undefined) {
+		params.append('session', session.toString());
 	}
-	if (counter) {
-		endpoint += `&counter=${counter}`;
+
+	if (counter !== undefined) {
+		params.append('counter', counter.toString());
 	}
+
 	try {
-		const response = await axios.get<MagnetStatusResponse>(endpoint);
-		return response.data;
+		const response = await allDebridAxios.post<ApiResponse<MagnetStatusData>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apikey}`,
+				},
+			}
+		);
+
+		if (response.data.status === 'error') {
+			throw allDebridEnvelopeError(response.data.error, 'Unknown error');
+		}
+
+		// The list form of /v4.1/magnet/status carries NO files — measured 0 of 44 magnets
+		// on 2026-09-02, and again a month earlier. Only the single-id form embeds them
+		// inline (see getMagnetStatusAd). The loop below is therefore a no-op on this path
+		// and is kept for the single-id branch and for older response shapes.
+		const magnets = response.data.data!.magnets;
+		const durationMs = Date.now() - requestStartedAt;
+		console.log('[AllDebridAPI] getMagnetStatus success', {
+			...requestMeta,
+			magnetCount: magnets.length,
+			fullSync: Boolean(response.data.data?.fullsync),
+			elapsedMs: durationMs,
+		});
+
+		// Convert files to links for backward compatibility
+		magnets.forEach((m) => {
+			// Initialize links array
+			if (!m.links) m.links = [];
+
+			// If magnet has files (v4.1 includes them), convert to links format
+			if (m.files && m.files.length > 0) {
+				m.links = convertFilesToLinks(m.files);
+			}
+		});
+
+		// Return in old format for backward compatibility
+		return {
+			status: response.data.status,
+			data: {
+				magnets: magnets,
+			},
+		};
 	} catch (error) {
+		console.error(
+			'[AllDebridAPI] getMagnetStatus error after',
+			Date.now() - requestStartedAt,
+			'ms',
+			{
+				...requestMeta,
+				error: (error as any)?.message,
+			}
+		);
 		console.error('Error fetching magnet status:', (error as any).message);
 		throw error;
 	}
 };
 
-interface MagnetDeleteResponse {
-	message: string;
-}
+export const getMagnetFiles = async (
+	apikey: string,
+	magnetIds: number[]
+): Promise<MagnetFilesData> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/files`;
 
-export const deleteMagnet = async (apikey: string, id: string): Promise<MagnetDeleteResponse> => {
-	let endpoint = `${config.allDebridHostname}/v4/magnet/delete?agent=${config.allDebridAgent}&apikey=${apikey}&id=${id}`;
+	// Filter out invalid IDs before making the request
+	const validIds = magnetIds.filter((id) => id && id > 0);
+
+	if (validIds.length === 0) {
+		return { magnets: [] } as MagnetFilesData;
+	}
+
 	try {
-		const response = await axios.get<MagnetDeleteResponse>(endpoint);
-		return response.data;
+		// AllDebrid expects form-encoded data with repeated id[] fields
+		const params = new URLSearchParams();
+		validIds.forEach((id) => params.append('id[]', id.toString()));
+
+		const response = await allDebridAxios.post<ApiResponse<MagnetFilesData>>(endpoint, params, {
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${apikey}`,
+			},
+		});
+
+		if (response.data.status === 'error') {
+			throw allDebridEnvelopeError(response.data.error, 'Unknown error');
+		}
+
+		return response.data.data!;
+	} catch (error: any) {
+		// Only log error if it's not about invalid magnet IDs
+		if (!error?.message?.includes('magnet ID does not exists')) {
+			console.error('Error fetching magnet files:', error.message);
+		}
+		throw error;
+	}
+};
+
+/** A magnet's files as links: the list form of /magnet/status carries none. */
+export const getMagnetLinks = async (apikey: string, magnetId: number): Promise<LinkObject[]> =>
+	convertFilesToLinks((await getMagnetFiles(apikey, [magnetId])).magnets[0]?.files);
+
+export const deleteMagnet = async (apikey: string, id: string): Promise<MagnetDeleteData> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/delete`;
+	try {
+		// AllDebrid expects form-encoded data
+		const params = new URLSearchParams();
+		params.append('id', id);
+
+		const response = await allDebridAxios.post<ApiResponse<MagnetDeleteData>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apikey}`,
+				},
+			}
+		);
+
+		if (response.data.status === 'error') {
+			throw new Error(response.data.error?.message || 'Unknown error');
+		}
+
+		return response.data.data!;
 	} catch (error) {
 		console.error('Error deleting magnet:', (error as any).message);
 		throw error;
 	}
 };
 
-interface MagnetRestartResponse {
-	message?: string;
-	error?: {
-		code: string;
-		message: string;
-	};
-	magnet?: number | string;
-}
-
-export const restartMagnet = async (apikey: string, id: string): Promise<MagnetRestartResponse> => {
-	let endpoint = `${config.allDebridHostname}/v4/magnet/restart?agent=${config.allDebridAgent}&apikey=${apikey}&id=${id}`;
+export const restartMagnet = async (apikey: string, id: string): Promise<MagnetRestartData> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/restart`;
 	try {
-		const response = await axios.get<MagnetRestartResponse>(endpoint);
-		if (response.data.error) throw new Error(response.data.error.message);
-		return response.data;
+		// AllDebrid expects form-encoded data
+		const params = new URLSearchParams();
+		params.append('id', id);
+
+		const response = await allDebridAxios.post<ApiResponse<MagnetRestartData>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apikey}`,
+				},
+			}
+		);
+
+		if (!response.data || response.data.status === 'error') {
+			throw allDebridEnvelopeError(response.data?.error, 'Unknown error');
+		}
+
+		return response.data.data!;
 	} catch (error) {
 		console.error('Error restarting magnet:', (error as any).message);
 		throw error;
 	}
 };
 
-export interface MagnetFile {
-	n: string;
-	s: number;
-	e?: MagnetFile[];
-}
+// There is no non-mutating cache probe left in AllDebrid's API: /magnet/instant
+// was withdrawn (it answers 404) and v4 /magnet/status is discontinued. The
+// upload itself reports `ready`, so uploadMagnet doubles as the probe — see
+// isAdMagnetInstant — but a miss has to be deleted again afterwards because
+// uploading put it in the user's account.
 
-interface MagnetData {
-	magnet: string;
-	hash: string;
-	instant: boolean;
-	files?: MagnetFile[];
-	error?: {
-		code: string;
-		message: string;
-	};
-}
+// ====================================================================
+// Availability Checking Functions (Simplified for availability checks)
+// ====================================================================
 
-export interface AdInstantAvailabilityResponse {
-	status: string;
-	data: { magnets: MagnetData[] };
-}
-
-export const adInstantCheck = async (
-	apikey: string,
-	hashes: string[]
-): Promise<AdInstantAvailabilityResponse> => {
-	let endpoint = `${config.allDebridHostname}/v4/magnet/instant?agent=${config.allDebridAgent}&apikey=${apikey}`;
-	for (const hash of hashes) {
-		endpoint += `&magnets[]=${hash}`;
+/**
+ * Upload a single magnet hash for availability checking
+ * Simplified version of uploadMagnet for single hash use case
+ * Returns the upload result with 'ready' field indicating instant availability
+ */
+export const uploadMagnetAd = async (apiKey: string, hash: string): Promise<MagnetObject> => {
+	const hashRegex = /^[a-f0-9]{40}$/i;
+	if (!hashRegex.test(hash)) {
+		throw new Error(`Invalid SHA40 hash: ${hash}`);
 	}
+
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/upload`;
+	const params = new URLSearchParams();
+	params.append('magnets[]', toMagnetUri(hash));
+
 	try {
-		const response = await axios.get<AdInstantAvailabilityResponse>(endpoint);
-		return response.data;
+		const response = await allDebridAxios.post<ApiResponse<MagnetUploadData>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apiKey}`,
+				},
+			}
+		);
+
+		if (response.data.status === 'error') {
+			throw new Error(response.data.error?.message || 'Upload failed');
+		}
+
+		return response.data.data!.magnets[0];
 	} catch (error: any) {
-		console.error('Error fetching magnet availability:', error.message);
+		console.error('Error uploading magnet for availability check:', error.message);
 		throw error;
 	}
 };
+
+/**
+ * Get magnet status including files for a specific magnet ID
+ * Simplified version of getMagnetStatus for single magnet queries
+ * Returns status with files array (no need for separate /files call)
+ */
+export const getMagnetStatusAd = async (
+	apiKey: string,
+	magnetId: number
+): Promise<MagnetStatus> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/status`;
+	const params = new URLSearchParams();
+	params.append('id', magnetId.toString());
+
+	try {
+		const response = await allDebridAxios.post<ApiResponse<{ magnets: MagnetStatus }>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apiKey}`,
+				},
+			}
+		);
+
+		if (response.data.status === 'error') {
+			throw allDebridEnvelopeError(response.data.error, 'Status check failed');
+		}
+
+		// Note: Status endpoint returns magnets as OBJECT (not array) when querying by ID
+		return response.data.data!.magnets;
+	} catch (error: any) {
+		console.error('Error fetching magnet status:', error.message);
+		throw error;
+	}
+};
+
+/**
+ * Delete a magnet by ID
+ * Simplified wrapper around deleteMagnet for consistency with other AD availability functions
+ * Uses axios interceptor for retry logic on 429/5xx errors
+ */
+export const deleteMagnetAd = async (apiKey: string, magnetId: number): Promise<void> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/magnet/delete`;
+	const params = new URLSearchParams();
+	params.append('id', magnetId.toString());
+
+	try {
+		const response = await allDebridAxios.post<ApiResponse<MagnetDeleteData>>(
+			endpoint,
+			params,
+			{
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					Authorization: `Bearer ${apiKey}`,
+				},
+			}
+		);
+
+		if (response.data.status === 'error') {
+			throw new Error(response.data.error?.message || 'Delete failed');
+		}
+	} catch (error: any) {
+		console.error('Error deleting magnet:', error.message);
+		throw error;
+	}
+};
+
+// ====================================================================
+// Helper Functions
+// ====================================================================
+
+/**
+ * Check if a magnet upload indicates instant availability
+ * @param upload Upload response from uploadMagnetAd
+ * @returns true if the magnet is instantly available (cached)
+ */
+export function isAdMagnetInstant(upload: MagnetObject): boolean {
+	return upload.ready === true;
+}
+
+/**
+ * Check if a magnet status indicates it's ready/cached
+ * @param status Status response from getMagnetStatusAd
+ * @returns true if the magnet is ready (statusCode 4)
+ */
+export function isAdStatusReady(status: MagnetStatus): boolean {
+	return status.statusCode === 4 && status.status === 'Ready';
+}
+
+/**
+ * Validate if a string is a valid SHA-1 hash (40 hex characters)
+ * @param hash Hash string to validate
+ * @returns true if valid SHA-1 hash format
+ */
+export function isValidSHA40Hash(hash: string): boolean {
+	return /^[a-fA-F0-9]{40}$/i.test(hash);
+}
+
+// ====================================================================
+// Link Unlocking
+// ====================================================================
+
+interface UnlockLinkData {
+	link: string;
+	host: string;
+	filename: string;
+	streaming: string[];
+	paws: boolean;
+	filesize: number;
+	id: string;
+	hostDomain: string;
+}
+
+export interface AllDebridSavedLink {
+	link: string;
+	filename: string;
+	size: number;
+	date: number;
+	host: string;
+}
+
+/**
+ * The user's saved hoster links - a second library beside magnets.
+ *
+ * These carry no id of their own; the link URL is the key, which is why the
+ * library encodes it into the meta id rather than an index into this list.
+ */
+export const getSavedLinks = async (apiKey: string): Promise<AllDebridSavedLink[]> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/user/links`;
+	const params = new URLSearchParams();
+	params.append('_fresh', Date.now().toString());
+
+	const response = await allDebridAxios.post<ApiResponse<{ links?: AllDebridSavedLink[] }>>(
+		endpoint,
+		params,
+		{
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${apiKey}`,
+			},
+		}
+	);
+
+	if (response.data.status === 'error') {
+		throw allDebridEnvelopeError(response.data.error, 'Failed to list saved links');
+	}
+	return response.data.data?.links ?? [];
+};
+
+/**
+ * Unlock an AllDebrid link to get a direct download URL
+ * @param apiKey AllDebrid API key
+ * @param link The AllDebrid link to unlock (e.g., https://alldebrid.com/f/...)
+ * @returns The unlocked link data including the direct download URL
+ */
+export const unlockLink = async (apiKey: string, link: string): Promise<UnlockLinkData> => {
+	const endpoint = `${config.allDebridHostname}/v4.1/link/unlock`;
+
+	try {
+		const params = new URLSearchParams();
+		params.append('link', link);
+
+		const response = await allDebridAxios.post<ApiResponse<UnlockLinkData>>(endpoint, params, {
+			headers: {
+				'Content-Type': 'application/x-www-form-urlencoded',
+				Authorization: `Bearer ${apiKey}`,
+			},
+		});
+
+		if (response.data.status === 'error') {
+			// The code is the whole answer: AUTH_BLOCKED (confirm the email
+			// AllDebrid sent), AUTH_BAD_APIKEY, LINK_HOST_NOT_SUPPORTED.
+			throw allDebridEnvelopeError(response.data.error, 'Failed to unlock link');
+		}
+
+		return response.data.data!;
+	} catch (error: any) {
+		console.error('Error unlocking AllDebrid link:', error.message);
+		throw error;
+	}
+};
+
+// ====================================================================
+// Rate Limiting
+// ====================================================================
+
+// AllDebrid: 600 req/min documented, use 500 for safety buffer
+const adRequestTimestamps: number[] = [];
+const AD_MAX_REQUESTS = 500;
+const AD_TIME_WINDOW = 60000; // 1 minute in milliseconds
+
+/**
+ * Wait if AllDebrid rate limit would be exceeded
+ * Implements a sliding window rate limiter
+ * AllDebrid allows 600 requests per minute, we use 500 for safety
+ */
+export async function waitForAdRateLimit(): Promise<void> {
+	const now = Date.now();
+
+	// Remove timestamps older than the time window
+	while (adRequestTimestamps.length > 0 && adRequestTimestamps[0] < now - AD_TIME_WINDOW) {
+		adRequestTimestamps.shift();
+	}
+
+	// If we've hit the limit, wait until the oldest request expires
+	if (adRequestTimestamps.length >= AD_MAX_REQUESTS) {
+		const oldestTimestamp = adRequestTimestamps[0];
+		const waitTime = oldestTimestamp + AD_TIME_WINDOW - now;
+
+		if (waitTime > 0) {
+			await delayWithMessageChannel(waitTime);
+			// Recursively call to clean up and check again
+			return waitForAdRateLimit();
+		}
+	}
+
+	// Record this request
+	adRequestTimestamps.push(now);
+}

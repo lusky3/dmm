@@ -1,0 +1,586 @@
+import { ReleaseSection } from '@/components/ReleaseSection';
+import { UsenetResult } from '@/services/nzb2rd';
+import { transferContextFromPath } from '@/utils/debridUploader';
+import {
+	createNzb2rdJob,
+	fetchNzb2rdTransfers,
+	followNzb2rdTransfer,
+	isNzb2rdDuplicate,
+	trackNzb2rdJob,
+	type Nzb2rdTransferSummary,
+} from '@/utils/nzb2rd';
+import { downloadCleanNzb } from '@/utils/nzbDownload';
+import { readRdOAuthCredentials } from '@/utils/rdTokenStorage';
+import {
+	describeTransfer,
+	PHASE_STYLES,
+	TRANSFER_LABELS,
+	TRANSFER_STEP_TOAST_MS,
+	TRANSFER_TOAST_MS,
+	type TransferPhase,
+} from '@/utils/transferPhase';
+import type { TvEpisodeMatch } from '@/utils/tvEpisodes';
+import { Check, Download, FileDown, Loader2, RotateCw, Send } from 'lucide-react';
+import Link from 'next/link';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import toast from 'react-hot-toast';
+
+type UsenetResultsProps = {
+	imdbId: string;
+	/** Present for a show season, absent for a movie. */
+	seasonNum?: number;
+	/** Show title, so whole-season packs can be looked up by name. */
+	title?: string;
+	rdKey: string | null;
+	/** Hears the results once a search lands, so the page can count them with its own rows. */
+	onResults?: (results: UsenetResult[]) => void;
+	/** Keeps only the rows whose title passes, e.g. the season page's episode chip. */
+	rowFilter?: (title: string) => boolean;
+	/**
+	 * The season page's episode reader, so the badge marks exactly the rows its
+	 * Packs chip counts. The episode search returns whole-season releases too,
+	 * and only the pack search's own finds carry `isPack`.
+	 */
+	episodeReader?: ((title: string) => TvEpisodeMatch) | null;
+};
+
+// Kept importable from here, where they started.
+export { formatSize, sortResults } from '@/components/ReleaseSection';
+
+export type SendButtonKind =
+	'send' | 'sending' | 'sent' | 'cached' | 'running' | 'failed' | 'added';
+
+export interface SendButtonState {
+	kind: SendButtonKind;
+	label: string;
+	/** Second line: place in line, or how far through the current stage. */
+	detail?: string;
+	title: string;
+	/** Set only for a job whose live state is known, and styles the button. */
+	phase: TransferPhase | null;
+	disabled: boolean;
+}
+
+/**
+ * What the row's button says.
+ *
+ * Three of these states are the whole point of the section, and two of them
+ * used to be dead ends:
+ *
+ * - **Completed** ("Add to RD"). A finished fetch left the content in
+ *   Real-Debrid under a hash the marker already stores — 1501 of 1501 completed
+ *   markers carried one, measured 2026-09-01 — and `POST /api/nzb2rd/jobs` has
+ *   always put that hash straight into the caller's own account instead of
+ *   starting a second Usenet fetch. The row simply never let anyone reach it:
+ *   the button was disabled and read "In RD", which is only true of whoever
+ *   submitted it. So it is live now, and says what a click actually does.
+ * - **Failed** ("Retry"). A resubmit was always allowed server-side — the dedup
+ *   check re-reads a non-`completed` marker's job and lets a failed one through
+ *   — but the marker was deleted on discovery, so the row fell back to a bare
+ *   "Send" that said nothing about the attempt that had already failed. The
+ *   marker is kept now, and its reason rides the tooltip.
+ * - **Unfinished** (a phase label). The marker's `pending` covers both waiting
+ *   in line and being fetched, and measured against the live queue on
+ *   2026-08-29, **670 of 683 unfinished jobs had not started** — no
+ *   `started_at`, no progress bytes — with the oldest queued 8 days. So a job's
+ *   real phase is read through the same `describeTransfer` vocabulary the
+ *   Transfers page uses, rather than inventing a second set of words for the
+ *   same states.
+ *
+ * A Usenet fetch costs indexer grab quota and block-account bytes, so nothing
+ * here ever starts a second one for content that already exists.
+ */
+export function buttonState(
+	id: string,
+	sending: Set<string>,
+	sent: Set<string>,
+	transferred: Map<string, Nzb2rdTransferSummary>,
+	added: Set<string> = new Set()
+): SendButtonState {
+	const existing = transferred.get(id);
+	// A completed job with no hash cannot be handed to anyone — there is nothing
+	// to add — so it is not "cached" in any useful sense. The server agrees: its
+	// dedup check answers false for exactly this record and accepts a fresh fetch.
+	const cached = existing?.status === 'completed' && !!existing.infoHash;
+
+	if (added.has(id)) {
+		return {
+			kind: 'added',
+			label: 'Added',
+			title: 'Added to your Real-Debrid library',
+			phase: null,
+			disabled: true,
+		};
+	}
+	if (sending.has(id)) {
+		return {
+			kind: 'sending',
+			label: cached ? 'Adding' : 'Sending',
+			title: cached ? 'Adding to your library…' : 'Submitting…',
+			phase: null,
+			disabled: true,
+		};
+	}
+	if (sent.has(id)) {
+		return {
+			kind: 'sent',
+			label: 'Sent',
+			title: 'Sent — follow it on the Transfers page',
+			phase: null,
+			disabled: true,
+		};
+	}
+	if (cached) {
+		return {
+			kind: 'cached',
+			label: 'Add to RD',
+			title: 'Already fetched from Usenet — add it to your Real-Debrid library now',
+			phase: null,
+			disabled: false,
+		};
+	}
+	if (existing?.status === 'failed') {
+		return {
+			kind: 'failed',
+			label: 'Retry',
+			// The reason is what makes this button worth offering: most failures
+			// name something the user can act on, and one they cannot fix is worth
+			// knowing before spending another multi-day queue wait on it.
+			detail: existing.error ?? undefined,
+			title: existing.error
+				? `Last attempt failed: ${existing.error}`
+				: 'The last attempt failed — send it again',
+			phase: null,
+			disabled: false,
+		};
+	}
+	if (existing && existing.status !== 'completed') {
+		// Nothing came back about the job itself — past the server's re-check cap,
+		// or nzb2rd was unreachable. Say only what is actually known.
+		if (!existing.progress) {
+			return {
+				kind: 'running',
+				label: 'In progress',
+				title: 'Someone is already fetching this release',
+				phase: null,
+				disabled: true,
+			};
+		}
+		const progress = describeTransfer('nzb2rd', existing.progress);
+		return {
+			kind: 'running',
+			label: progress.label,
+			// The place in line while queued; otherwise the stage's own percentage,
+			// which only the Usenet pass and RD's pull can answer — `describeTransfer`
+			// leaves the rest sitting at the rung floor, and repeating that as a
+			// percentage would read as stalled progress rather than no progress.
+			detail:
+				progress.detail ??
+				(progress.stagePercent === null ? undefined : `${progress.stagePercent}%`),
+			title:
+				progress.phase === 'queued'
+					? 'Waiting in nzb2rd’s queue — you will get it when it lands'
+					: 'Someone is already fetching this release',
+			phase: progress.phase,
+			disabled: true,
+		};
+	}
+	return {
+		kind: 'send',
+		label: 'Send',
+		title: 'Send to Real-Debrid via nzb2rd',
+		phase: null,
+		disabled: false,
+	};
+}
+
+// Usenet is a second supply line beside the torrent results: nothing here is
+// cached anywhere, so there is no availability to check and no reason to load it
+// for every visitor. It is its own tab (`ResultsTabs`) and searches once when that
+// tab opens; the indexer bills a daily API-call quota.
+const UsenetResults = ({
+	imdbId,
+	seasonNum,
+	title,
+	rdKey,
+	onResults,
+	rowFilter,
+	episodeReader,
+}: UsenetResultsProps) => {
+	const [results, setResults] = useState<UsenetResult[] | null>(null);
+	const [isLoading, setIsLoading] = useState(false);
+	const [error, setError] = useState<string | null>(null);
+	const [sendingIds, setSendingIds] = useState<Set<string>>(new Set());
+	const [sentIds, setSentIds] = useState<Set<string>>(new Set());
+	// Releases this browser has just put into its own Real-Debrid library.
+	// Real-Debrid does not dedupe an addMagnet by hash, so a second click would
+	// make a second library entry rather than being absorbed.
+	const [addedIds, setAddedIds] = useState<Set<string>>(new Set());
+	const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
+	// Releases someone has already fetched or is fetching, so the row shows where
+	// that stands instead of a Send the server would only reject as a duplicate.
+	const [transferred, setTransferred] = useState<Map<string, Nzb2rdTransferSummary>>(new Map());
+
+	const fetchResults = useCallback(async () => {
+		setIsLoading(true);
+		setError(null);
+		try {
+			const params = new URLSearchParams({ imdbId });
+			if (seasonNum !== undefined) params.set('seasonNum', String(seasonNum));
+			if (seasonNum !== undefined && title) params.set('title', title);
+			const response = await fetch(`/api/nzb2rd/search?${params}`);
+			const data = await response.json().catch(() => null);
+			if (!response.ok) throw new Error(data?.error || `Search failed (${response.status})`);
+			const found: UsenetResult[] = Array.isArray(data?.results) ? data.results : [];
+			setResults(found);
+			onResults?.(found);
+
+			// Best-effort, and deliberately not awaited into the error path: a
+			// failed lookup should never hide the results themselves.
+			fetchNzb2rdTransfers(found.map((r) => r.id)).then((existing) =>
+				setTransferred(new Map(existing.map((t) => [t.releaseId, t])))
+			);
+		} catch (e) {
+			setError(e instanceof Error ? e.message : 'Usenet search failed');
+			setResults(null);
+		} finally {
+			setIsLoading(false);
+		}
+	}, [imdbId, seasonNum, title, onResults]);
+
+	useEffect(() => {
+		if (imdbId) fetchResults();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [imdbId, seasonNum]);
+
+	const kept = useMemo(() => {
+		if (!results) return [];
+		const shown = rowFilter ? results.filter((r) => rowFilter(r.title)) : results;
+		if (!episodeReader) return shown;
+		return shown.map((r) => ({ ...r, isPack: episodeReader(r.title).kind === 'pack' }));
+	}, [results, rowFilter, episodeReader]);
+
+	const returnPath = () =>
+		seasonNum !== undefined ? `/show/${imdbId}/${seasonNum}` : `/movie/${imdbId}`;
+
+	const label = TRANSFER_LABELS.usenet;
+
+	const send = async (result: UsenetResult) => {
+		if (!rdKey) {
+			toast.error('Log in with Real-Debrid to send Usenet releases', { duration: 5000 });
+			return;
+		}
+		if (sendingIds.has(result.id) || sentIds.has(result.id) || addedIds.has(result.id)) return;
+
+		// The same request covers both buttons. A release someone already fetched
+		// is answered by `POST /api/nzb2rd/jobs` with the stored hash added to
+		// this caller's account — no NZB is pulled and no job is queued — so the
+		// only thing that differs is what the user is told is happening.
+		const marker = transferred.get(result.id);
+		const isAdd = marker?.status === 'completed' && !!marker.infoHash;
+
+		setSendingIds((prev) => new Set(prev).add(result.id));
+		// One toast per transfer, carried from submit to the point RD takes over,
+		// exactly as a TorBox or AllDebrid send does. `followNzb2rdTransfer` runs
+		// detached: the row is "Sent" the moment the job exists, and the Usenet
+		// pass that follows is minutes long.
+		const toastId = toast.loading(
+			isAdd ? `${label}: adding to your library...` : `${label}: submitting transfer...`,
+			{ duration: TRANSFER_STEP_TOAST_MS }
+		);
+		const follow = (jobId: string) =>
+			void followNzb2rdTransfer({
+				jobId,
+				toastId,
+				context: transferContextFromPath(returnPath()),
+				releaseId: result.id,
+			});
+		try {
+			const job = await createNzb2rdJob({
+				id: result.id,
+				title: result.title,
+				imdbId,
+				rdKey,
+				// The access token above dies 24h after login and this fetch can sit
+				// in nzb2rd's queue for days; these do not expire, so the service can
+				// mint a live token when it actually reaches Real-Debrid.
+				oauth: readRdOAuthCredentials(),
+				returnPath: returnPath(),
+			});
+
+			if (isNzb2rdDuplicate(job)) {
+				setTransferred((prev) =>
+					new Map(prev).set(result.id, {
+						releaseId: result.id,
+						jobId: job.jobId,
+						infoHash: job.infoHash,
+						status: job.duplicate === 'completed' ? 'completed' : 'pending',
+						// The duplicate reply says a job exists, not where it is. The
+						// row reads "In progress" until the next lookup places it.
+					})
+				);
+
+				if (job.duplicate === 'completed') {
+					// The row is done either way: it landed, or it did not and a
+					// repeat click would fail the same way. Only a success marks
+					// the release as added, so a failed add stays clickable.
+					if (job.added) setAddedIds((prev) => new Set(prev).add(result.id));
+					toast.success(
+						job.added
+							? `${label}: already fetched — it is in your Real-Debrid library.`
+							: `${label}: already fetched, but adding it to your library failed. Try the cached result above.`,
+						{ id: toastId, duration: TRANSFER_TOAST_MS }
+					);
+					return;
+				}
+
+				// Someone else is already fetching this. Follow their job rather than
+				// starting a second one: nzb2rd queues this account's key against it
+				// too, so the same toast can see it through to RD.
+				trackNzb2rdJob({
+					id: job.jobId,
+					releaseId: result.id,
+					imdbId,
+					title: result.title,
+					returnPath: returnPath(),
+					createdAt: Date.now(),
+				});
+				toast.loading(
+					`${label}: already being fetched for someone else — you get it too.`,
+					{
+						id: toastId,
+						duration: TRANSFER_STEP_TOAST_MS,
+					}
+				);
+				follow(job.jobId);
+				return;
+			}
+
+			// Remembered by this browser so the Transfers page can follow it; the
+			// job itself keeps running server-side either way.
+			trackNzb2rdJob({
+				id: job.id,
+				releaseId: result.id,
+				imdbId,
+				title: result.title,
+				returnPath: returnPath(),
+				createdAt: Date.now(),
+			});
+			setSentIds((prev) => new Set(prev).add(result.id));
+			toast.loading(`${label}: transfer started — track it on the Transfers page.`, {
+				id: toastId,
+				duration: TRANSFER_STEP_TOAST_MS,
+			});
+			follow(job.id);
+		} catch (e) {
+			toast.error(`${label}: ${e instanceof Error ? e.message : 'send failed'}`, {
+				id: toastId,
+				duration: TRANSFER_TOAST_MS,
+			});
+		} finally {
+			setSendingIds((prev) => {
+				const next = new Set(prev);
+				next.delete(result.id);
+				return next;
+			});
+		}
+	};
+
+	// Saving the release instead of sending it. Same articles, so the same
+	// download — but the file that lands has been rebuilt without the indexer's
+	// per-download watermark, so nothing in it points back at the account that
+	// grabbed it. Needs no Real-Debrid login: it goes to the user's own SABnzbd
+	// or NZBGet, not through nzb2rd.
+	const download = async (result: UsenetResult) => {
+		if (downloadingIds.has(result.id)) return;
+
+		setDownloadingIds((prev) => new Set(prev).add(result.id));
+		const toastId = toast.loading('Cleaning the NZB…', { duration: TRANSFER_STEP_TOAST_MS });
+		try {
+			const { name, removed } = await downloadCleanNzb(result.id, result.title);
+			toast.success(
+				removed.length > 0
+					? `${name} saved — removed ${removed.join(', ')}`
+					: `${name} saved — the indexer left nothing identifying on it`,
+				{ id: toastId, duration: TRANSFER_TOAST_MS }
+			);
+		} catch (e) {
+			toast.error(`NZB download: ${e instanceof Error ? e.message : 'failed'}`, {
+				id: toastId,
+				duration: TRANSFER_TOAST_MS,
+			});
+		} finally {
+			setDownloadingIds((prev) => {
+				const next = new Set(prev);
+				next.delete(result.id);
+				return next;
+			});
+		}
+	};
+
+	// Both pages read the id straight off router.query, which is undefined on the
+	// first client render; searching then would ask for "undefined" and come back 400.
+	if (!imdbId) return null;
+
+	return (
+		<ReleaseSection
+			heading={
+				// Without Real-Debrid the only thing a row can do is save the NZB.
+				rdKey ? (
+					// The hyphen is a break opportunity, so a narrow screen would otherwise
+					// split the service name across two lines as "Real-" / "Debrid".
+					<>
+						Send to <span className="whitespace-nowrap">Real-Debrid</span>
+					</>
+				) : (
+					'Download NZB'
+				)
+			}
+			collapsedKey="settings:usenetSendCollapsed"
+			count={
+				results === null
+					? null
+					: rowFilter && kept.length !== results.length
+						? `(${kept.length} of ${results.length})`
+						: `(${results.length})`
+			}
+			isLoading={isLoading}
+			status={
+				<>
+					{isLoading && (
+						<p className="px-2 py-3 text-sm text-gray-400">Searching Usenet…</p>
+					)}
+
+					{error && (
+						<div className="flex items-center gap-3 px-2 py-3 text-sm text-red-300">
+							<span>{error}</span>
+							<button
+								type="button"
+								onClick={fetchResults}
+								className="haptic rounded border border-gray-500 px-2 py-1 text-gray-100 hover:bg-gray-700/50"
+							>
+								Retry
+							</button>
+						</div>
+					)}
+
+					{!isLoading && !error && results !== null && results.length === 0 && (
+						<p className="px-2 py-3 text-sm text-gray-400">No Usenet results found.</p>
+					)}
+
+					{!isLoading && !error && !!results?.length && kept.length === 0 && (
+						<p className="px-2 py-3 text-sm text-gray-400">
+							None of the {results.length} Usenet results match the episode picked
+							above.
+						</p>
+					)}
+
+					{!rdKey && kept.length > 0 && !isLoading && !error && (
+						<p className="px-2 py-2 text-sm text-gray-400">
+							<Link
+								href="/realdebrid/login"
+								className="text-blue-400 hover:underline"
+							>
+								Log in with Real-Debrid
+							</Link>{' '}
+							to send these to your library.
+						</p>
+					)}
+				</>
+			}
+			rows={!isLoading && !error ? kept : []}
+			rowKey={(result) => result.id}
+			actions={(result) => {
+				const state = buttonState(result.id, sendingIds, sentIds, transferred, addedIds);
+				return (
+					<>
+						{rdKey && (
+							<button
+								type="button"
+								onClick={() => send(result)}
+								disabled={state.disabled}
+								title={state.title}
+								className={`haptic flex flex-1 flex-col items-start gap-0.5 rounded border px-2 py-1 text-left leading-tight transition-colors duration-200 disabled:cursor-not-allowed ${
+									// Green covers both halves of a finished
+									// fetch — the live "Add to RD" and the
+									// "Added" it becomes — so the colour tracks
+									// "this release exists" rather than
+									// whether the button is still clickable.
+									state.kind === 'cached' || state.kind === 'added'
+										? 'border-green-500 bg-green-900/30 text-green-100 hover:bg-green-900/60 disabled:opacity-60'
+										: state.kind === 'failed'
+											? 'border-red-500 bg-red-900/30 text-red-100 hover:bg-red-900/60'
+											: state.phase
+												? PHASE_STYLES[state.phase]
+												: 'border-gray-500 bg-gray-800/60 text-gray-100 hover:bg-gray-700/50 disabled:opacity-60'
+								}`}
+							>
+								<span className="flex items-center gap-1">
+									{state.kind === 'sending' || state.kind === 'running' ? (
+										<Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+									) : state.kind === 'added' || state.kind === 'sent' ? (
+										<Check className="h-3 w-3 shrink-0" />
+									) : state.kind === 'cached' ? (
+										<Download className="h-3 w-3 shrink-0" />
+									) : state.kind === 'failed' ? (
+										<RotateCw className="h-3 w-3 shrink-0" />
+									) : (
+										<Send className="h-3 w-3 shrink-0" />
+									)}
+									{state.label}
+								</span>
+								{/* Place in line, or how far through the current
+														    stage — the thing that tells a waiting user
+														    whether "not done yet" means minutes or days. */}
+								{state.detail && (
+									<span
+										className={`pl-4 text-xs opacity-70 ${
+											// A failure reason is a sentence, not
+											// a place in line: let it wrap, and cap
+											// it so one long message cannot stretch
+											// the row down the page. Phones show it
+											// on its own line under the buttons.
+											state.kind === 'failed'
+												? 'line-clamp-2 break-words whitespace-normal max-sm:hidden'
+												: ''
+										}`}
+									>
+										{state.detail}
+									</span>
+								)}
+							</button>
+						)}
+						{/* Always live, unlike Send: a release someone else already
+											    fetched is still one this user can save, and no Real-Debrid
+											    login is involved either way. */}
+						<button
+							type="button"
+							onClick={() => download(result)}
+							disabled={downloadingIds.has(result.id)}
+							title="Download the NZB, cleaned of the indexer’s watermark"
+							aria-label={`Download clean NZB for ${result.title}`}
+							className={`haptic flex items-center gap-1 rounded border border-gray-500 bg-gray-800/60 px-2 text-gray-100 transition-colors duration-200 hover:bg-gray-700/50 disabled:cursor-not-allowed disabled:opacity-60 ${
+								rdKey ? 'shrink-0' : 'flex-1 py-1'
+							}`}
+						>
+							{downloadingIds.has(result.id) ? (
+								<Loader2 className="h-3.5 w-3.5 animate-spin" />
+							) : (
+								<FileDown className="h-3.5 w-3.5" />
+							)}
+							{/* The row's only button then, so it says what it is. */}
+							{!rdKey && 'NZB'}
+						</button>
+					</>
+				);
+			}}
+			note={(result) => {
+				if (!rdKey) return null;
+				const state = buttonState(result.id, sendingIds, sentIds, transferred, addedIds);
+				return state.kind === 'failed' && state.detail ? state.detail : null;
+			}}
+		/>
+	);
+};
+
+export default UsenetResults;

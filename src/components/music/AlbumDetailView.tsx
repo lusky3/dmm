@@ -1,0 +1,232 @@
+import { MusicAlbum, MusicTrack } from '@/pages/api/music/library';
+import { ChevronLeft, Disc3, Download, ListEnd, Loader2, Play } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import DownloadAlbumModal from './DownloadAlbumModal';
+import TrackListItem from './TrackListItem';
+import { PlayerState, QueuedTrack } from './types';
+import { formatSize } from './utils';
+
+interface AlbumDetailViewProps {
+	album: MusicAlbum;
+	currentTrack: QueuedTrack | null;
+	playerState: PlayerState;
+	onPlay: (album: MusicAlbum, startIndex?: number) => void;
+	onAddToQueue: (album: MusicAlbum) => void;
+	onPlayNext: (album: MusicAlbum) => void;
+	onPlayTrackNext: (track: MusicTrack, album: MusicAlbum) => void;
+	onBack: () => void;
+	onDownload: (track: MusicTrack) => Promise<void>;
+	onDownloadAlbum: (album: MusicAlbum) => Promise<void>;
+	hasQueue: boolean;
+	onCoverLoaded?: (album: MusicAlbum, coverUrl: string) => void;
+}
+
+export default function AlbumDetailView({
+	album,
+	currentTrack,
+	playerState,
+	onPlay,
+	onAddToQueue,
+	onPlayNext,
+	onPlayTrackNext,
+	onBack,
+	onDownload,
+	onDownloadAlbum,
+	hasQueue,
+	onCoverLoaded,
+}: AlbumDetailViewProps) {
+	const [coverUrl, setCoverUrl] = useState(album.coverUrl);
+	const [isDownloadingAlbum, setIsDownloadingAlbum] = useState(false);
+	const [showDownloadConfirm, setShowDownloadConfirm] = useState(false);
+
+	useEffect(() => {
+		setCoverUrl(album.coverUrl);
+	}, [album.coverUrl]);
+
+	useEffect(() => {
+		if (coverUrl || !onCoverLoaded) return;
+		let isCancelled = false;
+		const handleCoverLoaded = onCoverLoaded;
+
+		async function fetchCover() {
+			try {
+				const response = await fetch('/api/music/cover', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/json' },
+					body: JSON.stringify({
+						mbid: album.mbid,
+						artist: album.artist,
+						album: album.album,
+					}),
+				});
+				if (!response.ok) return;
+				const data = await response.json();
+				if (!isCancelled && data.coverUrl) {
+					setCoverUrl(data.coverUrl);
+					handleCoverLoaded(album, data.coverUrl);
+				}
+			} catch (err) {
+				console.error(`Failed to fetch cover for ${album.album}:`, err);
+			}
+		}
+
+		fetchCover();
+		return () => {
+			isCancelled = true;
+		};
+	}, [album, coverUrl, onCoverLoaded]);
+
+	// The browser gates a burst of downloads behind a "download multiple files"
+	// prompt, so warn before starting instead of silently saving only track one.
+	const handleAlbumDownload = async () => {
+		if (isDownloadingAlbum) return;
+		setShowDownloadConfirm(false);
+		setIsDownloadingAlbum(true);
+		try {
+			await onDownloadAlbum(album);
+		} finally {
+			setIsDownloadingAlbum(false);
+		}
+	};
+
+	return (
+		<div className="relative min-h-full">
+			{/* Ambient background gradient */}
+			<div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-green-900/30 via-gray-900/80 to-transparent" />
+
+			<div className="relative z-10 p-4 pb-32 md:p-8">
+				{/* Back button */}
+				<button
+					type="button"
+					onClick={onBack}
+					className="mb-6 flex items-center gap-2 rounded-full bg-white/10 px-4 py-2 text-sm font-medium text-white backdrop-blur-sm transition-all duration-200 hover:bg-white/20 active:scale-95"
+				>
+					<ChevronLeft className="h-4 w-4" />
+					Back to Albums
+				</button>
+
+				{/* Album header */}
+				<div className="flex flex-col gap-8 md:flex-row md:items-end">
+					<div className="relative mx-auto h-48 w-48 shrink-0 overflow-hidden rounded-xl bg-gray-800 shadow-[0_8px_32px_rgba(0,0,0,0.5)] transition-transform duration-300 hover:scale-[1.02] md:mx-0 md:h-64 md:w-64">
+						{/* Fallback icon */}
+						<div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-gray-700 to-gray-800">
+							<Disc3 className="h-24 w-24 text-gray-500" />
+						</div>
+						{/* Album cover */}
+						{coverUrl && (
+							// oxlint-disable-next-line nextjs/no-img-element
+							<img
+								src={coverUrl}
+								alt={album.album}
+								className="absolute inset-0 z-10 h-full w-full object-cover"
+								onError={(e) => {
+									(e.target as HTMLImageElement).style.display = 'none';
+								}}
+							/>
+						)}
+					</div>
+
+					<div className="flex flex-col items-center gap-4 text-center md:items-start md:text-left">
+						<div>
+							<span className="text-xs font-bold tracking-wider text-green-500 uppercase">
+								Album
+							</span>
+							<h2 className="mt-2 text-2xl font-black tracking-tight text-white sm:text-4xl md:text-6xl md:leading-tight">
+								{album.album}
+							</h2>
+						</div>
+
+						<div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 text-sm font-medium text-gray-300 md:justify-start">
+							<span className="text-white">{album.artist}</span>
+							{album.year && (
+								<>
+									<span className="text-gray-600">&middot;</span>
+									<span>{album.year}</span>
+								</>
+							)}
+							<span className="text-gray-600">&middot;</span>
+							<span>{album.trackCount} songs</span>
+							<span className="text-gray-600">&middot;</span>
+							<span className="text-gray-400">{formatSize(album.totalBytes)}</span>
+						</div>
+
+						<div className="mt-4 flex flex-wrap justify-center gap-3 md:justify-start">
+							<button
+								type="button"
+								onClick={() => onPlay(album)}
+								className="flex items-center gap-2 rounded-full bg-green-500 px-8 py-3.5 font-bold text-black shadow-lg shadow-green-500/25 transition-all duration-200 hover:scale-105 hover:bg-green-400 active:scale-95"
+							>
+								<Play className="h-5 w-5" fill="currentColor" />
+								Play
+							</button>
+							<button
+								type="button"
+								onClick={() => onAddToQueue(album)}
+								className="flex items-center gap-2 rounded-full border border-gray-600 bg-white/5 px-6 py-3.5 font-bold text-white backdrop-blur-sm transition-all duration-200 hover:border-white/30 hover:bg-white/10 active:scale-95"
+							>
+								Add to Queue
+							</button>
+							<button
+								type="button"
+								onClick={() => setShowDownloadConfirm(true)}
+								disabled={isDownloadingAlbum}
+								className="flex items-center gap-2 rounded-full border border-gray-600 bg-white/5 px-6 py-3.5 font-bold text-white backdrop-blur-sm transition-all duration-200 hover:border-white/30 hover:bg-white/10 active:scale-95 disabled:cursor-wait disabled:opacity-70"
+							>
+								{isDownloadingAlbum ? (
+									<Loader2 className="h-5 w-5 animate-spin" />
+								) : (
+									<Download className="h-5 w-5" />
+								)}
+								Download Album
+							</button>
+							{hasQueue && (
+								<button
+									type="button"
+									onClick={() => onPlayNext(album)}
+									className="flex items-center gap-2 rounded-full border border-gray-600 bg-white/5 px-6 py-3.5 font-bold text-white backdrop-blur-sm transition-all duration-200 hover:border-white/30 hover:bg-white/10 active:scale-95"
+								>
+									<ListEnd className="h-5 w-5" />
+									Play Next
+								</button>
+							)}
+						</div>
+					</div>
+				</div>
+
+				{/* Track list */}
+				<div className="mt-8 md:mt-12">
+					<div className="mb-4 grid grid-cols-[40px_1fr_auto_auto] gap-4 border-b border-white/10 px-4 py-2 text-xs font-medium tracking-wider text-gray-400 uppercase">
+						<span className="text-center">#</span>
+						<span>Title</span>
+						<span className="text-right">Size</span>
+						<span className="w-7" />
+					</div>
+
+					<div className="flex flex-col gap-0.5">
+						{album.tracks.map((track, index) => (
+							<TrackListItem
+								key={track.id}
+								track={track}
+								index={index}
+								album={album}
+								isCurrentTrack={currentTrack?.track.id === track.id}
+								isPlaying={playerState.isPlaying}
+								onPlay={() => onPlay(album, index)}
+								onDownload={onDownload}
+								onPlayNext={hasQueue ? onPlayTrackNext : undefined}
+							/>
+						))}
+					</div>
+				</div>
+			</div>
+
+			{showDownloadConfirm && (
+				<DownloadAlbumModal
+					album={album}
+					onConfirm={handleAlbumDownload}
+					onClose={() => setShowDownloadConfirm(false)}
+				/>
+			)}
+		</div>
+	);
+}

@@ -1,0 +1,223 @@
+import handler from '@/pages/api/stremio/cast/movie/[imdbid]';
+import { createMockRequest, createMockResponse } from '@/test/utils/api';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import rdUrl from '../../../../fixtures/rd-cast-stream-url.json';
+
+const { mockSaveCast, mockGenerateUserId, mockGetBiggestFileStreamUrl } = vi.hoisted(() => ({
+	mockSaveCast: vi.fn(),
+	mockGenerateUserId: vi.fn(),
+	mockGetBiggestFileStreamUrl: vi.fn(),
+}));
+
+vi.mock('@/services/repository', () => ({
+	repository: {
+		saveCast: mockSaveCast,
+	},
+}));
+
+vi.mock('@/utils/castApiHelpers', async () => {
+	const actual =
+		await vi.importActual<typeof import('@/utils/castApiHelpers')>('@/utils/castApiHelpers');
+	return {
+		...actual,
+		generateUserId: mockGenerateUserId,
+	};
+});
+
+vi.mock('@/utils/getStreamUrl', () => ({
+	getBiggestFileStreamUrl: mockGetBiggestFileStreamUrl,
+}));
+
+describe('/api/stremio/cast/movie/[imdbid]', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it('validates required query parameters', async () => {
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer abc' },
+			query: { imdbid: 'tt123' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing "token" or "hash" parameter',
+		});
+	});
+
+	// Card 428: test 2's cast of The Prestige was saved on 2026-10-12, then RD
+	// answered 451 infringing_file for its link and Stremio never listed it.
+	it('refuses a file whose name Real-Debrid refuses, instead of saving a cast Stremio hides', async () => {
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockGetBiggestFileStreamUrl.mockResolvedValue([
+			'https://23-4.download.real-debrid.com/d/AAAAAAAAAAAAA/The.Prestige.2006.1080p.BluRay.x264-%5BYTS.AM%5D.mp4',
+			'https://real-debrid.com/d/AAAAAAAAAAAAA',
+			1700,
+		]);
+		const req = createMockRequest({
+			query: { imdbid: 'tt0482571', hash: 'aaa47382b2e6834cd487d0858bcd502d40145f7e' },
+			headers: { authorization: 'Bearer token-abc', 'x-real-ip': '127.0.0.1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockSaveCast).not.toHaveBeenCalled();
+		expect(res.status).toHaveBeenCalledWith(422);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: expect.stringContaining(
+				'The.Prestige.2006.1080p.BluRay.x264-[YTS.AM].mp4'
+			),
+		});
+	});
+
+	it('unrestricts the biggest RD file and saves it to the repository', async () => {
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockGetBiggestFileStreamUrl.mockResolvedValue([
+			'https://files.example.com/Video.mkv',
+			'https://rd.example.com/link',
+			900,
+		]);
+
+		const req = createMockRequest({
+			query: { imdbid: 'tt1234567', hash: 'hashabc' },
+			headers: { authorization: 'Bearer token-abc', 'x-real-ip': '127.0.0.1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockGenerateUserId).toHaveBeenCalledWith('token-abc');
+		expect(mockGetBiggestFileStreamUrl).toHaveBeenCalledWith(
+			'token-abc',
+			'hashabc',
+			'127.0.0.1'
+		);
+		expect(mockSaveCast).toHaveBeenCalledWith(
+			'tt1234567',
+			'user-1',
+			'hashabc',
+			'https://files.example.com/Video.mkv',
+			'https://rd.example.com/link',
+			900
+		);
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'success',
+			message: 'You can now stream the movie in Stremio',
+			filename: 'Video.mkv',
+		});
+	});
+
+	// RD download URLs end in the percent-encoded filename, and the cast toast
+	// showed it raw: "Casted Big%20Buck%20Bunny%20%282008%29... to Stremio."
+	it('answers the decoded filename of a real RD download URL', async () => {
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockGetBiggestFileStreamUrl.mockResolvedValue([
+			rdUrl.streamUrl,
+			'https://rd.example.com/link',
+			2480,
+		]);
+
+		const req = createMockRequest({
+			query: { imdbid: 'tt1254207', hash: 'hashabc' },
+			headers: { authorization: 'Bearer token-abc', 'x-real-ip': '127.0.0.1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.json).toHaveBeenCalledWith(
+			expect.objectContaining({ filename: 'Big Buck Bunny (2008) [1080p] BDRemux.m2ts' })
+		);
+	});
+
+	it('returns 500 when stream url acquisition fails', async () => {
+		mockGetBiggestFileStreamUrl.mockRejectedValue(new Error('rd offline'));
+
+		const req = createMockRequest({
+			query: { imdbid: 'tt7654321', hash: 'hashabc' },
+			headers: { authorization: 'Bearer token-abc', 'x-real-ip': '10.0.0.2' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(500);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'rd offline',
+		});
+	});
+
+	// Regression: an empty stream url fell straight out of the `if` with no
+	// `else` and no fall-through response, so the handler returned without ever
+	// answering and the request hung until something upstream timed it out.
+	it('answers instead of hanging when no stream url comes back', async () => {
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockGetBiggestFileStreamUrl.mockResolvedValue(['', '', 0]);
+
+		const req = createMockRequest({
+			query: { imdbid: 'tt123', hash: 'hash' },
+			headers: { authorization: 'Bearer token', 'x-real-ip': '1.1.1.1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(500);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Failed to cast, no streamUrl',
+		});
+		expect(mockSaveCast).not.toHaveBeenCalled();
+	});
+
+	it('accepts token via Authorization Bearer header instead of query', async () => {
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockGetBiggestFileStreamUrl.mockResolvedValue([
+			'https://files.example.com/Video.mkv',
+			'https://rd.example.com/link',
+			900,
+		]);
+
+		const req = createMockRequest({
+			query: { imdbid: 'tt1234567', hash: 'hashabc' },
+			headers: {
+				authorization: 'Bearer header-token',
+				'x-real-ip': '127.0.0.1',
+			},
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockGenerateUserId).toHaveBeenCalledWith('header-token');
+		expect(mockGetBiggestFileStreamUrl).toHaveBeenCalledWith(
+			'header-token',
+			'hashabc',
+			'127.0.0.1'
+		);
+		expect(res.status).toHaveBeenCalledWith(200);
+	});
+
+	it('returns 400 when no token is provided via any source', async () => {
+		const req = createMockRequest({
+			query: { imdbid: 'tt1', hash: 'hashabc' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing "token" or "hash" parameter',
+		});
+	});
+});

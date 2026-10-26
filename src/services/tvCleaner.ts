@@ -4,13 +4,12 @@ import {
 	getSeasonNameAndCode,
 	getSeasonYear,
 	grabTvMetadata,
-	matchesTitle,
 	meetsTitleConditions,
 	padWithZero,
 } from '@/utils/checks';
-import axios from 'axios';
-import { ScrapeSearchResult, flattenAndRemoveDuplicates, sortByFileSize } from './mediasearch';
-import { PlanetScaleCache } from './planetscale';
+import { getMdblistClient } from './mdblistClient';
+import { flattenAndRemoveDuplicates, ScrapeSearchResult, sortByFileSize } from './mediasearch';
+import { Repository } from './repository';
 
 type TvScrapeJob = {
 	titles: string[];
@@ -23,12 +22,10 @@ type TvScrapeJob = {
 	scrapes: ScrapeSearchResult[];
 };
 
-const db = new PlanetScaleCache();
+const mdblistClient = getMdblistClient();
 const tmdbKey = process.env.TMDB_KEY;
 const getTmdbSearch = (imdbId: string) =>
 	`https://api.themoviedb.org/3/find/${imdbId}?api_key=${tmdbKey}&external_source=imdb_id`;
-const mdbKey = process.env.MDBLIST_KEY;
-const getMdbInfo = (imdbId: string) => `https://mdblist.com/api/?apikey=${mdbKey}&i=${imdbId}`;
 const getTmdbTvInfo = (tmdbId: string) =>
 	`https://api.themoviedb.org/3/tv/${tmdbId}?api_key=${tmdbKey}`;
 
@@ -39,41 +36,6 @@ function convertMdbToTmdb(apiResponse: any) {
 		release_date: apiResponse.released,
 		// original_title: apiResponse.original_title, // This field does not exist in the provided API response
 	};
-}
-
-export async function cleanByImdbId(imdbId: string) {
-	let tmdbSearch, mdbInfo;
-	try {
-		tmdbSearch = await axios.get(getTmdbSearch(imdbId));
-		mdbInfo = await axios.get(getMdbInfo(imdbId));
-	} catch (error: any) {
-		console.error(error);
-		return;
-	}
-
-	const isTv = mdbInfo.data.type === 'show' || tmdbSearch.data.tv_results?.length > 0;
-	if (isTv) {
-		try {
-			const tmdbId = mdbInfo.data.tmdbid ?? tmdbSearch.data.tv_results[0]?.id;
-			const tmdbInfo = await axios.get(getTmdbTvInfo(tmdbId));
-			await cleanTvScrapes(imdbId, tmdbInfo.data, mdbInfo.data, db);
-			return;
-		} catch (error: any) {
-			if (error.response?.status === 404 || error.message.includes("reading 'id'")) {
-				try {
-					const convertedMdb = convertMdbToTmdb(mdbInfo.data);
-					await cleanTvScrapes(imdbId, convertedMdb, mdbInfo.data, db);
-					return;
-				} catch (error: any) {
-					console.error(error);
-				}
-			} else {
-				console.error(error);
-				return;
-			}
-		}
-	}
-	return;
 }
 
 function cleanScrapes(
@@ -91,12 +53,7 @@ const cleanBasedOnScrapeJob = (job: TvScrapeJob): ScrapeSearchResult[][] => {
 	});
 };
 
-export async function cleanTvScrapes(
-	imdbId: string,
-	tmdbData: any,
-	mdbData: any,
-	db: PlanetScaleCache
-) {
+export async function cleanTvScrapes(imdbId: string, tmdbData: any, mdbData: any, db: Repository) {
 	const {
 		cleanTitle,
 		originalTitle,
@@ -130,7 +87,7 @@ export async function cleanTvScrapes(
 		}
 		const scrapesCount = scrapes.length;
 		if (!scrapes.length) {
-			console.log(`⚠️ No results for ${cleanTitle} s${padWithZero(seasonNumber)}`);
+			console.log(`⚠️ No results for ${cleanTitle} S${padWithZero(seasonNumber)}}`);
 			return;
 		}
 
@@ -147,9 +104,7 @@ export async function cleanTvScrapes(
 			await db.saveScrapedResults(`tv:${imdbId}:${seasonNumber}`, scrapes, false, true);
 			await db.markAsDone(imdbId);
 			console.log(
-				`⚠️ Preliminary procedure removed all results left for ${cleanTitle} s${padWithZero(
-					seasonNumber
-				)}`
+				`⚠️ Preliminary procedure removed all results left for ${cleanTitle} S${padWithZero(seasonNumber)}`
 			);
 			continue;
 		}
@@ -167,38 +122,23 @@ export async function cleanTvScrapes(
 		let processedResults = flattenAndRemoveDuplicates(searchResults);
 		processedResults = sortByFileSize(processedResults);
 		if (processedResults.length < scrapesCount) {
-			await db.saveScrapedResults(
-				`tv:${imdbId}:${seasonNumber}`,
-				processedResults,
-				true,
-				true
-			);
-			await db.markAsDone(imdbId);
-			const years = [year, seasonYear].filter((y) => y !== undefined) as string[];
+			// await db.saveScrapedResults(
+			// 	`tv:${imdbId}:${seasonNumber}`,
+			// 	processedResults,
+			// 	true,
+			// 	true
+			// );
+			// await db.markAsDone(imdbId);
 			console.log(
-				scrapes
-					.filter((s) => !processedResults.find((p) => p.hash === s.hash))
-					.map(
-						(s) =>
-							`⚡ ${s.title} ${
-								titles.some((t) => matchesTitle(t, years, s.title)) ? '✅' : '❌'
-							}`
-					)
-			);
-			console.log(
-				`📺 Removed ${scrapesCount - processedResults.length}, left ${
+				`🌟 Removed ${scrapesCount - processedResults.length}, left ${
 					processedResults.length
-				} results for ${cleanTitle} s${padWithZero(seasonNumber)}`
+				} results for ${cleanTitle} S${padWithZero(seasonNumber)}}`
 			);
 			return;
 		}
+
 		console.log(
-			scrapes.map(
-				(s) =>
-					`🔋 ${s.title} ${
-						titles.some((t) => matchesTitle(t, [year], s.title)) ? '✅' : '❌'
-					}`
-			)
+			`📺 Retained ${processedResults.length} results for ${cleanTitle} S${padWithZero(seasonNumber)}}`
 		);
 	}
 }

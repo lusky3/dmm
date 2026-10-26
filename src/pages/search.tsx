@@ -1,4 +1,10 @@
+import { animeTypeLabel } from '@/components/AnimeEntryLinks';
 import Poster from '@/components/poster';
+import { useCachedList } from '@/hooks/useCachedList';
+import type { AnimeSearchResult } from '@/services/database/anime';
+import { animePagePath } from '@/utils/anidbId';
+import { getLocalStorageBoolean } from '@/utils/browserStorage';
+import { toasterPosition } from '@/utils/toastOptions';
 import { withAuth } from '@/utils/withAuth';
 import getConfig from 'next/config';
 import Head from 'next/head';
@@ -10,21 +16,65 @@ import { SearchResult } from './api/search/title';
 
 function Search() {
 	const { publicRuntimeConfig: config } = getConfig();
-	const [query, setQuery] = useState('');
 	const [typedQuery, setTypedQuery] = useState('');
-	const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
-	const [loading, setLoading] = useState(false);
-	const [errorMessage, setErrorMessage] = useState('');
-	const [miscResults, setMiscResults] = useState<Record<string, string[]>>({});
-
 	const router = useRouter();
+
+	const rawQuery = router.query.query;
+	const query = typeof rawQuery === 'string' ? rawQuery : '';
+
+	useEffect(() => {
+		if (query && typedQuery !== query) setTypedQuery(query);
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [query]);
+
+	const { data, loading, error, reset } = useCachedList<SearchResult[]>(
+		query ? `search:${query}` : null,
+		async () => {
+			try {
+				let path = `api/search/title?keyword=${encodeURIComponent(query)}`;
+				if (config.externalSearchApiHostname) {
+					path = encodeURIComponent(path);
+				}
+				const endpoint = `${config.externalSearchApiHostname || ''}/${path}`;
+				const res = await fetch(endpoint);
+				const body = await res.json();
+				if (body.errorMessage) throw new Error(body.errorMessage);
+				return body.results ?? [];
+			} catch (err) {
+				console.error('[Search] fetchData failed', { query, error: err });
+				throw err;
+			}
+		}
+	);
+
+	const searchResults = data ?? [];
+
+	// AniDB entries matching the query, each its own anime page. A season or
+	// OVA with no IMDb id of its own is reachable only this way. A row with no
+	// AniDB id (`anime:mal-N`) has its page at `/anime/mal-N`.
+	const [hideAnime] = useState(() => getLocalStorageBoolean('settings:hideAnime', false));
+	const { data: animeData, loading: animeLoading } = useCachedList<AnimeSearchResult[]>(
+		query && !hideAnime ? `animesearch:${query}` : null,
+		async () => {
+			const res = await fetch(`/api/search/anime?keyword=${encodeURIComponent(query)}`);
+			if (!res.ok) return [];
+			const body = await res.json();
+			return Array.isArray(body?.results) ? body.results : [];
+		}
+	);
+	const animeResults = (animeData ?? []).filter((r) => animePagePath(r.id) !== null);
+	const errorMessage = error
+		? error.message.includes('Failed to fetch search results')
+			? error.message
+			: 'Failed to fetch search results; try again soon.'
+		: '';
 
 	const handleSubmit = useCallback(
 		(e?: React.FormEvent<HTMLFormElement>) => {
 			if (e) e.preventDefault();
 			if (!typedQuery) return;
+			reset();
 			if (/(tt\d{7,})/.test(typedQuery)) {
-				setLoading(true);
 				const imdbid = typedQuery.match(/(tt\d{7,})/)?.[1];
 				router.push(`/x/${imdbid}/`);
 				return;
@@ -33,177 +83,143 @@ function Search() {
 				query: { query: typedQuery },
 			});
 		},
-		[router, typedQuery]
+		[router, typedQuery, reset]
 	);
 
-	useEffect(() => {
-		if (Object.keys(router.query).length === 0) return;
-		const { query: searchQuery } = router.query;
-		const decodedQuery = decodeURIComponent(searchQuery as string);
-		if (typedQuery !== decodedQuery) setTypedQuery(decodedQuery);
-		setQuery(decodedQuery);
-		fetchData(decodedQuery);
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [router.query]);
-
-	const fetchMiscData = async (q: string) => {
-		try {
-			let path = `api/search/misc?keyword=${q}`;
-			if (config.externalSearchApiHostname) {
-				path = encodeURIComponent(path);
-			}
-			let endpoint = `${config.externalSearchApiHostname || ''}/${path}`;
-			const res = await fetch(endpoint);
-			const data = await res.json();
-			if (Object.keys(data).length > 0) setMiscResults(data);
-			else fetchMiscData('');
-		} catch (error: any) {
-			console.error(error);
-		}
-	};
-
-	const fetchData = async (q: string) => {
-		setMiscResults({});
-		setErrorMessage('');
-		setLoading(true);
-		setSearchResults([]);
-		try {
-			let path = `api/search/title?keyword=${q}`;
-			if (config.externalSearchApiHostname) {
-				path = encodeURIComponent(path);
-			}
-			let endpoint = `${config.externalSearchApiHostname || ''}/${path}`;
-			const res = await fetch(endpoint);
-			const data = await res.json();
-			if (data.errorMessage) throw new Error(data.errorMessage);
-			setSearchResults(data.results);
-			if (data.results.length === 0) fetchMiscData(q);
-		} catch (error: any) {
-			setSearchResults([]);
-			setErrorMessage(error.message);
-			fetchMiscData(q);
-		} finally {
-			setLoading(false);
-		}
-	};
-
-	if (
-		!loading &&
-		searchResults.length === 0 &&
-		Object.keys(router.query).length === 0 &&
-		Object.keys(miscResults).length === 0
-	)
-		fetchMiscData('');
-
 	return (
-		<div className="mx-2 my-1 max-w-full">
+		<div className="flex min-h-screen flex-col items-center bg-gray-900 p-4">
 			<Head>
-				<title>Debrid Media Manager - Search: {query}</title>
+				<title>{`Debrid Media Manager - Search: ${query}`}</title>
 			</Head>
-			<Toaster position="bottom-right" />
-			<div className="flex justify-between items-center mb-2">
-				<h1 className="text-xl font-bold">Search</h1>
+			<Toaster position={toasterPosition()} />
+			{/* Header with Go Home button */}
+			<div className="mb-4 flex w-full max-w-3xl items-center justify-between">
+				<h1 className="text-xl font-bold text-white">Search</h1>
 				<Link
 					href="/"
-					className="text-sm bg-cyan-800 hover:bg-cyan-700 text-white py-1 px-2 rounded"
+					className="rounded border-2 border-cyan-500 bg-cyan-900/30 px-2 py-1 text-sm text-cyan-100 transition-colors hover:bg-cyan-800/50"
 				>
 					Go Home
 				</Link>
 			</div>
-			<form onSubmit={handleSubmit}>
-				<div className="flex items-center border-b-2 border-gray-500 py-2 mb-4">
-					<input
-						className="appearance-none bg-transparent border-none w-full text-white mr-3 py-1 px-2 leading-tight focus:outline-none"
-						type="text"
-						id="query"
-						placeholder="e.g. breaking bad show, tt1234567, etc."
-						value={typedQuery}
-						onChange={(e) => setTypedQuery(e.target.value)}
-					/>
-					<button
-						className="flex-shrink-0 bg-gray-700 hover:bg-gray-600 border-gray-700 hover:border-gray-600 text-xs border-4 text-white py-0 px-1 rounded"
-						type="submit"
-					>
-						Search
-					</button>
-				</div>
-			</form>
-			{loading && (
-				<div className="flex justify-center items-center mt-4">
-					<div className="animate-spin rounded-full h-10 w-10 border-t-2 border-b-2 border-blue-500"></div>
-				</div>
-			)}
-			{errorMessage && (
-				<div className="mt-4 bg-red-900 border border-red-400 px-4 py-3 rounded relative">
-					<strong className="font-bold">Error:</strong>
-					<span className="block sm:inline"> {errorMessage}</span>
-				</div>
-			)}
-			{searchResults.length > 0 && (
-				<>
-					<h2 className="text-xl font-bold my-4">
-						Search Results for <span className="text-yellow-500">{query}</span>
-					</h2>
-					<div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2">
-						{searchResults.map((result: SearchResult, i: number) => (
-							<Link
-								key={i}
-								className="text-center items-center cursor-pointer"
-								href={
-									result.type === 'movie'
-										? `/movie/${result.imdbid}`
-										: `/show/${result.imdbid}`
-								}
+			{/* Main content */}
+			<div className="w-full">
+				{/* Search form - keep reasonable width for usability */}
+				<div className="mx-auto max-w-3xl">
+					<form onSubmit={handleSubmit}>
+						<div className="mb-4 flex items-center border-b-2 border-gray-500 py-2">
+							<input
+								className="mr-3 w-full appearance-none border-none bg-transparent px-2 py-1 leading-tight text-white focus:outline-hidden"
+								type="text"
+								id="query"
+								placeholder="e.g. breaking bad show, tt1234567, etc."
+								value={typedQuery}
+								onChange={(e) => setTypedQuery(e.target.value)}
+							/>
+							<button
+								className="haptic-sm shrink-0 rounded border-2 border-gray-500 bg-gray-800/30 px-4 py-2 text-sm font-medium text-gray-100 transition-colors hover:bg-gray-700/50"
+								type="submit"
 							>
-								<Poster imdbId={result.imdbid} title={result.title} />
-								<h3 className="text-lg text-slate-300 font-bold">{result.title}</h3>
-								<div className="text-gray-600 text-sm">{result.year}</div>
-							</Link>
-						))}
+								Search
+							</button>
+						</div>
+					</form>
+				</div>
+				{/* Display loading indicator */}
+				{loading && searchResults.length === 0 && (
+					<div className="mt-4 flex items-center justify-center">
+						<div
+							className="h-10 w-10 animate-spin rounded-full border-t-2 border-b-2 border-blue-500"
+							data-testid="loading-spinner"
+						></div>
 					</div>
-				</>
-			)}
-			{!loading && searchResults.length === 0 && Object.keys(router.query).length !== 0 && (
-				<>
-					<h2 className="text-xl font-bold my-4">
-						No results found for &quot;{query}&quot;
-					</h2>
-				</>
-			)}
-			{!loading && searchResults.length === 0 && Object.keys(miscResults).length > 0 && (
-				<>
-					{Object.keys(miscResults).map((listName: string, idx: number) => {
-						return (
-							<div key={listName}>
-								<h2 className="mt-4 text-xl font-bold" key={idx}>
-									How about results from{' '}
-									<span className="text-yellow-500">{listName}</span>?
-								</h2>
-								<div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2">
-									{miscResults[listName].map((key: string) => {
-										const matches = key.split(':');
-										if (matches.length === 3) {
-											const mediaType = key.split(':')[0];
-											const imdbid = key.split(':')[1];
-											const title = key.split(':')[2];
-
-											return (
-												<Link
-													key={key}
-													href={`/${mediaType}/${imdbid}`}
-													className=""
-												>
-													<Poster imdbId={imdbid} title={title} />
-												</Link>
-											);
-										}
-									})}
-								</div>
-							</div>
-						);
-					})}
-				</>
-			)}
+				)}
+				{/* Display error message */}
+				{errorMessage && (
+					<div className="relative mx-auto mt-4 max-w-3xl rounded border border-red-400 bg-red-900 px-4 py-3">
+						<strong className="font-bold">Error:</strong>
+						<span className="block sm:inline"> {errorMessage}</span>
+					</div>
+				)}
+				{/* Update search results display */}
+				{searchResults.length > 0 && (
+					<>
+						<div className="grid w-full grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8">
+							{searchResults.map((result: SearchResult) => (
+								<Link
+									key={result.imdbid}
+									className="haptic flex flex-col items-center justify-start gap-1 rounded border-2 border-cyan-500 bg-cyan-900/30 p-1.5 text-cyan-100 transition-colors hover:bg-cyan-800/50"
+									href={
+										result.type === 'movie'
+											? `/movie/${result.imdbid}`
+											: `/show/${result.imdbid}`
+									}
+								>
+									<Poster imdbId={result.imdbid} title={result.title} />
+									<h3
+										className="line-clamp-2 text-center text-sm font-bold text-slate-300"
+										title={result.title}
+									>
+										{result.title}
+									</h3>
+									<div className="text-xs text-gray-400">{result.year}</div>
+								</Link>
+							))}
+						</div>
+					</>
+				)}
+				{animeResults.length > 0 && (
+					<div data-testid="anime-search-results">
+						<h2 className="mx-auto my-4 max-w-3xl text-xl font-bold">
+							Anime entries for <span className="text-yellow-500">{query}</span>
+						</h2>
+						<div className="grid w-full grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8">
+							{animeResults.map((result) => {
+								const type = animeTypeLabel(result.type);
+								return (
+									<Link
+										key={result.id}
+										className="haptic flex flex-col items-center justify-start gap-1 rounded border-2 border-fuchsia-500 bg-fuchsia-900/30 p-1.5 text-fuchsia-100 transition-colors hover:bg-fuchsia-800/50"
+										href={animePagePath(result.id)!}
+									>
+										{/* oxlint-disable-next-line nextjs/no-img-element */}
+										<img
+											src={result.poster_url}
+											alt={`${result.title} poster`}
+											loading="lazy"
+											className="aspect-[2/3] w-full rounded object-cover"
+											// A third of the old Kitsu posters are gone from both of
+											// Kitsu's hosts; keep the card's shape, not the alt text.
+											onError={(e) => {
+												e.currentTarget.style.visibility = 'hidden';
+											}}
+										/>
+										<h3
+											className="line-clamp-2 text-center text-sm font-bold text-slate-300"
+											title={result.title}
+										>
+											{result.title}
+										</h3>
+										{type && (
+											<div className="text-xs text-fuchsia-300">{type}</div>
+										)}
+									</Link>
+								);
+							})}
+						</div>
+					</div>
+				)}
+				{/* No results found message */}
+				{!loading &&
+					!animeLoading &&
+					searchResults.length === 0 &&
+					animeResults.length === 0 &&
+					query && (
+						<h2 className="mx-auto my-4 max-w-3xl text-xl font-bold">
+							No results found for &quot;{query}&quot;
+						</h2>
+					)}
+			</div>
 		</div>
 	);
 }

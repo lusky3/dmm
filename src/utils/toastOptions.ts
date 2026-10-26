@@ -1,34 +1,37 @@
-export const globalToastOptions = {
+const globalToastOptions = {
 	style: {
 		borderRadius: '10px',
 		background: 'rgba(255, 255, 0, 0.85)',
 		color: '#000',
 		fontSize: '1rem',
 		padding: '0.1rem',
+		// Passive notifications must not intercept controls underneath them.
+		pointerEvents: 'none' as const,
 	},
 };
 
 export const searchToastOptions = {
 	...globalToastOptions,
-	icon: '🔍',
 };
 
 export const libraryToastOptions = {
 	...globalToastOptions,
-	icon: '📚',
 };
 
 export const genericToastOptions = {
 	...globalToastOptions,
-	icon: '📢',
 };
 
 export const magnetToastOptions = {
 	...globalToastOptions,
-	icon: '🧲',
 };
 
 export const castToastOptions = {
 	...globalToastOptions,
-	icon: '🪄',
 };
+
+/** Phones get toasts at the top: along the bottom they covered result buttons. */
+export const toasterPosition = (): 'top-center' | 'bottom-right' =>
+	typeof window !== 'undefined' && window.matchMedia?.('(max-width: 639px)')?.matches
+		? 'top-center'
+		: 'bottom-right';

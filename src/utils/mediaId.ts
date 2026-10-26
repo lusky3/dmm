@@ -1,4 +1,5 @@
 import { ParsedMovie, ParsedShow } from '@ctrl/video-filename-parser';
+import { deburr, replace, toLower } from 'lodash';
 
 // Prefixes a number with a character and leading zero if necessary
 const prefix = (char: string, num: number): string => `${char}${num < 10 ? '0' : ''}${num}`;
@@ -12,9 +13,13 @@ function isArrayContinuouslyIncreasing(array: number[]) {
 	return true;
 }
 
+export function normalize(str: string) {
+	return replace(toLower(deburr(str)), /[^a-z0-9\p{L}\p{N}]/gu, '');
+}
+
 export const getMediaId = (
 	info: ParsedMovie | ParsedShow | string,
-	mediaType: 'tv' | 'movie',
+	mediaType: 'tv' | 'movie' | 'other',
 	systemOnlyId = true,
 	tvShowTitleOnly = false
 ) => {

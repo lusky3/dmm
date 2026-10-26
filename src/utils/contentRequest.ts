@@ -1,0 +1,293 @@
+import { safeReturnPath } from './transferContext';
+
+/**
+ * The rules a content request obeys, kept away from Prisma and HTTP.
+ *
+ * A request pairs two people who each hold half of what the uploader needs: the
+ * asker's Real-Debrid account for where the release lands, and a fulfiller's
+ * TorBox or AllDebrid account for where the bytes come from. Everything here is
+ * pure so the pairing rules — who may act, and when — are assertable without a
+ * database or a debrid host.
+ */
+
+export const REQUEST_STATUSES = [
+	'open',
+	'claimed',
+	'fulfilled',
+	'failed',
+	'cancelled',
+	'stalled',
+] as const;
+export type RequestStatus = (typeof REQUEST_STATUSES)[number];
+
+export const MEDIA_TYPES = ['movie', 'show'] as const;
+export type MediaType = (typeof MEDIA_TYPES)[number];
+
+/** Longer than any real release name, short enough that the column stays sane. */
+const MAX_TITLE = 500;
+
+export interface ContentRequestInput {
+	hash: string;
+	imdbId: string;
+	title?: string | null;
+	mediaType: string;
+	sizeBytes?: number | null;
+	returnPath?: string | null;
+}
+
+export interface ValidRequest {
+	hash: string;
+	imdbId: string;
+	title: string | null;
+	mediaType: MediaType;
+	/** Whole release in bytes, when the page knew it. */
+	sizeBytes: number | null;
+	/** The DMM page it was asked from, when that is a page we recognise. */
+	returnPath: string | null;
+}
+
+export class RequestValidationError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'RequestValidationError';
+	}
+}
+
+/**
+ * A 40-character info hash, lowercased.
+ *
+ * Lowercasing is what makes `@@unique([hash, requesterId])` mean anything —
+ * trackers and the DMM UI hand back the same hash in either case, and two
+ * casings of one release would otherwise be two rows nothing could reconcile.
+ */
+export function normalizeHash(raw: unknown): string {
+	if (typeof raw !== 'string') throw new RequestValidationError('hash is required');
+	const hash = raw.trim().toLowerCase();
+	if (!/^[0-9a-f]{40}$/.test(hash)) {
+		throw new RequestValidationError('hash must be a 40-character info hash');
+	}
+	return hash;
+}
+
+export function normalizeImdbId(raw: unknown): string {
+	if (typeof raw !== 'string') throw new RequestValidationError('imdbId is required');
+	const id = raw.trim().toLowerCase();
+	if (!/^tt\d{7,10}$/.test(id)) {
+		throw new RequestValidationError('imdbId must look like tt1234567');
+	}
+	return id;
+}
+
+export function normalizeMediaType(raw: unknown): MediaType {
+	const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+	if ((MEDIA_TYPES as readonly string[]).includes(value)) return value as MediaType;
+	throw new RequestValidationError(`mediaType must be one of: ${MEDIA_TYPES.join(', ')}`);
+}
+
+/** Cosmetic only — the uploader re-derives the real name from the torrent. */
+export function normalizeTitle(raw: unknown): string | null {
+	if (typeof raw !== 'string') return null;
+	const title = raw.trim().replace(/\s+/g, ' ');
+	if (title === '') return null;
+	return title.length > MAX_TITLE ? title.slice(0, MAX_TITLE) : title;
+}
+
+/** A size is a hint for routing and the cap; anything unusable is dropped. */
+export function normalizeSize(raw: unknown): number | null {
+	if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null;
+	return Math.round(raw);
+}
+
+export function parseRequestInput(body: unknown): ValidRequest {
+	const input = (body ?? {}) as Partial<ContentRequestInput>;
+	return {
+		hash: normalizeHash(input.hash),
+		imdbId: normalizeImdbId(input.imdbId),
+		title: normalizeTitle(input.title),
+		mediaType: normalizeMediaType(input.mediaType),
+		sizeBytes: normalizeSize(input.sizeBytes),
+		returnPath: safeReturnPath(input.returnPath) ?? null,
+	};
+}
+
+/**
+ * Which statuses a fulfiller may act on.
+ *
+ * `claimed` is absent on purpose: a second fulfiller arriving mid-transfer
+ * would spend their own TorBox quota re-fetching a release already on its way,
+ * and the loser of that race has no way to get it back.
+ *
+ * `failed` is present, because a failed attempt says the *fulfiller* could not
+ * serve it, not that nobody can — a different account may well have it cached.
+ */
+const CLAIMABLE: ReadonlySet<string> = new Set<RequestStatus>(['open', 'failed']);
+
+export function isClaimable(status: string): boolean {
+	return CLAIMABLE.has(status);
+}
+
+export interface ClaimSubject {
+	status: string;
+	requesterId: string;
+}
+
+export type ClaimVerdict = { ok: true } | { ok: false; code: number; reason: string };
+
+/**
+ * May this fulfiller take this request?
+ *
+ * Self-fulfilment is refused rather than allowed-but-pointless. Someone holding
+ * both halves never needed the board — they can submit to the uploader directly
+ * — and letting them claim their own row turns a queue other people can serve
+ * into a private one, while making the board look busier than it is.
+ */
+export function canClaim(request: ClaimSubject, fulfillerId: string): ClaimVerdict {
+	if (!isClaimable(request.status)) {
+		return { ok: false, code: 409, reason: `request is ${request.status}` };
+	}
+	if (request.requesterId === fulfillerId) {
+		return {
+			ok: false,
+			code: 400,
+			reason: 'you already hold both halves — submit it directly instead',
+		};
+	}
+	return { ok: true };
+}
+
+export interface SourceKeys {
+	torboxApiKey?: string | null;
+}
+
+/**
+ * The fulfiller's half of the pair.
+ *
+ * Mirrors the uploader's own rule — it refuses a job carrying no cache source —
+ * so the failure is a 400 here rather than a job that dies on arrival.
+ */
+export function pickSourceKeys(keys: SourceKeys): { tb_api_key: string } {
+	const torbox = typeof keys.torboxApiKey === 'string' ? keys.torboxApiKey.trim() : '';
+	if (!torbox) {
+		throw new RequestValidationError('a TorBox key is required to fulfil');
+	}
+	return { tb_api_key: torbox };
+}
+
+/** What the board shows. Never the ids of the people involved, nor any key. */
+export interface PublicRequest {
+	id: string;
+	hash: string;
+	imdbId: string;
+	title: string | null;
+	mediaType: string;
+	status: string;
+	createdAt: string;
+	/** True only for the caller's own rows, so the UI can offer a cancel. */
+	mine: boolean;
+	/** Present once a transfer exists, so the asker can follow it. */
+	jobId: string | null;
+	/**
+	 * Whether TorBox has the release cached, asked with the viewer's own key.
+	 * `null` when the viewer sent no key or TorBox gave no answer.
+	 */
+	tbCached: boolean | null;
+	/**
+	 * Why the last attempt failed. The asker sees the stored reason verbatim;
+	 * everyone else sees it too unless it describes the asker's Real-Debrid
+	 * credentials, which {@link publicError} replaces with a neutral line.
+	 */
+	error: string | null;
+	/** How many people asked for this release. One send reaches them all. */
+	wantedBy: number;
+	/** The asker thanked whoever sent it. */
+	thanked: boolean;
+	/** The caller asked, somebody sent it, and no thanks has gone yet. */
+	canThank: boolean;
+}
+
+export interface StoredRequest {
+	id: string;
+	hash: string;
+	imdbId: string;
+	title: string | null;
+	mediaType: string;
+	status: string;
+	requesterId: string;
+	fulfillerId: string | null;
+	jobId: string | null;
+	jobHost?: string | null;
+	error?: string | null;
+	sizeBytes?: bigint | number | null;
+	returnPath?: string | null;
+	fulfilledAt?: Date | string | null;
+	thankedAt?: Date | string | null;
+	createdAt: Date | string;
+	updatedAt?: Date | string;
+	/** Set on board rows, which stand for every ask of their release. */
+	wantedBy?: number;
+}
+
+/** What strangers read in place of a reason about the asker's credentials. */
+export const ASKER_ACCOUNT_ERROR = "the asker's Real-Debrid account refused the transfer";
+
+/**
+ * The failure reason as a stranger may read it. Most reasons describe the
+ * release or the uploader (`uncached`, TorBox 404s, dead torrent sources) and
+ * are what a fulfiller needs to judge whether another try can work. Reasons
+ * about the asker's Real-Debrid credentials say whether that person's session
+ * is dead, so those stay the asker's own.
+ */
+export function publicError(error: string | null | undefined): string | null {
+	if (!error) return null;
+	if (/^RD credentials rejected|no usable Real-Debrid credentials/i.test(error)) {
+		return ASKER_ACCOUNT_ERROR;
+	}
+	return error;
+}
+
+/**
+ * The failure line a row shows under its status, or null when it shows none.
+ * `uncached` is folded into the status chip instead (the page tests for it),
+ * and AllDebrid's NO_SERVER is history: AD was withdrawn as a source on
+ * 2026-09-01, so a stale reason about it tells nobody anything they can act on.
+ * The rest are shortened to what a fulfiller can judge a retry by.
+ */
+export function failureNote(error: string | null | undefined): string | null {
+	if (!error || error === 'uncached' || /^AllDebrid NO_SERVER\b/.test(error)) return null;
+	if (/^All torrent sources failed\b/.test(error)) return 'Could not fetch the .torrent file';
+	const tb404 = 'TorBox reports the release cached but serves 404';
+	if (error.startsWith(`${tb404} for `)) return tb404;
+	return error;
+}
+
+/**
+ * Strip a row down to what a stranger may see.
+ *
+ * `requesterId` and `fulfillerId` never cross the wire. They are stable HMACs
+ * of a Real-Debrid username, so publishing them would let anyone watching the
+ * board follow one person's entire request history across releases.
+ */
+export function toPublicRequest(
+	row: StoredRequest,
+	viewerId: string | null,
+	tbCached: Set<string> | null = null
+): PublicRequest {
+	const mine = viewerId !== null && row.requesterId === viewerId;
+	return {
+		id: row.id,
+		hash: row.hash,
+		imdbId: row.imdbId,
+		title: row.title,
+		mediaType: row.mediaType,
+		status: row.status,
+		createdAt: new Date(row.createdAt).toISOString(),
+		mine,
+		jobId: row.jobId,
+		tbCached: tbCached ? tbCached.has(row.hash) : null,
+		error: mine ? (row.error ?? null) : publicError(row.error),
+		wantedBy: row.wantedBy ?? 1,
+		thanked: Boolean(row.thankedAt),
+		// Only a send somebody made: a free delivery has nobody to thank.
+		canThank: mine && row.status === 'fulfilled' && Boolean(row.fulfillerId) && !row.thankedAt,
+	};
+}

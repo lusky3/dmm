@@ -1,0 +1,188 @@
+import handler from '@/pages/api/stremio/cast/anime/[anidbid]';
+import { createMockRequest, createMockResponse } from '@/test/utils/api';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { mockGenerateUserId, mockSaveCast, mockGetStreamUrl } = vi.hoisted(() => ({
+	mockGenerateUserId: vi.fn(),
+	mockSaveCast: vi.fn(),
+	mockGetStreamUrl: vi.fn(),
+}));
+
+vi.mock('@/utils/castApiHelpers', async () => {
+	const actual =
+		await vi.importActual<typeof import('@/utils/castApiHelpers')>('@/utils/castApiHelpers');
+	return {
+		...actual,
+		generateUserId: mockGenerateUserId,
+	};
+});
+
+vi.mock('@/services/repository', () => ({
+	repository: {
+		saveCast: mockSaveCast,
+	},
+}));
+
+vi.mock('@/utils/getStreamUrl', () => ({
+	getStreamUrl: mockGetStreamUrl,
+}));
+
+describe('/api/stremio/cast/anime/[anidbid]', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		mockGenerateUserId.mockResolvedValue('user-1');
+		mockGetStreamUrl.mockResolvedValue([
+			'https://stream/video.mkv',
+			'https://rd/link',
+			1,
+			2,
+			700,
+		]);
+	});
+
+	it('validates required query params', async () => {
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer tok' },
+			query: { anidbid: 'anidb1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing "token", "hash" or "fileIds" parameter',
+		});
+	});
+
+	it('validates query param types', async () => {
+		const req = createMockRequest({
+			headers: { authorization: 'Bearer tok' },
+			query: { anidbid: ['anidb1'] as any, hash: 'hash', fileIds: '1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Invalid "token", "hash" or "fileIds" parameter',
+		});
+	});
+
+	it('saves casted anime streams for each requested file id', async () => {
+		const req = createMockRequest({
+			query: { anidbid: 'anidb1', hash: 'hash', fileIds: ['101'] },
+			headers: { authorization: 'Bearer tok', 'x-real-ip': '127.0.0.1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockGetStreamUrl).toHaveBeenCalledWith('tok', 'hash', 101, '127.0.0.1', 'anime');
+		expect(mockSaveCast).toHaveBeenCalledWith(
+			'anidb-1:1:2',
+			'user-1',
+			'hash',
+			'https://stream/video.mkv',
+			'https://rd/link',
+			700
+		);
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith({ errorEpisodes: [] });
+	});
+
+	// Stremio asks for `kitsu:46474:2`, which the stream routes turn into
+	// `anidb-17617:1:2`; a cast filed under the bare `17617` would never match.
+	it.each(['17617', 'anidb-17617', 'anime:anidb-17617'])(
+		'files an episode cast from %s under anidb-17617',
+		async (anidbid) => {
+			const req = createMockRequest({
+				query: { anidbid, hash: 'hash', fileIds: ['101'] },
+				headers: { authorization: 'Bearer tok', 'x-real-ip': '127.0.0.1' },
+			});
+			await handler(req, createMockResponse());
+
+			expect(mockSaveCast.mock.calls[0][0]).toBe('anidb-17617:1:2');
+		}
+	);
+
+	// The bare anidb id is the *movie* key, and Cast is unique on
+	// (imdbId, userId, hash) - so an episode written there overwrites whatever
+	// this torrent already cast, one file at a time, leaving one row.
+	it('records an error instead of writing an unparsed episode to the bare id', async () => {
+		mockGetStreamUrl.mockResolvedValue([
+			'https://stream/video.mkv',
+			'https://rd/link',
+			-1,
+			-1,
+			700,
+		]);
+		const req = createMockRequest({
+			query: { anidbid: 'anidb1', hash: 'hash', fileIds: ['101'] },
+			headers: { authorization: 'Bearer tok', 'x-real-ip': '127.0.0.1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockSaveCast).not.toHaveBeenCalled();
+		expect(res.json).toHaveBeenCalledWith({
+			errorEpisodes: ['fileId:101 (no episode number in filename)'],
+		});
+	});
+
+	it('accepts token via Authorization Bearer header instead of query', async () => {
+		const req = createMockRequest({
+			query: { anidbid: 'anidb1', hash: 'hash', fileIds: ['101'] },
+			headers: {
+				authorization: 'Bearer header-token',
+				'x-real-ip': '127.0.0.1',
+			},
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(mockGenerateUserId).toHaveBeenCalledWith('header-token');
+		expect(mockGetStreamUrl).toHaveBeenCalledWith(
+			'header-token',
+			'hash',
+			101,
+			'127.0.0.1',
+			'anime'
+		);
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith({ errorEpisodes: [] });
+	});
+
+	it('returns 400 when no token is provided via any source', async () => {
+		const req = createMockRequest({
+			query: { anidbid: 'anidb1', hash: 'hash', fileIds: '1' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(res.json).toHaveBeenCalledWith({
+			status: 'error',
+			errorMessage: 'Missing "token", "hash" or "fileIds" parameter',
+		});
+	});
+
+	it('records failed episodes when stream acquisition errors occur', async () => {
+		mockGetStreamUrl.mockRejectedValueOnce(new Error('rd down'));
+		const req = createMockRequest({
+			query: { anidbid: 'anidb1', hash: 'hash', fileIds: ['201'] },
+			headers: { authorization: 'Bearer tok', 'x-real-ip': '10.0.0.5' },
+		});
+		const res = createMockResponse();
+
+		await handler(req, res);
+
+		expect(res.json).toHaveBeenCalledWith({ errorEpisodes: ['fileId:201'] });
+	});
+});

@@ -1,19 +1,14 @@
 import { CachedHash, UserTorrent } from '@/torrent/userTorrent';
 import { IDBPDatabase, openDB } from 'idb';
 
-const backupToWeekNum = 2;
-
-function currentISOWeekNumber(): number {
-	const target = new Date();
-	const dayNumber = (target.getUTCDay() + 6) % 7;
-	target.setUTCDate(target.getUTCDate() - dayNumber + 3);
-	const firstThursday = target.getTime(); // Convert to numeric value
-	target.setUTCMonth(0, 1);
-	if (target.getUTCDay() !== 4) {
-		target.setUTCMonth(0, 1 + ((4 - target.getUTCDay() + 7) % 7));
-	}
-	return 1 + Math.ceil((firstThursday - target.getTime()) / (7 * 24 * 3600 * 1000)); // Use getTime for arithmetic
-}
+// Two torrent stores exist for historical reasons: the table used to be picked
+// by `isoWeek % 2`, which meant every week the app silently switched to the other
+// store - one still holding the library from *two* weeks earlier - and nothing
+// ever migrated or emptied it. Reads and writes now always use the first store;
+// the second is still declared so existing databases keep their schema, and
+// clear() empties both so a logout leaves nothing behind.
+const TORRENT_STORE_COUNT = 2;
+const ACTIVE_TORRENT_STORE = 'torrents-0';
 
 type Store = {
 	name: string;
@@ -33,7 +28,7 @@ function createObjectStores(db: IDBPDatabase, stores: Store[]) {
 
 function listTorrentObjectStores(): Store[] {
 	const stores = [];
-	for (let i = 0; i < backupToWeekNum; i++) {
+	for (let i = 0; i < TORRENT_STORE_COUNT; i++) {
 		stores.push({
 			name: `torrents-${i}`,
 			keyPath: 'id',
@@ -56,7 +51,7 @@ function listMiscObjectStores(): Store[] {
 class UserTorrentDB {
 	private db: IDBPDatabase | null = null;
 	private dbName = 'DMMDB';
-	private torrentsTbl = `torrents-${currentISOWeekNumber() % backupToWeekNum}`;
+	private torrentsTbl = ACTIVE_TORRENT_STORE;
 	private rdHashesTbl = 'cached-hashes';
 
 	public async initializeDB() {
@@ -112,13 +107,53 @@ class UserTorrentDB {
 	}
 
 	public async add(torrent: UserTorrent) {
-		await this.insertToDB(torrent);
+		// Use upsert for better performance
+		await this.upsert(torrent);
+	}
+
+	public async upsert(torrent: UserTorrent) {
+		const db = await this.getDB();
+		await db.put(this.torrentsTbl, torrent);
 	}
 
 	public async addAll(torrents: UserTorrent[]) {
-		for (const torrent of torrents) {
-			await this.insertToDB(torrent);
+		if (torrents.length === 0) return;
+
+		const db = await this.getDB();
+		const tx = db.transaction(this.torrentsTbl, 'readwrite');
+		const store = tx.objectStore(this.torrentsTbl);
+
+		// Batch all operations in a single transaction
+		await Promise.all(torrents.map((torrent) => store.put(torrent)));
+
+		await tx.done;
+	}
+
+	public async replaceAll(torrents: UserTorrent[]) {
+		const db = await this.getDB();
+		const storeNames = Array.from(db.objectStoreNames);
+		const includeHashesStore = storeNames.includes(this.rdHashesTbl);
+		const transactionStores = includeHashesStore
+			? [this.torrentsTbl, this.rdHashesTbl]
+			: [this.torrentsTbl];
+
+		const tx = db.transaction(transactionStores, 'readwrite');
+		const torrentsStore = tx.objectStore(this.torrentsTbl);
+
+		await torrentsStore.clear();
+		if (includeHashesStore) {
+			await tx.objectStore(this.rdHashesTbl).clear();
 		}
+
+		if (torrents.length > 0) {
+			const chunkSize = 500;
+			for (let i = 0; i < torrents.length; i += chunkSize) {
+				const chunk = torrents.slice(i, i + chunkSize);
+				await Promise.all(chunk.map((torrent) => torrentsStore.put(torrent)));
+			}
+		}
+
+		await tx.done;
 	}
 
 	public async deleteByHash(service: string, hash: string) {
@@ -135,15 +170,121 @@ class UserTorrentDB {
 		await db.delete(this.torrentsTbl, id);
 	}
 
+	public async deleteMany(ids: string[]) {
+		if (ids.length === 0) return;
+
+		const db = await this.getDB();
+		const tx = db.transaction(this.torrentsTbl, 'readwrite');
+		const store = tx.objectStore(this.torrentsTbl);
+
+		// Batch all deletions in a single transaction
+		await Promise.all(ids.map((id) => store.delete(id)));
+		await tx.done;
+	}
+
 	public async clear() {
 		const db = await this.getDB();
-		await db.clear(this.torrentsTbl);
+		// Every torrent store, not just the active one - the retired week-rotated
+		// store would otherwise keep a copy of the library across a logout
+		for (const name of Array.from(db.objectStoreNames)) {
+			if (name.startsWith('torrents-')) {
+				await db.clear(name);
+			}
+		}
+		// Clear cached hashes table
+		if (db.objectStoreNames.contains(this.rdHashesTbl)) {
+			await db.clear(this.rdHashesTbl);
+		}
+	}
+
+	public async deleteDatabase() {
+		// Close the current connection if it exists
+		if (this.db) {
+			this.db.close();
+			this.db = null;
+		}
+		// Delete the entire database
+		await new Promise<void>((resolve, reject) => {
+			const deleteReq = indexedDB.deleteDatabase(this.dbName);
+			deleteReq.onsuccess = () => resolve();
+			deleteReq.onerror = () => reject(deleteReq.error);
+			deleteReq.onblocked = () => {
+				console.warn('Database deletion blocked - other connections may be open');
+				// Still resolve after a timeout to prevent hanging
+				setTimeout(() => resolve(), 1000);
+			};
+		});
+	}
+
+	public async isEmpty(): Promise<boolean> {
+		try {
+			const db = await this.getDB();
+			let totalCount = 0;
+
+			// Check all torrent tables
+			for (let i = 0; i < TORRENT_STORE_COUNT; i++) {
+				const tableName = `torrents-${i}`;
+				if (db.objectStoreNames.contains(tableName)) {
+					totalCount += await db.count(tableName);
+				}
+			}
+
+			// Check cached hashes table
+			if (db.objectStoreNames.contains(this.rdHashesTbl)) {
+				totalCount += await db.count(this.rdHashesTbl);
+			}
+
+			return totalCount === 0;
+		} catch (error) {
+			console.error('Error checking if database is empty:', error);
+			return true; // Assume empty if error
+		}
+	}
+
+	public async getBackupTableData(): Promise<UserTorrent[]> {
+		const db = await this.getDB();
+		const backupTorrents: UserTorrent[] = [];
+
+		// Anything left in the stores we no longer write to - in practice whatever
+		// the old week-rotated table still holds
+		console.log('Active torrent store:', this.torrentsTbl);
+
+		for (let i = 0; i < TORRENT_STORE_COUNT; i++) {
+			const tableName = `torrents-${i}`;
+			if (tableName !== this.torrentsTbl) {
+				console.log(`Checking backup table: ${tableName}`);
+				if (db.objectStoreNames.contains(tableName)) {
+					const torrents = await db.getAll(tableName);
+					console.log(`Found ${torrents.length} torrents in ${tableName}`);
+					backupTorrents.push(...torrents);
+				} else {
+					console.log(`Table ${tableName} does not exist`);
+				}
+			}
+		}
+
+		return backupTorrents;
+	}
+
+	public async getAllTablesData(): Promise<{ table: string; torrents: UserTorrent[] }[]> {
+		const db = await this.getDB();
+		const allData: { table: string; torrents: UserTorrent[] }[] = [];
+
+		// Get data from all torrent tables
+		for (let i = 0; i < TORRENT_STORE_COUNT; i++) {
+			const tableName = `torrents-${i}`;
+			if (db.objectStoreNames.contains(tableName)) {
+				const torrents = await db.getAll(tableName);
+				allData.push({ table: tableName, torrents });
+			}
+		}
+
+		return allData;
 	}
 
 	public async inLibrary(hash: string): Promise<boolean> {
 		const db = await this.getDB();
 		const count = await db.countFromIndex(this.torrentsTbl, 'hash', hash);
-		console.log(`inLibrary: ${hash} ${count}`);
 		return count > 0;
 	}
 

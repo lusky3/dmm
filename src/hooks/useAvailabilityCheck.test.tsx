@@ -1,0 +1,1394 @@
+import { SearchResult } from '@/services/mediasearch';
+import retest from '@/test/fixtures/realdebrid/rd-add-name-retest-2026-10-13.json';
+import { isRdBlockedName } from '@/utils/deInfringe';
+import { act, renderHook } from '@testing-library/react';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { useAvailabilityCheck } from './useAvailabilityCheck';
+
+const {
+	mockToast,
+	mockToastCall,
+	mockGenerateTokenAndHash,
+	mockCheckDatabaseAvailabilityRd,
+	mockCheckDatabaseAvailabilityAd,
+	mockCheckDatabaseAvailabilityTb,
+	mockGetCachedTrackerStats,
+	mockShouldIncludeTrackerStats,
+	mockProcessWithConcurrency,
+	mockCheckCachedStatus,
+	mockCheckOffcloudCache,
+	mockDelay,
+	mockIsRdThrottling,
+	toastFunction,
+	mockCheckDebridLinkCache,
+} = vi.hoisted(() => {
+	const loading = vi.fn().mockReturnValue('toast-id');
+	const success = vi.fn();
+	const error = vi.fn();
+	const dismiss = vi.fn();
+	const promise = vi.fn();
+	const call = vi.fn();
+	const toastFn = Object.assign(
+		(...args: unknown[]) => {
+			call(...args);
+		},
+		{ loading, success, error, dismiss, promise }
+	);
+	return {
+		mockToast: { loading, success, error, dismiss, promise },
+		mockToastCall: call,
+		mockGenerateTokenAndHash: vi.fn(),
+		mockCheckDatabaseAvailabilityRd: vi.fn(),
+		mockCheckDatabaseAvailabilityAd: vi.fn(),
+		mockCheckDatabaseAvailabilityTb: vi.fn(),
+		mockGetCachedTrackerStats: vi.fn(),
+		mockShouldIncludeTrackerStats: vi.fn(),
+		mockProcessWithConcurrency: vi.fn(),
+		mockCheckCachedStatus: vi.fn(),
+		mockCheckOffcloudCache: vi.fn(),
+		mockCheckDebridLinkCache: vi.fn(),
+		mockDelay: vi.fn(),
+		mockIsRdThrottling: vi.fn(),
+		toastFunction: toastFn,
+	};
+});
+
+vi.mock('react-hot-toast', () => ({
+	__esModule: true,
+	default: toastFunction,
+	toast: toastFunction,
+}));
+
+vi.mock('@/utils/token', () => ({
+	generateTokenAndHash: mockGenerateTokenAndHash,
+}));
+
+vi.mock('@/utils/instantChecks', () => ({
+	checkDatabaseAvailabilityRd: mockCheckDatabaseAvailabilityRd,
+	checkDatabaseAvailabilityAd: mockCheckDatabaseAvailabilityAd,
+	checkDatabaseAvailabilityTb: mockCheckDatabaseAvailabilityTb,
+}));
+
+vi.mock('@/utils/trackerStats', () => ({
+	getCachedTrackerStats: mockGetCachedTrackerStats,
+	shouldIncludeTrackerStats: mockShouldIncludeTrackerStats,
+}));
+
+vi.mock('@/utils/parallelProcessor', () => ({
+	processWithConcurrency: mockProcessWithConcurrency,
+}));
+
+vi.mock('@/services/torbox', () => ({
+	checkCachedStatus: mockCheckCachedStatus,
+	TorBoxCachedResponse: {},
+}));
+
+vi.mock('@/services/debridLink', () => ({
+	checkDebridLinkCache: mockCheckDebridLinkCache,
+}));
+
+vi.mock('@/services/offcloud', () => ({
+	checkOffcloudCache: mockCheckOffcloudCache,
+	CACHE_CHECK_CHUNK_SIZE: 1000,
+}));
+
+vi.mock('@/services/realDebrid', () => ({
+	isRdThrottling: mockIsRdThrottling,
+	RD_ADD_MIN_SPACING_MS: 2000,
+}));
+
+// The sweep paces its RD probes; the suite runs on fake timers, so the real
+// MessageChannel-backed delay would never resolve.
+vi.mock('@/utils/delay', () => ({
+	delay: mockDelay,
+}));
+
+const createSearchResult = (overrides: Partial<SearchResult> = {}): SearchResult => ({
+	title: overrides.title || 'Sample Torrent',
+	fileSize: overrides.fileSize ?? 1024,
+	hash: overrides.hash || 'hash-1',
+	rdAvailable: overrides.rdAvailable ?? false,
+	adAvailable: overrides.adAvailable ?? false,
+	tbAvailable: overrides.tbAvailable ?? false,
+	pmAvailable: false,
+	ocAvailable: overrides.ocAvailable ?? false,
+	dlAvailable: overrides.dlAvailable ?? false,
+	files: overrides.files ?? [],
+	noVideos: overrides.noVideos ?? false,
+	medianFileSize: overrides.medianFileSize ?? 1024,
+	biggestFileSize: overrides.biggestFileSize ?? 1024,
+	videoCount: overrides.videoCount ?? 1,
+	trackerStats: overrides.trackerStats,
+	tbTransferred: overrides.tbTransferred ?? false,
+});
+
+const makeTbCachedResponse = (hashes: string[]) => {
+	const data: Record<string, any> = {};
+	for (const hash of hashes) {
+		data[hash] = {
+			name: 'test',
+			size: 1024,
+			hash,
+			files: [{ name: 'video.mkv', size: 1024 }],
+		};
+	}
+	return { success: true, data };
+};
+
+describe('useAvailabilityCheck', () => {
+	const initialSearchResults = [createSearchResult(), createSearchResult({ hash: 'hash-2' })];
+	let searchResults = [...initialSearchResults];
+	const setSearchResults = vi.fn((updater) => {
+		searchResults =
+			typeof updater === 'function'
+				? (updater as (prev: SearchResult[]) => SearchResult[])(searchResults)
+				: updater;
+	});
+	const addRd = vi.fn();
+	const addAd = vi.fn();
+	const deleteRd = vi.fn();
+	const deleteAd = vi.fn();
+	const sortFn = vi.fn((results: SearchResult[]) => results);
+
+	beforeEach(() => {
+		vi.useFakeTimers();
+		searchResults = [...initialSearchResults];
+		setSearchResults.mockClear();
+		addRd.mockReset();
+		addAd.mockReset();
+		deleteRd.mockReset();
+		deleteAd.mockReset();
+		sortFn.mockClear();
+		mockToast.loading.mockClear();
+		mockToast.success.mockClear();
+		mockToast.error.mockClear();
+		mockToast.dismiss.mockClear();
+		mockToastCall.mockClear();
+		mockCheckCachedStatus.mockReset();
+		mockCheckOffcloudCache.mockReset();
+		mockCheckOffcloudCache.mockResolvedValue([]);
+		mockDelay.mockReset();
+		mockDelay.mockResolvedValue(undefined);
+		mockIsRdThrottling.mockReset();
+		mockIsRdThrottling.mockReturnValue(false);
+		mockGenerateTokenAndHash.mockResolvedValue(['token', 'hash']);
+		mockCheckDatabaseAvailabilityRd.mockResolvedValue(undefined);
+		mockCheckDatabaseAvailabilityAd.mockResolvedValue(undefined);
+		mockCheckDatabaseAvailabilityTb.mockResolvedValue(undefined);
+		mockShouldIncludeTrackerStats.mockReturnValue(true);
+		mockGetCachedTrackerStats.mockResolvedValue({
+			seeders: 2,
+			leechers: 0,
+			downloads: 10,
+		});
+		mockProcessWithConcurrency.mockImplementation(async (items, processor) => {
+			const results = [];
+			for (const item of items) {
+				try {
+					const result = await processor(item);
+					results.push({ item, success: true, result });
+				} catch (error) {
+					results.push({ item, success: false, error });
+				}
+			}
+			return results;
+		});
+		Object.defineProperty(window, 'location', {
+			value: { reload: vi.fn() },
+			writable: true,
+		});
+		Object.defineProperty(window, 'localStorage', {
+			value: {
+				store: new Map<string, string>(),
+				getItem(key: string) {
+					return this.store.get(key) ?? null;
+				},
+				setItem(key: string, value: string) {
+					this.store.set(key, value);
+				},
+				removeItem(key: string) {
+					this.store.delete(key);
+				},
+			},
+			writable: true,
+		});
+		addRd.mockResolvedValue({
+			id: 'rd-1',
+			status: 'downloaded',
+			progress: 100,
+			links: [],
+			files: [],
+		});
+		addAd.mockResolvedValue({
+			id: 123,
+			filename: 'test.mkv',
+			size: 1024,
+			status: 'Ready',
+			statusCode: 4,
+			files: [],
+		});
+		mockCheckCachedStatus.mockResolvedValue(makeTbCachedResponse(['hash-1', 'hash-2']));
+	});
+
+	afterEach(() => {
+		vi.useRealTimers();
+	});
+
+	const renderAvailabilityHook = (
+		overrides: {
+			rdKey?: string | null;
+			adKey?: string | null;
+			torboxKey?: string | null;
+			premiumizeKey?: string | null;
+			offcloudKey?: string | null;
+			debridLinkKey?: string | null;
+			hashAndProgress?: Record<string, number>;
+		} = {}
+	) =>
+		renderHook(() =>
+			useAvailabilityCheck(
+				overrides.rdKey !== undefined ? overrides.rdKey : 'rd-key',
+				overrides.adKey !== undefined ? overrides.adKey : 'ad-key',
+				overrides.torboxKey !== undefined ? overrides.torboxKey : 'tb-key',
+				overrides.premiumizeKey !== undefined ? overrides.premiumizeKey : null,
+				overrides.offcloudKey !== undefined ? overrides.offcloudKey : null,
+				overrides.debridLinkKey !== undefined ? overrides.debridLinkKey : null,
+				'tt123',
+				searchResults,
+				setSearchResults,
+				overrides.hashAndProgress ?? {},
+				addRd,
+				addAd,
+				deleteRd,
+				deleteAd,
+				sortFn
+			)
+		);
+
+	// =========================================================================
+	// Initial state
+	// =========================================================================
+
+	describe('initial state', () => {
+		it('starts with isAnyChecking = false', () => {
+			const { result } = renderAvailabilityHook();
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('isHashServiceChecking returns false for all services', () => {
+			const { result } = renderAvailabilityHook();
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'TB')).toBe(false);
+		});
+	});
+
+	// =========================================================================
+	// checkServiceAvailability — single item
+	// =========================================================================
+
+	describe('checkServiceAvailability (single)', () => {
+		it('checks all services and triggers RD/AD/TB database refresh', async () => {
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0]);
+			});
+
+			expect(addRd).toHaveBeenCalledWith('hash-1', true);
+			expect(deleteRd).toHaveBeenCalled();
+			expect(addAd).toHaveBeenCalledWith('hash-1', true);
+			expect(deleteAd).toHaveBeenCalled();
+			expect(mockCheckCachedStatus).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityRd).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityAd).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityTb).toHaveBeenCalled();
+			expect(mockToast.success).toHaveBeenCalledWith(
+				expect.stringContaining('Service check done'),
+				{ id: 'toast-id' }
+			);
+		});
+
+		it('does NOT reload the page after completing', async () => {
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0]);
+			});
+
+			vi.runAllTimers();
+			expect(window.location.reload).not.toHaveBeenCalled();
+		});
+
+		it('checks only AllDebrid when only AD key is provided', async () => {
+			const { result } = renderHook(() =>
+				useAvailabilityCheck(
+					null,
+					'ad-key',
+					null,
+					null,
+					null,
+					null,
+					'tt123',
+					searchResults,
+					setSearchResults,
+					{},
+					addRd,
+					addAd,
+					deleteRd,
+					deleteAd,
+					sortFn
+				)
+			);
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0]);
+			});
+
+			expect(addRd).not.toHaveBeenCalled();
+			expect(addAd).toHaveBeenCalledWith('hash-1', true);
+			expect(deleteAd).toHaveBeenCalled();
+			expect(mockCheckCachedStatus).not.toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityAd).toHaveBeenCalled();
+			expect(mockToast.success).toHaveBeenCalledWith(
+				expect.stringContaining('Service check done'),
+				{ id: 'toast-id' }
+			);
+		});
+
+		it('marks the current card as AD available when the live AD check is cached', async () => {
+			mockCheckDatabaseAvailabilityAd.mockResolvedValue(0);
+			const { result } = renderAvailabilityHook({ rdKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['AD']);
+			});
+
+			expect(searchResults[0].adAvailable).toBe(true);
+			expect(mockCheckDatabaseAvailabilityAd).toHaveBeenCalled();
+		});
+
+		it('shows already cached message for AD', async () => {
+			window.localStorage.removeItem('settings:availabilityCheckLimit');
+			const cachedResult = createSearchResult({ adAvailable: true });
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(cachedResult, ['AD']);
+			});
+
+			expect(mockToast.success).toHaveBeenCalledWith(
+				expect.stringContaining('Already cached in AD')
+			);
+			expect(addRd).not.toHaveBeenCalled();
+			expect(addAd).not.toHaveBeenCalled();
+			expect(mockCheckCachedStatus).not.toHaveBeenCalled();
+		});
+
+		it('shows error toast when no services are available', async () => {
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0]);
+			});
+
+			expect(mockToast.error).toHaveBeenCalledWith(
+				'No services available for availability check.'
+			);
+		});
+
+		it('calls addRd before deleteRd when torrent is NOT in progress', async () => {
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			const addOrder = addRd.mock.invocationCallOrder[0];
+			const deleteOrder = deleteRd.mock.invocationCallOrder[0];
+			expect(addOrder).toBeLessThan(deleteOrder);
+		});
+
+		it('calls deleteRd before addRd when torrent IS in progress', async () => {
+			const { result } = renderAvailabilityHook({
+				adKey: null,
+				torboxKey: null,
+				hashAndProgress: { 'rd:hash-1': 50 },
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			const deleteOrder = deleteRd.mock.invocationCallOrder[0];
+			const addOrder = addRd.mock.invocationCallOrder[0];
+			expect(deleteOrder).toBeLessThan(addOrder);
+		});
+	});
+
+	// =========================================================================
+	// checkServiceAvailabilityBulk
+	// =========================================================================
+
+	// `removeDebridTransfer` is keyed by hash alone, so retiring a transfer badge
+	// on a probe that never got an answer costs every user the registration, not
+	// just this one. The usual reason a probe gets no answer is RD's 451 throttle
+	// penalty — which a sweep of adds like this one earns for itself.
+	describe('transfer badges vs a probe RD never answered', () => {
+		const unregisterCalls = () =>
+			(global.fetch as any).mock.calls.filter(
+				(c: any[]) => c[0] === '/api/debrid-uploader/unregister'
+			);
+
+		beforeEach(() => {
+			global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }) as any;
+			searchResults = [createSearchResult({ tbTransferred: true })];
+		});
+
+		it('keeps the badge when the RD add threw (throttled, no answer)', async () => {
+			addRd.mockResolvedValue(null);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(unregisterCalls()).toHaveLength(0);
+		});
+
+		it('retires the badge when RD answered that it is not cached', async () => {
+			addRd.mockResolvedValue({
+				id: 'rd-1',
+				status: 'downloading',
+				progress: 12,
+				links: [],
+				files: [],
+			});
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(unregisterCalls()).toHaveLength(1);
+		});
+
+		it('keeps the badge mid-sweep when the RD add threw', async () => {
+			addRd.mockResolvedValue(null);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(unregisterCalls()).toHaveLength(0);
+		});
+
+		it('retires the badge mid-sweep when RD answered', async () => {
+			addRd.mockResolvedValue({
+				id: 'rd-1',
+				status: 'downloading',
+				progress: 12,
+				links: [],
+				files: [],
+			});
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(unregisterCalls()).toHaveLength(1);
+		});
+	});
+
+	// Releases RD refused by name on 2026-10-13 and again an hour later
+	// (src/test/fixtures/realdebrid/rd-add-name-retest-2026-10-13.json). A probe
+	// of one deletes the user's own copy first, then spends an add RD refuses.
+	describe('a row whose name RD blocks', () => {
+		const refusedTwice = retest.adds.filter(
+			(a) =>
+				a.pass === 1 &&
+				a.status === 451 &&
+				isRdBlockedName(a.title) &&
+				retest.adds.some((b) => b.pass === 2 && b.hash === a.hash && b.status === 451)
+		);
+		const rows = refusedTwice.map((a) => createSearchResult({ hash: a.hash, title: a.title }));
+
+		it('is not probed on RD by a single check, and the user keeps their copy', async () => {
+			expect(refusedTwice).toHaveLength(36);
+			for (const row of rows) {
+				searchResults = [row];
+				const { result, unmount } = renderAvailabilityHook({
+					torboxKey: null,
+					hashAndProgress: { [`rd:${row.hash}`]: 100 },
+				});
+				await act(async () => {
+					await result.current.checkServiceAvailability(row);
+				});
+				unmount();
+			}
+
+			expect(addRd).not.toHaveBeenCalled();
+			expect(deleteRd).not.toHaveBeenCalled();
+			// The services that do not judge names are still asked.
+			expect(addAd).toHaveBeenCalledTimes(rows.length);
+		});
+
+		it('is left out of a sweep while the clean rows are probed', async () => {
+			searchResults = [...rows, createSearchResult({ hash: 'hash-1' })];
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(addRd.mock.calls).toEqual([['hash-1', true]]);
+			expect(deleteRd.mock.calls).toEqual([['hash-1']]);
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+	});
+
+	// RD retired /instantAvailability, so this sweep probes by adding and deleting
+	// each hash — a burst of adds, which RD punishes with `451 infringing_file`.
+	// Measured 2026-08-28: the old shape (concurrency 3, no pacing) got 2 usable
+	// answers out of 15 and reported the other 13 cached torrents as uncached.
+	// The base spacing is `addMagnet`'s own budget, about 30 adds a minute per
+	// account (measured 2026-09-17), not the 250/min the API publishes: at the
+	// old 1s the sweep was still running at twice what RD sustains.
+	describe('RD sweep pacing under throttle', () => {
+		const rows = (n: number) =>
+			Array.from({ length: n }, (_, i) => createSearchResult({ hash: `hash-${i}` }));
+
+		beforeEach(() => {
+			global.fetch = vi.fn().mockResolvedValue({ ok: true, json: async () => ({}) }) as any;
+		});
+
+		it('probes one at a time, spaced', async () => {
+			searchResults = rows(3);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(addRd).toHaveBeenCalledTimes(3);
+			// First probe goes straight out; the rest are spaced.
+			expect(mockDelay).toHaveBeenCalledTimes(2);
+			expect(mockDelay).toHaveBeenCalledWith(2000);
+		});
+
+		it('widens the gap each time RD throttles', async () => {
+			searchResults = rows(4);
+			addRd.mockResolvedValue(null);
+			mockIsRdThrottling.mockReturnValue(true);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(mockDelay.mock.calls.map((c) => c[0])).toEqual([4000, 8000, 16000]);
+		});
+
+		it('stops after five throttled rows instead of grinding out wrong answers', async () => {
+			searchResults = rows(9);
+			addRd.mockResolvedValue(null);
+			mockIsRdThrottling.mockReturnValue(true);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(addRd).toHaveBeenCalledTimes(5);
+			expect(mockToast.error).toHaveBeenCalledWith(
+				expect.stringContaining(
+					'Real-Debrid is pausing adds on your account — stopped after 5 of 9'
+				),
+				expect.any(Object)
+			);
+		});
+
+		it('does not stop for probes RD actually answered', async () => {
+			searchResults = rows(9);
+			addRd.mockResolvedValue(null);
+			mockIsRdThrottling.mockReturnValue(false);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(addRd).toHaveBeenCalledTimes(9);
+			expect(mockDelay.mock.calls.map((c) => c[0])).toEqual([
+				2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000,
+			]);
+		});
+
+		it('earns the gap back after a real answer', async () => {
+			searchResults = rows(4);
+			mockIsRdThrottling
+				.mockReturnValueOnce(true)
+				.mockReturnValueOnce(true)
+				.mockReturnValue(false);
+			addRd.mockResolvedValue(null);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			// 2s base -> 4s -> 8s after two throttles, then halved back to 4s.
+			expect(mockDelay.mock.calls.map((c) => c[0])).toEqual([4000, 8000, 4000]);
+		});
+
+		it('tells the single-row check apart from RD answering no', async () => {
+			searchResults = [createSearchResult()];
+			addRd.mockResolvedValue(null);
+			mockIsRdThrottling.mockReturnValue(true);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(mockToast.error).toHaveBeenCalledWith(
+				'Real-Debrid is pausing adds on your account — try this row again in a few minutes.',
+				expect.objectContaining({ id: 'toast-id' })
+			);
+			expect(mockToast.success).not.toHaveBeenCalled();
+		});
+
+		// The throttle is the account's, so it is read for the key that probed.
+		it("reads the throttle for the probing account's key", async () => {
+			searchResults = [createSearchResult()];
+			addRd.mockResolvedValue(null);
+			mockIsRdThrottling.mockReturnValue(true);
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(mockIsRdThrottling).toHaveBeenCalledWith('rd-key');
+		});
+	});
+
+	describe('checkServiceAvailabilityBulk', () => {
+		it('handles bulk availability check for multiple services', async () => {
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults);
+			});
+
+			expect(addRd).toHaveBeenCalled();
+			expect(addAd).toHaveBeenCalled();
+			expect(mockCheckCachedStatus).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityRd).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityAd).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityTb).toHaveBeenCalled();
+		});
+
+		it('marks bulk AD live-check hits available even when database refresh returns no rows', async () => {
+			mockCheckDatabaseAvailabilityAd.mockResolvedValue(0);
+			const { result } = renderAvailabilityHook({ rdKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['AD']);
+			});
+
+			expect(searchResults.every((r) => r.adAvailable)).toBe(true);
+			expect(mockToast.success).toHaveBeenCalledWith(
+				expect.stringContaining('AD: checked 2; AD: 2 available.'),
+				{ duration: 3000 }
+			);
+		});
+
+		it('respects availabilityCheckLimit from localStorage', async () => {
+			window.localStorage.setItem('settings:availabilityCheckLimit', '1');
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults);
+			});
+
+			expect(mockToast.loading).toHaveBeenCalled();
+			expect(mockToastCall).toHaveBeenCalledWith(
+				expect.stringContaining('Checking first 1 of 2'),
+				expect.objectContaining({ duration: 4000 })
+			);
+			expect(addRd).toHaveBeenCalled();
+			expect(addAd).toHaveBeenCalled();
+			expect(mockCheckCachedStatus).toHaveBeenCalled();
+			expect(mockGetCachedTrackerStats).toHaveBeenCalled();
+			expect(mockToast.dismiss).toHaveBeenCalledWith('toast-id');
+		});
+
+		it('targets only the selected services during bulk checks', async () => {
+			const { result } = renderAvailabilityHook();
+			const mixedResults = [
+				createSearchResult({ hash: 'hash-3', adAvailable: true }),
+				createSearchResult({ hash: 'hash-4' }),
+			];
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(mixedResults, ['RD']);
+			});
+
+			expect(addRd).toHaveBeenCalled();
+			expect(addAd).not.toHaveBeenCalled();
+			expect(mockCheckCachedStatus).not.toHaveBeenCalled();
+		});
+
+		it('does NOT reload the page after bulk check completes', async () => {
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			vi.runAllTimers();
+			expect(window.location.reload).not.toHaveBeenCalled();
+		});
+
+		it('does NOT reload the page after bulk check errors', async () => {
+			addRd.mockRejectedValue(new Error('fail'));
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			vi.runAllTimers();
+			expect(window.location.reload).not.toHaveBeenCalled();
+		});
+
+		it('shows error toast when all torrents are already available', async () => {
+			const allCached = [createSearchResult({ hash: 'hash-1', rdAvailable: true })];
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(allCached, ['RD']);
+			});
+
+			expect(mockToast.error).toHaveBeenCalledWith('No torrents left to check for RD.');
+		});
+
+		it('shows error toast when no services are configured', async () => {
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults);
+			});
+
+			expect(mockToast.error).toHaveBeenCalledWith(
+				'No services available for availability check.'
+			);
+		});
+	});
+
+	// =========================================================================
+	// Per-hash-per-service checking state
+	// =========================================================================
+
+	describe('per-hash-per-service checking state (single check)', () => {
+		it('marks only the requested service as checking for the given hash', async () => {
+			let resolveRd!: (value: any) => void;
+			addRd.mockReturnValue(new Promise((r) => (resolveRd = r)));
+
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			let checkPromise: Promise<void>;
+			act(() => {
+				checkPromise = result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'TB')).toBe(false);
+			expect(result.current.isAnyChecking).toBe(true);
+
+			await act(async () => {
+				resolveRd({ id: 'rd-1', status: 'downloaded', progress: 100 });
+				await checkPromise!;
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('marks all needed services when no specific service is requested', async () => {
+			let resolveRd!: (value: any) => void;
+			let resolveAd!: (value: any) => void;
+			let resolveTb!: (value: any) => void;
+			addRd.mockReturnValue(new Promise((r) => (resolveRd = r)));
+			addAd.mockReturnValue(new Promise((r) => (resolveAd = r)));
+			mockCheckCachedStatus.mockReturnValue(new Promise((r) => (resolveTb = r)));
+
+			const { result } = renderAvailabilityHook();
+
+			let checkPromise: Promise<void>;
+			act(() => {
+				checkPromise = result.current.checkServiceAvailability(searchResults[0]);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'TB')).toBe(true);
+
+			await act(async () => {
+				resolveRd({ id: 'rd-1', status: 'downloaded', progress: 100 });
+				resolveAd({ id: 123, status: 'Ready', statusCode: 4 });
+				resolveTb(makeTbCachedResponse(['hash-1']));
+				await checkPromise!;
+			});
+
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('does not mark already-available services', async () => {
+			const partialResult = createSearchResult({
+				hash: 'hash-1',
+				rdAvailable: true,
+			});
+			searchResults = [partialResult, createSearchResult({ hash: 'hash-2' })];
+
+			let resolveAd!: (value: any) => void;
+			let resolveTb!: (value: any) => void;
+			addAd.mockReturnValue(new Promise((r) => (resolveAd = r)));
+			mockCheckCachedStatus.mockReturnValue(new Promise((r) => (resolveTb = r)));
+
+			const { result } = renderAvailabilityHook();
+
+			let checkPromise: Promise<void>;
+			act(() => {
+				checkPromise = result.current.checkServiceAvailability(partialResult);
+			});
+
+			// RD already available — should NOT be checking
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'TB')).toBe(true);
+
+			await act(async () => {
+				resolveAd({ id: 123, status: 'Ready', statusCode: 4 });
+				resolveTb(makeTbCachedResponse(['hash-1']));
+				await checkPromise!;
+			});
+
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('skips entirely and does not mark checking when all requested are cached', async () => {
+			const fullyCached = createSearchResult({
+				hash: 'hash-1',
+				rdAvailable: true,
+				adAvailable: true,
+			});
+			const { result } = renderAvailabilityHook();
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(fullyCached, ['RD', 'AD']);
+			});
+
+			expect(result.current.isAnyChecking).toBe(false);
+			expect(mockToast.success).toHaveBeenCalledWith('Already cached in RD / AD.');
+			expect(addRd).not.toHaveBeenCalled();
+			expect(addAd).not.toHaveBeenCalled();
+		});
+
+		it('clears checking state on error', async () => {
+			addRd.mockRejectedValue(new Error('network error'));
+
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('different hashes are independent — completing one does not affect the other', async () => {
+			let resolveRd1!: (value: any) => void;
+			let resolveRd2!: (value: any) => void;
+			addRd.mockImplementation((hash: string) => {
+				if (hash === 'hash-1') return new Promise((r) => (resolveRd1 = r));
+				if (hash === 'hash-2') return new Promise((r) => (resolveRd2 = r));
+				return Promise.resolve(null);
+			});
+
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			let promise1: Promise<void>;
+			let promise2: Promise<void>;
+			act(() => {
+				promise1 = result.current.checkServiceAvailability(searchResults[0], ['RD']);
+				promise2 = result.current.checkServiceAvailability(searchResults[1], ['RD']);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-2', 'RD')).toBe(true);
+
+			// Complete only hash-1
+			await act(async () => {
+				resolveRd1({ id: 'rd-1', status: 'downloaded', progress: 100 });
+				await promise1!;
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-2', 'RD')).toBe(true);
+			expect(result.current.isAnyChecking).toBe(true);
+
+			// Complete hash-2
+			await act(async () => {
+				resolveRd2({ id: 'rd-2', status: 'downloaded', progress: 100 });
+				await promise2!;
+			});
+
+			expect(result.current.isHashServiceChecking('hash-2', 'RD')).toBe(false);
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('checking RD does not disable AD or TB buttons for the same hash', async () => {
+			let resolveRd!: (value: any) => void;
+			addRd.mockReturnValue(new Promise((r) => (resolveRd = r)));
+
+			const { result } = renderAvailabilityHook();
+
+			let checkPromise: Promise<void>;
+			act(() => {
+				checkPromise = result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'TB')).toBe(false);
+
+			await act(async () => {
+				resolveRd({ id: 'rd-1', status: 'downloaded', progress: 100 });
+				await checkPromise!;
+			});
+		});
+
+		it('allows checking different services for the same hash concurrently', async () => {
+			let resolveRd!: (value: any) => void;
+			let resolveAd!: (value: any) => void;
+			addRd.mockReturnValue(new Promise((r) => (resolveRd = r)));
+			addAd.mockReturnValue(new Promise((r) => (resolveAd = r)));
+
+			const { result } = renderAvailabilityHook({ torboxKey: null });
+
+			let rdPromise: Promise<void>;
+			let adPromise: Promise<void>;
+			act(() => {
+				rdPromise = result.current.checkServiceAvailability(searchResults[0], ['RD']);
+				adPromise = result.current.checkServiceAvailability(searchResults[0], ['AD']);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(true);
+
+			// Resolve RD first
+			await act(async () => {
+				resolveRd({ id: 'rd-1', status: 'downloaded', progress: 100 });
+				await rdPromise!;
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(true);
+			expect(result.current.isAnyChecking).toBe(true);
+
+			await act(async () => {
+				resolveAd({ id: 123, status: 'Ready', statusCode: 4 });
+				await adPromise!;
+			});
+
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+	});
+
+	// =========================================================================
+	// Per-hash-per-service checking state (bulk check)
+	// =========================================================================
+
+	describe('per-hash-per-service checking state (bulk check)', () => {
+		it('marks each hash only with its needed services', async () => {
+			const mixedResults = [
+				createSearchResult({ hash: 'hash-A', rdAvailable: false, adAvailable: true }),
+				createSearchResult({ hash: 'hash-B', rdAvailable: true, adAvailable: false }),
+			];
+			searchResults = mixedResults;
+
+			// Make processWithConcurrency hang so we can inspect checking state
+			let resolveProcessing!: (value: any) => void;
+			mockProcessWithConcurrency.mockReturnValue(new Promise((r) => (resolveProcessing = r)));
+
+			const { result } = renderAvailabilityHook({ torboxKey: null });
+
+			let bulkPromise: Promise<void>;
+			act(() => {
+				bulkPromise = result.current.checkServiceAvailabilityBulk(mixedResults, [
+					'RD',
+					'AD',
+				]);
+			});
+
+			// hash-A needs RD (not AD — already cached)
+			expect(result.current.isHashServiceChecking('hash-A', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-A', 'AD')).toBe(false);
+
+			// hash-B needs AD (not RD — already cached)
+			expect(result.current.isHashServiceChecking('hash-B', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-B', 'AD')).toBe(true);
+
+			await act(async () => {
+				resolveProcessing([]);
+				await bulkPromise!;
+			});
+		});
+
+		it('prevents concurrent bulk checks via isAnyChecking guard', async () => {
+			let resolveProcessing!: (value: any) => void;
+			mockProcessWithConcurrency.mockReturnValue(new Promise((r) => (resolveProcessing = r)));
+
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			let firstPromise: Promise<void>;
+			act(() => {
+				firstPromise = result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(result.current.isAnyChecking).toBe(true);
+
+			const callCountBefore = mockProcessWithConcurrency.mock.calls.length;
+
+			// Second call should be a no-op
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			expect(mockProcessWithConcurrency.mock.calls.length).toBe(callCountBefore);
+
+			await act(async () => {
+				resolveProcessing([]);
+				await firstPromise!;
+			});
+		});
+
+		it('removes checking state per-hash as each hash completes in bulk', async () => {
+			// Track the order of removeChecking calls via state transitions
+			const checkedHashes: string[] = [];
+			addRd.mockImplementation((hash: string) => {
+				checkedHashes.push(hash);
+				return Promise.resolve({ id: `rd-${hash}`, status: 'downloaded', progress: 100 });
+			});
+
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			// Both hashes were processed
+			expect(checkedHashes).toContain('hash-1');
+			expect(checkedHashes).toContain('hash-2');
+
+			// After completion, all checking states should be cleared
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-2', 'RD')).toBe(false);
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+
+		it('clears checking state for a hash even when that hash fails in bulk', async () => {
+			addRd.mockImplementation((hash: string) => {
+				if (hash === 'hash-1') return Promise.reject(new Error('RD fail'));
+				return Promise.resolve({ id: 'rd-2', status: 'downloaded', progress: 100 });
+			});
+
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['RD']);
+			});
+
+			// Both should be cleared after completion, even hash-1 which failed
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-2', 'RD')).toBe(false);
+			expect(result.current.isAnyChecking).toBe(false);
+		});
+	});
+
+	// =========================================================================
+	// Service key filtering
+	// =========================================================================
+
+	describe('service key filtering', () => {
+		it('only checks services for which keys are provided', async () => {
+			let resolveRd!: (value: any) => void;
+			addRd.mockReturnValue(new Promise((r) => (resolveRd = r)));
+
+			const { result } = renderAvailabilityHook({
+				rdKey: 'rd-key',
+				adKey: null,
+				torboxKey: null,
+			});
+
+			let checkPromise: Promise<void>;
+			act(() => {
+				checkPromise = result.current.checkServiceAvailability(searchResults[0]);
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'RD')).toBe(true);
+			expect(result.current.isHashServiceChecking('hash-1', 'AD')).toBe(false);
+			expect(result.current.isHashServiceChecking('hash-1', 'TB')).toBe(false);
+
+			await act(async () => {
+				resolveRd({ id: 'rd-1', status: 'downloaded', progress: 100 });
+				await checkPromise!;
+			});
+
+			expect(addAd).not.toHaveBeenCalled();
+			expect(mockCheckCachedStatus).not.toHaveBeenCalled();
+		});
+
+		it('requesting a service without a key is a no-op for that service', async () => {
+			const { result } = renderAvailabilityHook({ torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['TB']);
+			});
+
+			// TB key is null, so requesting TB should trigger the "no services" error
+			expect(mockToast.error).toHaveBeenCalledWith(
+				'No services available for availability check.'
+			);
+			expect(mockCheckCachedStatus).not.toHaveBeenCalled();
+		});
+	});
+
+	// =========================================================================
+	// Response parsing / cached detection
+	// =========================================================================
+
+	describe('response parsing', () => {
+		it('detects RD cached response (status=downloaded, progress=100)', async () => {
+			addRd.mockResolvedValue({ id: '123', status: 'downloaded', progress: 100 });
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			expect(mockCheckDatabaseAvailabilityRd).toHaveBeenCalled();
+		});
+
+		it('detects AD cached response (statusCode=4, status=Ready)', async () => {
+			addAd.mockResolvedValue({ id: '123', statusCode: 4, status: 'Ready' });
+			const { result } = renderAvailabilityHook({ rdKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['AD']);
+			});
+
+			expect(mockCheckDatabaseAvailabilityAd).toHaveBeenCalled();
+		});
+
+		it('detects TB cached response via checkCachedStatus', async () => {
+			mockCheckCachedStatus.mockResolvedValue(makeTbCachedResponse(['hash-1']));
+			const { result } = renderAvailabilityHook({ rdKey: null, adKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['TB']);
+			});
+
+			expect(mockCheckCachedStatus).toHaveBeenCalled();
+			expect(mockCheckDatabaseAvailabilityTb).toHaveBeenCalled();
+		});
+
+		it('does not treat incomplete RD response as cached', async () => {
+			addRd.mockResolvedValue({ id: '123', status: 'downloading', progress: 50 });
+			const { result } = renderAvailabilityHook({ adKey: null, torboxKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['RD']);
+			});
+
+			// Should still call the db check function (it gets called regardless for the hash array)
+			// But the response was not "cached" so the isCachedInRD flag is false
+			expect(addRd).toHaveBeenCalled();
+			expect(deleteRd).toHaveBeenCalled();
+		});
+	});
+	// =========================================================================
+	// Debrid-Link
+	// =========================================================================
+
+	describe('Debrid-Link', () => {
+		const sweep = (over = {}) => ({
+			results: [{ hash: 'hash-1', cached: true, checked: true, ...over }],
+			removedIds: [],
+			leftBehindIds: [],
+			floodLockedOut: false,
+		});
+
+		it('probes the one row it was asked about, not the page', async () => {
+			// The probe mutates, so it runs per row from a button. Handing it
+			// the whole page is what the sweep used to do and is exactly what
+			// churned somebody's library for rows they never asked about.
+			mockCheckDebridLinkCache.mockResolvedValue(sweep());
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				debridLinkKey: 'dl-key',
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['DL']);
+			});
+
+			expect(mockCheckDebridLinkCache).toHaveBeenCalledWith('dl-key', ['hash-1']);
+			expect(searchResults.find((r) => r.hash === 'hash-1')?.dlAvailable).toBe(true);
+		});
+
+		it('leaves a row alone when the probe never got an answer', async () => {
+			// `checked: false` is the hour-long lockout or an aborted sweep. It
+			// is not a miss, and marking it one would tell a user Debrid-Link
+			// lacks something it may well be holding.
+			mockCheckDebridLinkCache.mockResolvedValue(sweep({ cached: false, checked: false }));
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				debridLinkKey: 'dl-key',
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['DL']);
+			});
+
+			// Unset, not false: an unanswered row has to read the same as one
+			// nobody has checked yet.
+			expect(searchResults.find((r) => r.hash === 'hash-1')?.dlAvailable).toBeFalsy();
+		});
+
+		it('is not asked at all without a Debrid-Link key', async () => {
+			mockCheckDebridLinkCache.mockClear();
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				debridLinkKey: null,
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['DL']);
+			});
+
+			expect(mockCheckDebridLinkCache).not.toHaveBeenCalled();
+		});
+	});
+
+	// =========================================================================
+	// Offcloud
+	// =========================================================================
+
+	describe('Offcloud', () => {
+		it('marks a row available from a single-row probe', async () => {
+			mockCheckOffcloudCache.mockResolvedValue([{ hash: 'hash-1', cached: true }]);
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				offcloudKey: 'oc-key',
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['OC']);
+			});
+
+			expect(mockCheckOffcloudCache).toHaveBeenCalledWith('oc-key', ['hash-1']);
+			expect(searchResults.find((r) => r.hash === 'hash-1')?.ocAvailable).toBe(true);
+		});
+
+		it('marks by set membership, so a miss is an absent hash', async () => {
+			// `/cache` replies with hits only. `checkOffcloudCache` has already
+			// rebuilt one answer per input, and this consumes it that way: an
+			// answer that never mentions hash-2 must leave hash-2 uncached rather
+			// than shifting hash-1's answer onto it.
+			mockCheckOffcloudCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: true },
+				{ hash: 'hash-2', cached: false },
+			]);
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				offcloudKey: 'oc-key',
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['OC']);
+			});
+
+			expect(searchResults.find((r) => r.hash === 'hash-1')?.ocAvailable).toBe(true);
+			expect(searchResults.find((r) => r.hash === 'hash-2')?.ocAvailable).toBe(false);
+		});
+
+		it('ignores a hash Offcloud volunteered that was never asked about', async () => {
+			mockCheckOffcloudCache.mockResolvedValue([
+				{ hash: 'someone-elses-hash', cached: true },
+				{ hash: 'hash-2', cached: true },
+			]);
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				offcloudKey: 'oc-key',
+			});
+
+			await act(async () => {
+				await result.current.checkServiceAvailabilityBulk(searchResults, ['OC']);
+			});
+
+			expect(searchResults.find((r) => r.hash === 'hash-1')?.ocAvailable).toBe(false);
+			expect(searchResults.find((r) => r.hash === 'hash-2')?.ocAvailable).toBe(true);
+		});
+
+		it('never probes Offcloud without an Offcloud key', async () => {
+			const { result } = renderAvailabilityHook({ offcloudKey: null });
+
+			await act(async () => {
+				await result.current.checkServiceAvailability(searchResults[0], ['OC']);
+			});
+
+			expect(mockCheckOffcloudCache).not.toHaveBeenCalled();
+			expect(mockToast.error).toHaveBeenCalledWith(
+				'No services available for availability check.'
+			);
+		});
+
+		it('tracks OC in the per-row checking state', async () => {
+			const { result } = renderAvailabilityHook({
+				rdKey: null,
+				adKey: null,
+				torboxKey: null,
+				offcloudKey: 'oc-key',
+			});
+
+			expect(result.current.isHashServiceChecking('hash-1', 'OC')).toBe(false);
+		});
+	});
+});

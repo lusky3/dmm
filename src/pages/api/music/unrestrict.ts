@@ -1,0 +1,212 @@
+import {
+	addHashAsMagnet,
+	deleteTorrent,
+	getTorrentInfo,
+	selectFiles,
+	unrestrictLink,
+} from '@/services/realDebrid';
+import { BLOCKED_MESSAGE, isHashBlocked } from '@/services/takedown/blocklist';
+import { getClientIpFromRequest } from '@/utils/clientIp';
+import { prisma } from '@/utils/prisma';
+import { RdAddPausedError, retryRdAddThroughPause } from '@/utils/rdAddPause';
+import { isVideo } from '@/utils/selectable';
+import { NextApiRequest, NextApiResponse } from 'next';
+
+export interface UnrestrictRequest {
+	link: string;
+	hash: string;
+	fileId: number;
+	accessToken: string;
+}
+
+export interface UnrestrictTrackResponse {
+	streamUrl: string;
+	filename: string;
+	filesize: number;
+	mimeType: string;
+}
+
+const MIME_TYPES: Record<string, string> = {
+	'.flac': 'audio/flac',
+	'.mp3': 'audio/mpeg',
+	'.m4a': 'audio/mp4',
+	'.aac': 'audio/aac',
+	'.ogg': 'audio/ogg',
+	'.opus': 'audio/opus',
+	'.wav': 'audio/wav',
+	'.wma': 'audio/x-ms-wma',
+};
+
+function getMimeType(filename: string): string {
+	const ext = filename.toLowerCase().slice(filename.lastIndexOf('.'));
+	return MIME_TYPES[ext] ?? 'audio/mpeg';
+}
+
+const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Wait for the torrent to have files available (magnet conversion complete).
+ * Polls getTorrentInfo until files appear or timeout is reached.
+ */
+async function waitForFiles(
+	accessToken: string,
+	torrentId: string,
+	maxAttempts = 10,
+	intervalMs = 1000
+): Promise<Awaited<ReturnType<typeof getTorrentInfo>>> {
+	for (let i = 0; i < maxAttempts; i++) {
+		const info = await getTorrentInfo(accessToken, torrentId, false);
+		if (info.files.length > 0) return info;
+		await delay(intervalMs);
+	}
+	throw new Error('Timed out waiting for torrent files');
+}
+
+/**
+ * Wait for the torrent to reach "downloaded" status (links available).
+ * Polls getTorrentInfo until status is downloaded or timeout is reached.
+ */
+async function waitForDownloaded(
+	accessToken: string,
+	torrentId: string,
+	maxAttempts = 15,
+	intervalMs = 1000
+): Promise<Awaited<ReturnType<typeof getTorrentInfo>>> {
+	for (let i = 0; i < maxAttempts; i++) {
+		const info = await getTorrentInfo(accessToken, torrentId, false);
+		if (info.status === 'downloaded' && info.links.length > 0) return info;
+		if (info.status === 'error' || info.status === 'dead' || info.status === 'virus') {
+			throw new Error(`Torrent status: ${info.status}`);
+		}
+		await delay(intervalMs);
+	}
+	throw new Error('Timed out waiting for torrent to be ready');
+}
+
+export default async function handler(
+	req: NextApiRequest,
+	res: NextApiResponse<UnrestrictTrackResponse | { error: string; errorCode?: number }>
+) {
+	if (req.method !== 'POST') {
+		return res.status(405).json({ error: 'Method not allowed' });
+	}
+
+	const { link, hash, fileId, accessToken } = req.body as UnrestrictRequest;
+
+	if (!accessToken) {
+		return res.status(401).json({ error: 'Missing access token' });
+	}
+
+	if (!hash || fileId === undefined) {
+		return res.status(400).json({ error: 'Missing hash or fileId' });
+	}
+	if (await isHashBlocked(hash)) {
+		return res.status(451).json({ error: BLOCKED_MESSAGE });
+	}
+
+	const ipAddress = getClientIpFromRequest(req);
+
+	// Fast path: try to unrestrict the stored link directly (avoids full magnet flow)
+	if (link) {
+		try {
+			const unrestricted = await unrestrictLink(accessToken, link, ipAddress, false);
+			console.log('[Music Unrestrict] Fast path succeeded', { hash, fileId });
+			return res.status(200).json({
+				streamUrl: unrestricted.download,
+				filename: unrestricted.filename,
+				filesize: unrestricted.filesize,
+				mimeType: getMimeType(unrestricted.filename),
+			});
+		} catch (fastPathError: unknown) {
+			console.log('[Music Unrestrict] Fast path failed, falling back to magnet flow', {
+				hash,
+				fileId,
+				error:
+					(fastPathError as any)?.response?.data?.error ||
+					(fastPathError as Error)?.message,
+			});
+		}
+	}
+
+	let torrentId: string | undefined;
+
+	try {
+		// The player is waiting: a 451 gets one more try after the account's
+		// pause, then a temporary 503 rather than a verdict on the release.
+		// Unless the album's name on record is one RD blocks, which no wait changes.
+		const onRecord = await prisma.availableMusic
+			.findUnique({ where: { hash }, select: { filename: true, originalFilename: true } })
+			.catch(() => null);
+		const names = onRecord ? [onRecord.originalFilename, onRecord.filename] : [];
+		torrentId = await retryRdAddThroughPause(
+			() => addHashAsMagnet(accessToken, hash, false, { names }),
+			{ token: accessToken }
+		);
+
+		// Wait for magnet conversion to complete (files become available)
+		const initialInfo = await waitForFiles(accessToken, torrentId);
+
+		// Select only media files (audio/video), skip junk like .nfo, .txt, .jpg, .cue, .log
+		let mediaFileIds = initialInfo.files.filter(isVideo).map((f) => `${f.id}`);
+		if (mediaFileIds.length === 0) {
+			// Fallback to all files if no recognized media files found
+			mediaFileIds = initialInfo.files.map((f) => `${f.id}`);
+		}
+		await selectFiles(accessToken, torrentId, mediaFileIds, false);
+
+		// Wait for torrent to reach "downloaded" status so links are populated
+		const torrentInfo = await waitForDownloaded(accessToken, torrentId);
+
+		const fileIdx = torrentInfo.files
+			.filter((f) => f.selected)
+			.findIndex((f) => f.id === fileId);
+		const link = torrentInfo.links[fileIdx] ?? torrentInfo.links[0];
+
+		if (!link) {
+			throw new Error('No download link found for this track');
+		}
+
+		const unrestricted = await unrestrictLink(accessToken, link, ipAddress, false);
+
+		await deleteTorrent(accessToken, torrentId, false);
+
+		console.log('[Music Unrestrict] Magnet flow succeeded', { hash, fileId });
+
+		return res.status(200).json({
+			streamUrl: unrestricted.download,
+			filename: unrestricted.filename,
+			filesize: unrestricted.filesize,
+			mimeType: getMimeType(unrestricted.filename),
+		});
+	} catch (error: unknown) {
+		if (error instanceof RdAddPausedError) {
+			res.setHeader('Retry-After', '120');
+			return res.status(503).json({ error: error.message });
+		}
+		if (torrentId) {
+			try {
+				await deleteTorrent(accessToken, torrentId, false);
+			} catch {
+				// ignore cleanup errors
+			}
+		}
+
+		const axiosError = (error as any)?.response?.data;
+		const errorCode = axiosError?.error_code;
+		const errorMessage =
+			axiosError?.error || (error as Error)?.message || 'Failed to unrestrict link';
+
+		console.error('[Music Unrestrict] Error:', {
+			hash,
+			fileId,
+			errorCode,
+			errorMessage,
+			status: (error as any)?.response?.status,
+		});
+
+		return res.status(500).json({
+			error: errorMessage,
+			errorCode,
+		});
+	}
+}

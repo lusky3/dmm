@@ -1,10 +1,11 @@
 import { getTorrentInfo, unrestrictLink } from '@/services/realDebrid';
+import { getClientIpFromRequest } from '@/utils/clientIp';
 import { NextApiHandler, NextApiRequest, NextApiResponse } from 'next';
 
 const handler: NextApiHandler = async (req: NextApiRequest, res: NextApiResponse) => {
 	const { token, torrentId } = req.query;
 	const rdKey = token as string;
-	const ipAddress = (req.headers['cf-connecting-ip'] as string) ?? req.socket.remoteAddress;
+	const ipAddress = getClientIpFromRequest(req);
 	const [filename, downloadLinks] = await exportDownloadLinks(
 		rdKey,
 		torrentId as string,
@@ -15,7 +16,7 @@ const handler: NextApiHandler = async (req: NextApiRequest, res: NextApiResponse
 		res.setHeader('Content-Type', 'text/plain');
 		res.status(200).send(downloadLinks);
 	} else {
-		res.status(500).send('Internal Server Error');
+		res.status(500).json({ error: `No download links found for torrent ${torrentId}` });
 	}
 };
 
@@ -25,18 +26,18 @@ export const exportDownloadLinks = async (rdKey: string, torrentId: string, ipAd
 	let filename = '',
 		downloadLinks = '';
 	try {
-		const info = await getTorrentInfo(rdKey, torrentId, true);
+		const info = await getTorrentInfo(rdKey, torrentId, false);
 		filename = info.original_filename;
 		for (const link of info.links) {
 			try {
-				const resp = await unrestrictLink(rdKey, link, ipAddress, true);
+				const resp = await unrestrictLink(rdKey, link, ipAddress, false);
 				downloadLinks += resp.download + '\n';
 			} catch (e) {
-				console.log('exportdownload, unrestrict error', e);
+				console.error('exportdownload, unrestrict error', e);
 			}
 		}
 	} catch (e) {
-		console.log('exportdownload, getinfo error', e);
+		console.error('exportdownload, gettorrentinfo error', e);
 	}
 	return [filename, downloadLinks];
 };

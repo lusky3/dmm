@@ -1,105 +1,117 @@
 import Poster from '@/components/poster';
 import useLocalStorage from '@/hooks/localStorage';
+import { useCachedList } from '@/hooks/useCachedList';
 import {
 	TraktMediaItem,
 	fetchListItems,
 	getLikedLists,
 	getUsersPersonalLists,
 } from '@/services/trakt';
+import { toasterPosition } from '@/utils/toastOptions';
 import { withAuth } from '@/utils/withAuth';
+import { List } from 'lucide-react';
 import Head from 'next/head';
-import Image from 'next/image';
 import Link from 'next/link';
-import { useEffect, useState } from 'react';
+import { useRouter } from 'next/router';
 import { Toaster } from 'react-hot-toast';
 
 function TraktMyLists() {
 	const [traktToken] = useLocalStorage<string>('trakt:accessToken');
 	const [traktUserSlug] = useLocalStorage<string>('trakt:userSlug');
-	const [arrayOfResults, setArrayOfResults] = useState<Record<string, TraktMediaItem[]>>({});
-	const [loading, setLoading] = useState(2);
+	const router = useRouter();
+	const selectedList = typeof router.query.list === 'string' ? router.query.list : '';
 
-	useEffect(() => {
-		if (!traktToken || !traktUserSlug) {
-			return;
+	const { data, loading } = useCachedList<Record<string, TraktMediaItem[]>>(
+		traktToken && traktUserSlug ? `trakt:mylists:${traktUserSlug}` : null,
+		async () => {
+			const [personalLists, likedLists] = await Promise.all([
+				getUsersPersonalLists(traktToken!, traktUserSlug!),
+				getLikedLists(traktToken!, traktUserSlug!),
+			]);
+
+			const personalEntries = await Promise.all(
+				personalLists.map(async (list) => {
+					const items = await fetchListItems(traktToken!, traktUserSlug!, list.ids.trakt);
+					return [list.name, items] as const;
+				})
+			);
+
+			const likedEntries = await Promise.all(
+				likedLists.map(async (listContainer) => {
+					const list = listContainer.list;
+					const items = await fetchListItems(
+						traktToken!,
+						list.user.ids.slug,
+						list.ids.trakt
+					);
+					return [list.name, items] as const;
+				})
+			);
+
+			return Object.fromEntries([...personalEntries, ...likedEntries]);
 		}
-		(async () => {
-			const response = await getUsersPersonalLists(traktToken, traktUserSlug);
-			for (const list of response) {
-				const listName = list.name;
-				const items = await fetchListItems(traktToken, traktUserSlug, list.ids.trakt);
-				setArrayOfResults((prev) => ({
-					...prev,
-					[listName]: items,
-				}));
-			}
-			setLoading((prev) => prev - 1);
-		})();
-		(async () => {
-			const response = await getLikedLists(traktToken, traktUserSlug);
-			for (const listContainer of response) {
-				const list = listContainer.list;
-				const listName = list.name;
-				const items = await fetchListItems(traktToken, list.user.ids.slug, list.ids.trakt);
-				setArrayOfResults((prev) => ({
-					...prev,
-					[listName]: items,
-				}));
-			}
-			setLoading((prev) => prev - 1);
-		})();
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, []);
+	);
+
+	const arrayOfResults = data ?? {};
+	const selectedItems =
+		Object.hasOwn(arrayOfResults, selectedList) && Array.isArray(arrayOfResults[selectedList])
+			? arrayOfResults[selectedList]
+			: null;
 
 	return (
-		<div className="mx-2 my-1 max-w-full">
+		<div className="mx-2 my-1 min-h-screen bg-gray-900">
 			<Head>
 				<title>Debrid Media Manager - Trakt - {traktUserSlug}&apos;s lists</title>
 			</Head>
-			<Toaster position="bottom-right" />
-			<div className="flex justify-between items-center mb-2">
-				<h1 className="text-xl font-bold">Trakt - 🧏🏻‍♀️ {traktUserSlug}&apos;s lists</h1>
+			<Toaster position={toasterPosition()} />
+
+			<div className="mb-4 flex items-center justify-between">
+				<h1 className="text-xl font-bold text-white">
+					Trakt - <List className="mr-1 inline-block h-5 w-5 text-green-400" />{' '}
+					{traktUserSlug}&apos;s lists
+				</h1>
 				<Link
 					href="/"
-					className="text-sm bg-cyan-800 hover:bg-cyan-700 text-white py-1 px-2 rounded"
+					className="shrink-0 rounded border-2 border-cyan-500 bg-cyan-900/30 px-2 py-1 text-sm whitespace-nowrap text-cyan-100 transition-colors hover:bg-cyan-800/50"
 				>
 					Go Home
 				</Link>
 			</div>
-			{Object.keys(arrayOfResults)
-				.sort()
-				.map((listName: string, idx: number) => (
-					<div key={listName}>
-						<h2 className="mt-4 text-2xl font-bold">
-							<span className="text-yellow-500">{idx + 1}</span> {listName}
-						</h2>
-						<div className="grid grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10 gap-2">
-							{(arrayOfResults[listName].length >= 8
-								? arrayOfResults[listName].slice(0, 8)
-								: arrayOfResults[listName]
-							).map((item: TraktMediaItem, idx: number, arr: TraktMediaItem[]) => {
-								// check if end of list
-								if (
-									arrayOfResults[listName].length >= 8 &&
-									idx === arr.length - 1
-								) {
-									return (
-										<Link
-											key={listName}
-											href={`/trakt/mylists/${listName}`}
-											className="flex justify-center items-center bg-gray-800 text-white font-bold rounded"
-										>
-											<Image
-												src={`https://fakeimg.pl/400x600/282828/eae0d0?font_size=40&font=bebas&text=View ${
-													arrayOfResults[listName].length - 8
-												} more`}
-												alt="plus"
-												width={400}
-												height={600}
-											/>
-										</Link>
-									);
-								}
+
+			<div className="mb-6">
+				<select
+					value={selectedList}
+					onChange={(e) => {
+						const query = { ...router.query };
+						if (e.target.value) {
+							query.list = e.target.value;
+						} else {
+							delete query.list;
+						}
+						void router.replace({ pathname: router.pathname, query }, undefined, {
+							shallow: true,
+							scroll: false,
+						});
+					}}
+					className="w-full rounded bg-gray-800 p-2 text-white"
+				>
+					<option value="">Select a list</option>
+					{Object.keys(arrayOfResults)
+						.sort()
+						.map((listName) => (
+							<option key={listName} value={listName}>
+								{listName}
+							</option>
+						))}
+				</select>
+			</div>
+
+			<div className="flex w-full max-w-7xl flex-col items-center gap-6">
+				{selectedItems && (
+					<div className="w-full">
+						<h2 className="mb-4 text-xl font-bold text-white">{selectedList}</h2>
+						<div className="grid grid-cols-2 gap-3 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10">
+							{selectedItems.map((item: TraktMediaItem) => {
 								const imdbid =
 									item.movie?.ids?.imdb ||
 									item.show?.ids?.imdb ||
@@ -122,12 +134,20 @@ function TraktMyLists() {
 							})}
 						</div>
 					</div>
-				))}
-			{loading !== 0 && (
-				<div className="flex justify-center items-center mt-4">
-					<div className="animate-spin rounded-full h-10 w-10 border-t-2 border-b-2 border-blue-500"></div>
-				</div>
-			)}
+				)}
+
+				{!selectedList && !loading && (
+					<div className="text-center text-white">
+						Please select a list to view its contents
+					</div>
+				)}
+
+				{loading && Object.keys(arrayOfResults).length === 0 && (
+					<div className="mt-4 flex items-center justify-center">
+						<div className="h-10 w-10 animate-spin rounded-full border-t-2 border-b-2 border-blue-500"></div>
+					</div>
+				)}
+			</div>
 		</div>
 	);
 }

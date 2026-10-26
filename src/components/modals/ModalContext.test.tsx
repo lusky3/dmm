@@ -1,0 +1,151 @@
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { afterEach, describe, expect, it } from 'vitest';
+import { ModalProvider, getGlobalModalInstance } from './ModalContext';
+
+const renderWithProvider = () => {
+	render(
+		<ModalProvider>
+			<div>child</div>
+		</ModalProvider>
+	);
+	return waitFor(() => {
+		const instance = getGlobalModalInstance();
+		if (!instance) {
+			throw new Error('Modal instance not ready');
+		}
+		return instance;
+	});
+};
+
+describe('ModalContext', () => {
+	afterEach(() => {
+		(window as any).closePopup = undefined;
+	});
+
+	it('fires confirm dialog and resolves when confirmed', async () => {
+		const modal = await renderWithProvider();
+		const promise = modal.fire({
+			title: 'Delete item?',
+			text: 'Are you sure?',
+		});
+
+		const confirmButton = await screen.findByRole('button', { name: 'OK' });
+		expect((window as any).closePopup).toBeDefined();
+		await userEvent.click(confirmButton);
+		await expect(promise).resolves.toEqual({ isConfirmed: true });
+		await waitFor(() => expect((window as any).closePopup).toBeUndefined());
+	});
+
+	// The info popups show no buttons, so on a phone the only way out was the
+	// thin strip of backdrop around a panel that fills the screen.
+	it('gives a button-less html dialog a close button', async () => {
+		const modal = await renderWithProvider();
+		const promise = modal.fire({
+			html: '<h1>Some.Release.2020</h1>',
+			showConfirmButton: false,
+			showCancelButton: false,
+		});
+		await userEvent.click(await screen.findByRole('button', { name: 'Close' }));
+		await expect(promise).resolves.toMatchObject({ isDismissed: true, dismiss: 'close' });
+	});
+
+	it('leaves the close button off an html dialog that has its own buttons', async () => {
+		const modal = await renderWithProvider();
+		void modal.fire({ html: '<h1>Some.Release.2020</h1>', showCancelButton: false });
+		await screen.findByText('Some.Release.2020');
+		expect(screen.queryByRole('button', { name: 'Close' })).toBeNull();
+	});
+
+	it('shows a poster above an html dialog when one is given', async () => {
+		const modal = await renderWithProvider();
+		void modal.fire({
+			html: '<h1>Mad.Max.Fury.Road.2015.2160p</h1>',
+			poster: { imdbId: 'tt1392190', title: 'Mad Max: Fury Road' },
+			showConfirmButton: false,
+			showCancelButton: false,
+		});
+		const poster = await screen.findByTestId('dialog-poster');
+		expect(poster.querySelector('img')?.getAttribute('src')).toContain('tt1392190');
+		expect(screen.getByText('Mad.Max.Fury.Road.2015.2160p')).toBeTruthy();
+	});
+
+	it('keeps the poster off phone widths so the release details stay in view', async () => {
+		const modal = await renderWithProvider();
+		void modal.fire({
+			html: '<h1>Mad.Max.Fury.Road.2015.2160p</h1>',
+			poster: { imdbId: 'tt1392190', title: 'Mad Max: Fury Road' },
+			showConfirmButton: false,
+			showCancelButton: false,
+		});
+		const poster = await screen.findByTestId('dialog-poster');
+		expect(poster.className.split(' ')).toEqual(expect.arrayContaining(['hidden', 'sm:block']));
+	});
+
+	it('shows no poster without one', async () => {
+		const modal = await renderWithProvider();
+		void modal.fire({ html: '<h1>Some.Release.2020</h1>', showCancelButton: false });
+		await screen.findByText('Some.Release.2020');
+		expect(screen.queryByTestId('dialog-poster')).toBeNull();
+	});
+
+	it('renders loading modal when showLoading is called', async () => {
+		const modal = await renderWithProvider();
+		modal.showLoading();
+		expect(await screen.findByText('Loading...')).toBeInTheDocument();
+	});
+
+	it('supports choice dialogs and deny flow', async () => {
+		const modal = await renderWithProvider();
+		const resultPromise = modal.fire({
+			title: 'Pick an option',
+			text: 'Choose wisely',
+			showDenyButton: true,
+			confirmButtonText: 'Accept',
+			denyButtonText: 'Reject',
+		});
+
+		const denyButton = await screen.findByRole('button', { name: 'Reject' });
+		await userEvent.click(denyButton);
+		await expect(resultPromise).resolves.toEqual({ isConfirmed: false, isDenied: true });
+	});
+
+	it('opens custom html dialog and resolves with preConfirm result', async () => {
+		const modal = await renderWithProvider();
+		const resultPromise = modal.fire({
+			title: 'Custom',
+			html: '<p>Custom body</p>',
+			preConfirm: () => Promise.resolve('done'),
+		});
+
+		const confirmButton = await screen.findByRole('button', { name: 'OK' });
+		await userEvent.click(confirmButton);
+		await expect(resultPromise).resolves.toEqual({ isConfirmed: true, value: 'done' });
+	});
+
+	it('keeps rejected custom input editable until validation succeeds', async () => {
+		const modal = await renderWithProvider();
+		const result = modal.fire({
+			title: 'Add a torrent',
+			html: '<input aria-label="Torrent source" />',
+			preConfirm: () => {
+				const input = document.querySelector<HTMLInputElement>(
+					'input[aria-label="Torrent source"]'
+				);
+				return input?.value.startsWith('magnet:') ? input.value : false;
+			},
+		});
+		const input = await screen.findByRole('textbox', { name: 'Torrent source' });
+		await userEvent.type(input, 'invalid source');
+		await userEvent.click(screen.getByRole('button', { name: 'OK' }));
+		expect(input).toBeInTheDocument();
+		expect(input).toHaveValue('invalid source');
+
+		const source = 'magnet:?xt=urn:btih:08ada5a7a6183aae1e09d831df6748d566095a10';
+		await userEvent.clear(input);
+		await userEvent.type(input, source);
+		await userEvent.click(screen.getByRole('button', { name: 'OK' }));
+		await expect(result).resolves.toEqual({ isConfirmed: true, value: source });
+		expect(input).not.toBeInTheDocument();
+	});
+});

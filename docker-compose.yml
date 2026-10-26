@@ -1,20 +1,96 @@
 version: '3.9'
 services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
   tor:
     image: debridmediamanager/tor
     deploy:
       replicas: 1
 
   web:
-    image: debridmediamanager/debrid-media-manager:latest
+    image: dmm-prod:latest
     ports:
       - 3000:3000
     env_file:
       - .env
       - .env.local
+    environment:
+      - REDIS_URL=redis://redis:6379
     depends_on:
       - tor
+      - redis
+    # Docker's embedded DNS forwards to Hetzner's resolvers, which time out on
+    # a share of lookups and broke every RD call through /api/anticors (#276).
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
+    healthcheck:
+      test: ['CMD-SHELL', 'curl -sf -m 5 http://localhost:3000/api/healthz | grep -qm1 ok']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    # Bounds each container's own log on disk; logship keeps the history and
+    # finds web's lines by the Swarm task name json-file adds to each entry.
+    logging:
+      driver: json-file
+      options:
+        max-size: '50m'
+        max-file: '3'
+        labels: 'com.docker.swarm.task.name'
     deploy:
-      replicas: 1
+      replicas: 4
       restart_policy:
-        condition: on-failure
+        # A health kill ends in SIGTERM and a clean exit 0, which on-failure
+        # never restarts.
+        condition: any
+
+  # Swarm deletes a container's log with its task, five tasks per replica, so
+  # a busy deploy day left about four hours of history. This copies every
+  # dmm_web line, credentials redacted, into one file per UTC day under
+  # /var/log/dmm-web, compressed once the day is over and deleted after 14.
+  # CI tests and installs scripts/ops/logship/ into /home/ben/dmm/logship and
+  # creates the log directory before deploying.
+  logship:
+    image: timberio/vector:0.58.0-alpine
+    entrypoint: ['/bin/sh', '-c']
+    command:
+      - >-
+        umask 077;
+        while true; do sh /etc/vector/maintain.sh; sleep 3600; done &
+        exec vector --config /etc/vector/vector.yaml --watch-config
+    environment:
+      - VECTOR_LOG=warn
+      # One worker thread per host core (16 on dmm-01) took the first start's
+      # read of every existing container log past 256M and an OOM kill.
+      - VECTOR_THREADS=2
+    volumes:
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - /home/ben/dmm/logship:/etc/vector:ro
+      - /var/log/dmm-web:/var/log/dmm-web
+      - logship_state:/var/lib/vector
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '2'
+    deploy:
+      mode: global
+      restart_policy:
+        condition: any
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+volumes:
+  redis_data:
+  logship_state:

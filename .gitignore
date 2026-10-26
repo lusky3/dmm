@@ -43,8 +43,6 @@ src/utils/parser.ts
 tmp/
 temp/
 
-pscale_dump_dmm_main/
-
 *.sqlite
 
 src/pages/api/importers/yts.json
@@ -52,3 +50,29 @@ src/pages/api/importers/yts.json
 src/tgx/*.json
 src/hdt/*.json
 src/json-to-import
+
+.aider*
+.env
+
+# PWA files
+public/service-worker.js
+public/service-worker.js.map
+public/swe-worker-*.js
+public/swe-worker-*.js.map
+public/workbox-*.js
+public/worker-*.js
+public/sw.js
+public/sw.js.map
+public/workbox-*.js.map
+public/fallback-*.js
+**/.claude/settings.local.json
+# Agent sessions put full worktrees of this repo here. They are separate
+# checkouts, never content of this one.
+**/.claude/worktrees/
+
+credentials.txt
+
+.data/
+
+AGENTS.md
+CLAUDE.md

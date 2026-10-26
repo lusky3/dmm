@@ -1,0 +1,553 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({
+	deleteMagnetAd: vi.fn(),
+	prepareMagnetForCast: vi.fn(),
+	pickBiggestVideo: vi.fn(),
+	findVideoByName: vi.fn(),
+	toastError: vi.fn(),
+}));
+
+vi.mock('@/services/allDebrid', () => ({ deleteMagnetAd: mocks.deleteMagnetAd }));
+vi.mock('./allDebridCastClientPipeline', () => ({
+	prepareMagnetForCast: mocks.prepareMagnetForCast,
+	pickBiggestVideo: mocks.pickBiggestVideo,
+	findVideoByName: mocks.findVideoByName,
+}));
+vi.mock('react-hot-toast', () => ({
+	default: { error: mocks.toastError },
+}));
+vi.mock('@/utils/selectable', () => ({
+	isVideo: ({ path }: { path: string }) => /\.(mkv|mp4)$/i.test(path),
+}));
+
+import {
+	getBiggestVideoFile,
+	openWatch,
+	pickInfoService,
+	pickWatchService,
+	WATCH_SERVICE_LABEL,
+	watchKeyFor,
+} from './watchService';
+
+const cached = (over: Partial<Record<string, boolean>> = {}) => ({
+	rdAvailable: false,
+	adAvailable: false,
+	tbAvailable: false,
+	pmAvailable: false,
+	ocAvailable: false,
+	dlAvailable: false,
+	...over,
+});
+
+beforeEach(() => {
+	vi.clearAllMocks();
+	// Matches the real signature (Promise<void>); openWatch chains .catch on it.
+	mocks.deleteMagnetAd.mockResolvedValue(undefined);
+});
+
+describe('pickWatchService', () => {
+	it('prefers RD, then AD, then TB', () => {
+		const all = cached({ rdAvailable: true, adAvailable: true, tbAvailable: true });
+		const keys = { rdKey: 'r', adKey: 'a', torboxKey: 't' };
+
+		expect(pickWatchService(all as any, keys)).toBe('rd');
+		expect(
+			pickWatchService(cached({ adAvailable: true, tbAvailable: true }) as any, keys)
+		).toBe('ad');
+		expect(pickWatchService(cached({ tbAvailable: true }) as any, keys)).toBe('tb');
+	});
+
+	// Cached somewhere the user has no key for is not watchable.
+	it('skips a service whose key is missing', () => {
+		const all = cached({ rdAvailable: true, adAvailable: true, tbAvailable: true });
+
+		expect(pickWatchService(all as any, { adKey: 'a' })).toBe('ad');
+		expect(pickWatchService(all as any, { torboxKey: 't' })).toBe('tb');
+		expect(pickWatchService(all as any, {})).toBeNull();
+	});
+
+	it('returns null when nothing is cached', () => {
+		expect(
+			pickWatchService(cached() as any, { rdKey: 'r', adKey: 'a', torboxKey: 't' })
+		).toBeNull();
+	});
+});
+
+describe('watchKeyFor', () => {
+	it('returns the key belonging to the service', () => {
+		const keys = { rdKey: 'r', adKey: 'a', torboxKey: 't' };
+		expect(watchKeyFor('rd', keys)).toBe('r');
+		expect(watchKeyFor('ad', keys)).toBe('a');
+		expect(watchKeyFor('tb', keys)).toBe('t');
+		expect(watchKeyFor('rd', {})).toBeNull();
+	});
+});
+
+describe('getBiggestVideoFile', () => {
+	it('picks the biggest video, ignoring larger non-video files', () => {
+		const result = {
+			files: [
+				{ fileId: 1, filename: 'huge.iso', filesize: 900 },
+				{ fileId: 2, filename: 'small.mkv', filesize: 10 },
+				{ fileId: 3, filename: 'feature.mkv', filesize: 500 },
+			],
+		};
+
+		expect(getBiggestVideoFile(result as any)).toMatchObject({ fileId: 3 });
+	});
+
+	it('returns undefined when there are no files', () => {
+		expect(getBiggestVideoFile({ files: [] } as any)).toBeUndefined();
+	});
+});
+
+describe('openWatch', () => {
+	const originalOpen = window.open;
+	const originalFetch = global.fetch;
+	let fetchMock: ReturnType<typeof vi.fn>;
+
+	const lastRequest = () => {
+		const [url, init] = fetchMock.mock.calls[fetchMock.mock.calls.length - 1] as [string, any];
+		return { url, init, body: JSON.parse(init.body) };
+	};
+
+	// A stand-in for the opened tab that records what was written into it, so a
+	// test can tell "the tab shows a Play link" from "the tab was navigated".
+	const fakeTab = () => {
+		const writes: string[] = [];
+		return {
+			location: { href: '' },
+			close: vi.fn(),
+			document: {
+				open: vi.fn(),
+				write: (html: string) => writes.push(html),
+				close: vi.fn(),
+			},
+			shown: () => writes[writes.length - 1] ?? '',
+			renders: () => writes.length,
+		} as any;
+	};
+
+	beforeEach(() => {
+		fetchMock = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 200,
+			json: async () => ({ intent: 'vlc://stream' }),
+		});
+		global.fetch = fetchMock as any;
+	});
+
+	afterEach(() => {
+		window.open = originalOpen;
+		global.fetch = originalFetch;
+	});
+
+	it('resolves RD by hash without touching AllDebrid', async () => {
+		const tab: any = { location: { href: '' }, close: vi.fn() };
+		const open = vi.fn(() => tab);
+		window.open = open as any;
+
+		await openWatch({
+			service: 'rd',
+			player: 'windows/vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+			fileName: 'Feature.mkv',
+		});
+
+		const { url, init, body } = lastRequest();
+		expect(url).toBe('/api/watch/resolve/windows/vlc');
+		expect(init.method).toBe('POST');
+		expect(body).toMatchObject({ service: 'rd', hash: 'abc', fileName: 'Feature.mkv' });
+		expect(tab.location.href).toBe('vlc://stream');
+		expect(mocks.prepareMagnetForCast).not.toHaveBeenCalled();
+	});
+
+	// The key used to travel as a query parameter, which put it in the address
+	// bar of the tab that opened and in every access log on the way.
+	it('keeps the debrid key out of the request URL', async () => {
+		window.open = vi.fn(() => ({ location: { href: '' }, close: vi.fn() })) as any;
+
+		await openWatch({
+			service: 'rd',
+			player: 'windows/vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+		});
+
+		const { url, body } = lastRequest();
+		expect(url).not.toContain('rd-key');
+		expect(body.token).toBe('rd-key');
+	});
+
+	// A library row already holds the resolved link. Re-adding the hash would
+	// make RD stall on content the account already has.
+	it('uses a link the caller already holds instead of the hash', async () => {
+		window.open = vi.fn(() => ({ location: { href: '' }, close: vi.fn() })) as any;
+
+		await openWatch({
+			service: 'rd',
+			player: 'windows/vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+			link: 'https://real-debrid.com/d/XYZ',
+		});
+
+		expect(lastRequest().body.link).toBe('https://real-debrid.com/d/XYZ');
+	});
+
+	it('does not re-upload an AD magnet when the row has a link', async () => {
+		window.open = vi.fn(() => ({ location: { href: '' }, close: vi.fn() })) as any;
+
+		await openWatch({
+			service: 'ad',
+			player: 'ios/infuse',
+			hash: 'abc',
+			keys: { adKey: 'ad-key' },
+			link: 'https://alldebrid.com/f/known',
+		});
+
+		expect(mocks.prepareMagnetForCast).not.toHaveBeenCalled();
+		expect(lastRequest().body.link).toBe('https://alldebrid.com/f/known');
+	});
+
+	// The AD magnet prep is async, so the tab has to be opened synchronously on
+	// the click and navigated after — opening it post-await is what popup
+	// blockers reject.
+	it('opens a blank tab first for AD, then navigates it', async () => {
+		const tab: any = { location: { href: '' }, close: vi.fn() };
+		const open = vi.fn(() => tab);
+		window.open = open as any;
+		mocks.prepareMagnetForCast.mockResolvedValue({ magnetId: 55, videoFiles: [] });
+		mocks.findVideoByName.mockReturnValue({ link: 'https://alldebrid.com/f/xyz' });
+
+		await openWatch({
+			service: 'ad',
+			player: 'ios/infuse',
+			hash: 'abc',
+			keys: { adKey: 'ad-key' },
+			fileName: 'Feature.mkv',
+		});
+
+		expect(open).toHaveBeenCalledWith('', '_blank');
+		const { body } = lastRequest();
+		expect(body.service).toBe('ad');
+		expect(body.link).toBe('https://alldebrid.com/f/xyz');
+		expect(tab.location.href).toBe('vlc://stream');
+	});
+
+	// The tab used to be closed and the failure reported only by a toast in the
+	// opener — which is a background tab by then, so on a phone or a TV box the
+	// user watched the tab vanish and was told nothing.
+	it('reports a missing intent in the tab, not just in the opener', async () => {
+		const tab = fakeTab();
+		window.open = vi.fn(() => tab) as any;
+		fetchMock.mockResolvedValue({
+			ok: false,
+			status: 500,
+			json: async () => ({ error: "Torrent status is 'queued'" }),
+		});
+
+		await openWatch({
+			service: 'rd',
+			player: 'windows/vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+		});
+
+		expect(tab.shown()).toContain('queued');
+		expect(tab.close).not.toHaveBeenCalled();
+		expect(mocks.toastError).toHaveBeenCalledWith(expect.stringContaining('queued'));
+	});
+
+	// Uploading is AllDebrid's only cache probe, so it leaves the magnet in the
+	// account; the unlocked link keeps working after the magnet is removed.
+	it('removes the AD magnet it added', async () => {
+		const tab: any = { location: { href: '' }, close: vi.fn() };
+		window.open = vi.fn(() => tab) as any;
+		mocks.prepareMagnetForCast.mockResolvedValue({ magnetId: 55, videoFiles: [] });
+		mocks.pickBiggestVideo.mockReturnValue({ link: 'https://alldebrid.com/f/xyz' });
+
+		await openWatch({
+			service: 'ad',
+			player: 'ios/infuse',
+			hash: 'abc',
+			keys: { adKey: 'ad-key' },
+		});
+
+		expect(mocks.deleteMagnetAd).toHaveBeenCalledWith('ad-key', 55);
+	});
+
+	it("leaves the user's own library entry alone", async () => {
+		const tab: any = { location: { href: '' }, close: vi.fn() };
+		window.open = vi.fn(() => tab) as any;
+		mocks.prepareMagnetForCast.mockResolvedValue({ magnetId: 55, videoFiles: [] });
+		mocks.pickBiggestVideo.mockReturnValue({ link: 'https://alldebrid.com/f/xyz' });
+
+		await openWatch({
+			service: 'ad',
+			player: 'ios/infuse',
+			hash: 'abc',
+			keys: { adKey: 'ad-key' },
+			adInLibrary: true,
+		});
+
+		expect(mocks.deleteMagnetAd).not.toHaveBeenCalled();
+	});
+
+	it('falls back to the biggest video when the name is not in the magnet', async () => {
+		const tab: any = { location: { href: '' }, close: vi.fn() };
+		window.open = vi.fn(() => tab) as any;
+		mocks.prepareMagnetForCast.mockResolvedValue({ magnetId: 1, videoFiles: [] });
+		mocks.findVideoByName.mockReturnValue(null);
+		mocks.pickBiggestVideo.mockReturnValue({ link: 'https://alldebrid.com/f/biggest' });
+
+		await openWatch({
+			service: 'ad',
+			player: 'ios/infuse',
+			hash: 'abc',
+			keys: { adKey: 'ad-key' },
+			fileName: 'Not.In.Magnet.mkv',
+		});
+
+		expect(lastRequest().body.link).toBe('https://alldebrid.com/f/biggest');
+	});
+
+	it('shows the tab why AD prep failed', async () => {
+		const tab = fakeTab();
+		window.open = vi.fn(() => tab) as any;
+		mocks.prepareMagnetForCast.mockRejectedValue(new Error('No video files in magnet'));
+
+		await openWatch({
+			service: 'ad',
+			player: 'ios/infuse',
+			hash: 'abc',
+			keys: { adKey: 'ad-key' },
+		});
+
+		expect(tab.shown()).toContain('No video files in magnet');
+		expect(mocks.toastError).toHaveBeenCalledWith(
+			expect.stringContaining('No video files in magnet')
+		);
+	});
+
+	// The bug this pins: the tab was opened blank and then navigated by assigning
+	// `intent://…` to its location. Android Chrome blocks a scripted jump to an
+	// app, so the tab stayed on about:blank and no player ever opened. The tap on
+	// a real link is what carries the gesture Chrome demands.
+	it('hands an android intent to a Play link instead of navigating the tab', async () => {
+		const tab = fakeTab();
+		window.open = vi.fn(() => tab) as any;
+		fetchMock.mockResolvedValue({
+			ok: true,
+			status: 200,
+			json: async () => ({ intent: 'intent://cdn/movie.mkv#Intent;end' }),
+		});
+
+		await openWatch({
+			service: 'rd',
+			player: 'android/org.videolan.vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+		});
+
+		expect(tab.location.href).toBe('');
+		expect(tab.shown()).toContain('href="intent://cdn/movie.mkv#Intent;end"');
+	});
+
+	// Nothing blocks the scripted navigation off Android, so those users keep the
+	// zero-press path they have always had — with the link there to press if the
+	// player does not come up.
+	it('still navigates the tab itself for a non-android player', async () => {
+		const tab = fakeTab();
+		window.open = vi.fn(() => tab) as any;
+
+		await openWatch({
+			service: 'rd',
+			player: 'windows/vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+		});
+
+		expect(tab.location.href).toBe('vlc://stream');
+		expect(tab.shown()).toContain('href="vlc://stream"');
+	});
+
+	// RD's resolve is five sequential API calls, so the tab is on screen for
+	// seconds before an intent exists. It said nothing at all before.
+	it('tells the tab it is working before the intent arrives', async () => {
+		const tab = fakeTab();
+		window.open = vi.fn(() => tab) as any;
+		let resolveIntent: (value: any) => void = () => {};
+		fetchMock.mockReturnValue(
+			new Promise((resolve) => {
+				resolveIntent = resolve;
+			})
+		);
+
+		const watching = openWatch({
+			service: 'rd',
+			player: 'android/org.videolan.vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+		});
+
+		expect(tab.shown()).toContain('Real-Debrid');
+		expect(tab.shown()).not.toContain('Play');
+		resolveIntent({
+			ok: true,
+			status: 200,
+			json: async () => ({ intent: 'intent://x#Intent;end' }),
+		});
+		await watching;
+		expect(tab.shown()).toContain('Play');
+	});
+
+	// A closed tab throws on `document`, and a watch that resolved must not be
+	// turned into a failure by the tab it can no longer draw into.
+	it('survives the user closing the tab mid-resolve', async () => {
+		const tab: any = {
+			location: { href: '' },
+			close: vi.fn(),
+			get document(): Document {
+				throw new Error('window is closed');
+			},
+		};
+		window.open = vi.fn(() => tab) as any;
+
+		await openWatch({
+			service: 'rd',
+			player: 'windows/vlc',
+			hash: 'abc',
+			keys: { rdKey: 'rd-key' },
+		});
+
+		expect(mocks.toastError).not.toHaveBeenCalled();
+	});
+
+	it('reports a missing key instead of opening anything', async () => {
+		const open = vi.fn();
+		window.open = open as any;
+
+		await openWatch({ service: 'tb', player: 'windows/vlc', hash: 'abc', keys: {} });
+
+		expect(open).not.toHaveBeenCalled();
+		expect(mocks.toastError).toHaveBeenCalledWith(expect.stringContaining('TorBox'));
+	});
+});
+
+describe('Premiumize in the watch order', () => {
+	it('serves a stream when Premiumize is the only service that has it', () => {
+		expect(pickWatchService(cached({ pmAvailable: true }), { premiumizeKey: 'pm' })).toBe('pm');
+	});
+
+	it('never takes playback away from a service the user already had', () => {
+		const keys = { rdKey: 'rd', adKey: 'ad', torboxKey: 'tb', premiumizeKey: 'pm' };
+		expect(pickWatchService(cached({ rdAvailable: true, pmAvailable: true }), keys)).toBe('rd');
+		expect(pickWatchService(cached({ adAvailable: true, pmAvailable: true }), keys)).toBe('ad');
+		expect(pickWatchService(cached({ tbAvailable: true, pmAvailable: true }), keys)).toBe('tb');
+	});
+
+	it('ignores a cached Premiumize result when the user has no Premiumize key', () => {
+		expect(pickWatchService(cached({ pmAvailable: true }), { rdKey: 'rd' })).toBeNull();
+	});
+
+	it('hands the Premiumize key to the pm service', () => {
+		expect(watchKeyFor('pm', { rdKey: 'rd', premiumizeKey: 'pm' })).toBe('pm');
+		expect(watchKeyFor('pm', { rdKey: 'rd' })).toBeNull();
+	});
+});
+describe('Offcloud in the watch order', () => {
+	it('serves a stream when Offcloud is the only service that has it', () => {
+		expect(pickWatchService(cached({ ocAvailable: true }), { offcloudKey: 'oc' })).toBe('oc');
+	});
+
+	it('prefers Premiumize over Offcloud for the very same bytes', () => {
+		// The two serve the same energycdn objects, so the stream is identical
+		// either way - but Premiumize resolves it with one stateless `directdl`
+		// while Offcloud has to add the item and leaves a cloud entry behind.
+		// Given a free choice, take the path that mutates nothing.
+		expect(
+			pickWatchService(cached({ pmAvailable: true, ocAvailable: true }), {
+				premiumizeKey: 'pm',
+				offcloudKey: 'oc',
+			})
+		).toBe('pm');
+	});
+
+	it('never takes playback away from a service the user already had', () => {
+		const keys = {
+			rdKey: 'rd',
+			adKey: 'ad',
+			torboxKey: 'tb',
+			premiumizeKey: 'pm',
+			offcloudKey: 'oc',
+		};
+		expect(pickWatchService(cached({ rdAvailable: true, ocAvailable: true }), keys)).toBe('rd');
+		expect(pickWatchService(cached({ adAvailable: true, ocAvailable: true }), keys)).toBe('ad');
+		expect(pickWatchService(cached({ tbAvailable: true, ocAvailable: true }), keys)).toBe('tb');
+	});
+
+	it('ignores a cached Offcloud result when the user has no Offcloud key', () => {
+		expect(pickWatchService(cached({ ocAvailable: true }), { rdKey: 'rd' })).toBeNull();
+	});
+
+	it('hands the Offcloud key to the oc service', () => {
+		expect(watchKeyFor('oc', { rdKey: 'rd', offcloudKey: 'oc' })).toBe('oc');
+		expect(watchKeyFor('oc', { rdKey: 'rd' })).toBeNull();
+	});
+
+	it('falls back to Offcloud in the info modal when it is the only key', () => {
+		expect(pickInfoService(cached(), { offcloudKey: 'oc' })).toBe('oc');
+	});
+
+	it('labels the service by name', () => {
+		expect(WATCH_SERVICE_LABEL.oc).toBe('Offcloud');
+	});
+});
+
+describe('Debrid-Link in the watch order', () => {
+	it('is chosen when it is the only service holding the row', () => {
+		// The bare-hash add gives Debrid-Link a real cache answer, so it can be
+		// picked now. An unmarked row is still not picked: the sweep leaves a
+		// hash it could not reach unset rather than setting it false.
+		expect(pickWatchService(cached({ dlAvailable: true }), { debridLinkKey: 'dl' })).toBe('dl');
+		expect(pickWatchService(cached(), { debridLinkKey: 'dl' })).toBeNull();
+	});
+
+	it('yields to a service that answered yes without mutating anything', () => {
+		// Debrid-Link's probe is the only one that adds and then undoes an add.
+		// Where another service already holds the same row, that is the cheaper
+		// path to the same bytes, so it wins the order.
+		expect(
+			pickWatchService(cached({ rdAvailable: true, dlAvailable: true }), {
+				rdKey: 'rd',
+				debridLinkKey: 'dl',
+			})
+		).toBe('rd');
+	});
+
+	it('does not become the info modal fallback either', () => {
+		// Same reason: `pickInfoService` agrees with `pickWatchService` by design,
+		// and the search-result modal has no Debrid-Link view to open.
+		expect(pickInfoService(cached(), { debridLinkKey: 'dl' })).toBeNull();
+	});
+
+	it('hands the Debrid-Link credential to the dl service', () => {
+		// Reached from a library row or a row the user has already added, never
+		// from a flag - so `watchKeyFor` still has to know about it.
+		expect(watchKeyFor('dl', { rdKey: 'rd', debridLinkKey: 'dl' })).toBe('dl');
+		expect(watchKeyFor('dl', { rdKey: 'rd' })).toBeNull();
+	});
+
+	it('never mistakes the Debrid-Link key for TorBox’s', () => {
+		// `watchKeyFor` falls through to `torboxKey`, so a missing branch would
+		// silently hand a Debrid-Link watch somebody else's credential.
+		expect(watchKeyFor('dl', { torboxKey: 'tb' })).toBeNull();
+	});
+
+	it('labels the service by name', () => {
+		expect(WATCH_SERVICE_LABEL.dl).toBe('Debrid-Link');
+	});
+});

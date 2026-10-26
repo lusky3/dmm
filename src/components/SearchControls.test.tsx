@@ -1,0 +1,135 @@
+import { fireEvent, render, screen } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const onQueryChange = vi.fn();
+const onMassReport = vi.fn();
+
+vi.mock('@/components/SearchTokens', () => ({
+	__esModule: true,
+	default: ({ onTokenClick }: { onTokenClick: (token: string) => void }) => (
+		<button data-testid="token-button" onClick={() => onTokenClick('1080p')}>
+			Token
+		</button>
+	),
+}));
+
+vi.mock('lucide-react', () => ({
+	__esModule: true,
+	RotateCcw: () => <span data-testid="rotate-icon" />,
+	Search: () => <span data-testid="search-icon" />,
+}));
+
+import SearchControls from './SearchControls';
+
+const defaultProps = {
+	query: '',
+	onQueryChange,
+	filteredCount: 0,
+	totalCount: 0,
+	showMassReportButtons: false,
+	rdKey: null,
+	onMassReport,
+	mediaType: 'movie' as const,
+	title: 'Demo Title',
+	year: '1999',
+	isShow: false,
+};
+
+describe('SearchControls', () => {
+	beforeEach(() => {
+		onQueryChange.mockReset();
+		onMassReport.mockReset();
+	});
+
+	it('updates query input with lowercase text and supports reset', () => {
+		render(<SearchControls {...defaultProps} />);
+		const input = screen.getByPlaceholderText(/filter results/i);
+		fireEvent.change(input, { target: { value: 'HDR' } });
+		expect(onQueryChange).toHaveBeenCalledWith('hdr');
+
+		fireEvent.click(screen.getByTitle(/Reset search/i));
+		expect(onQueryChange).toHaveBeenCalledWith('');
+	});
+
+	it('shows mass report buttons only when query, rd key, and flags are present', () => {
+		render(
+			<SearchControls
+				{...defaultProps}
+				query="matrix"
+				totalCount={3}
+				showMassReportButtons
+				rdKey="abc"
+				mediaType="tv"
+			/>
+		);
+
+		fireEvent.click(screen.getByText(/Report as Porn/i));
+		expect(onMassReport).toHaveBeenCalledWith('porn');
+
+		fireEvent.click(screen.getByText(/Report Wrong IMDB/i));
+		expect(onMassReport).toHaveBeenCalledWith('wrong_imdb');
+
+		fireEvent.click(screen.getByText(/Report Wrong Season/i));
+		expect(onMassReport).toHaveBeenCalledWith('wrong_season');
+	});
+
+	it.each([
+		['AllDebrid', { adKey: 'ad' }],
+		['TorBox', { torboxKey: 'tb' }],
+		['Premiumize', { premiumizeKey: 'pm' }],
+		['Offcloud', { offcloudKey: 'oc' }],
+		['Debrid-Link', { debridLinkKey: 'dl' }],
+	])('shows mass report buttons to a %s-only user', (_name, keys) => {
+		render(
+			<SearchControls
+				{...defaultProps}
+				query="filter"
+				totalCount={3}
+				showMassReportButtons
+				{...keys}
+			/>
+		);
+		expect(screen.getByText(/Report as Porn \(3\)/i)).toBeInTheDocument();
+	});
+
+	it('shows no mass report buttons without any signed-in service', () => {
+		render(
+			<SearchControls {...defaultProps} query="filter" totalCount={3} showMassReportButtons />
+		);
+		expect(screen.queryByText(/Report as Porn/i)).toBeNull();
+	});
+
+	it('appends search tokens and color scale queries', () => {
+		render(
+			<SearchControls
+				{...defaultProps}
+				query="source:hdr"
+				colorScales={[{ threshold: 5, color: 'red-500', label: 'High quality' }]}
+				getQueryForScale={(threshold: number) => `videos:${threshold}`}
+			/>
+		);
+
+		fireEvent.click(screen.getByTestId('token-button'));
+		expect(onQueryChange).toHaveBeenCalledWith('source:hdr 1080p');
+
+		fireEvent.click(screen.getByText(/High quality/i));
+		expect(onQueryChange).toHaveBeenCalledWith('source:hdr videos:5');
+	});
+
+	it('puts the availability filters last in the token row', () => {
+		const { container } = render(
+			<SearchControls
+				{...defaultProps}
+				rdKey="rd-key"
+				torboxKey="tb-key"
+				colorScales={[{ threshold: 5, color: 'red-500', label: 'Single' }]}
+				getQueryForScale={(threshold: number) => `videos:${threshold}`}
+				extraTokens={[{ label: 'Quality releases', query: 'remux' }]}
+			/>
+		);
+
+		const row = container.querySelectorAll('div.overflow-x-auto > *');
+		const labels = Array.from(row).map((el) => el.textContent);
+		expect(labels).toEqual(['Token', 'Single', 'Quality releases', 'RD ✓TB ✓Any ✓']);
+	});
+});

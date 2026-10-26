@@ -1,0 +1,175 @@
+import { resolveStreamTarget } from '@/services/anime/stremioAnime';
+import { withRateLimit } from '@/services/rateLimit/withRateLimit';
+import { repository as db } from '@/services/repository';
+import { sendStreamError, sendStreamFailure } from '@/utils/castAddonResponses';
+import { effectiveOtherStreamsLimit } from '@/utils/castOtherStreamsLimit';
+import {
+	extractStreamMetadata,
+	formatStremioStreamTitle,
+	generateStreamName,
+} from '@/utils/streamMetadata';
+import { releaseBingeGroup } from '@/utils/stremioBingeGroup';
+import { NextApiRequest, NextApiResponse } from 'next';
+
+// lists all available streams for a movie or show (AllDebrid version)
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+	res.setHeader('access-control-allow-origin', '*');
+
+	const { userid, mediaType, imdbid } = req.query;
+
+	if (typeof userid !== 'string' || typeof imdbid !== 'string' || typeof mediaType !== 'string') {
+		res.status(400).json({
+			status: 'error',
+			errorMessage: 'Invalid "userid", "imdbid" or "mediaType" query parameter',
+		});
+		return;
+	}
+
+	if (req.method === 'OPTIONS') {
+		return res.status(200).end();
+	}
+
+	let profile;
+	try {
+		profile = await db.getAllDebridCastProfile(userid);
+	} catch (error) {
+		sendStreamError(res, 'ad', error);
+		return;
+	}
+	if (!profile) {
+		// An install whose profile is gone: say so on the stream list, where
+		// the member is looking, instead of a 500 on every title they open.
+		sendStreamFailure(res, 'ad', 'not-connected');
+		return;
+	}
+
+	const imdbidStr = (imdbid as string).replace(/\.json$/, '');
+	// An anime id (`kitsu:46474:5`) resolves to the AniDB key its casts are
+	// filed under; an IMDb id keeps its own.
+	const target = await resolveStreamTarget(imdbidStr, mediaType, process.env.DMM_ORIGIN);
+	if (!target) {
+		res.status(200).json({ streams: [], cacheMaxAge: 0 });
+		return;
+	}
+	const { castKey, typeSlug, externalUrl } = target;
+
+	const streams: any[] = [];
+
+	// Add cast option unless hidden in profile settings
+	if (!profile.hideCastOption) {
+		streams.push({
+			name: 'DMM Cast AD✨',
+			title: 'Cast a file inside a torrent',
+			externalUrl,
+			behaviorHints: {
+				bingeGroup: `dmm-ad:${imdbidStr}:cast`,
+			},
+		});
+	}
+
+	try {
+		const maxSize = typeSlug === 'movie' ? profile.movieMaxSize : profile.episodeMaxSize;
+		// Above 5 only while the sponsorship that saved it is still active.
+		const otherStreamsLimit = await effectiveOtherStreamsLimit(
+			'ad',
+			userid,
+			profile.otherStreamsLimit
+		);
+
+		// get urls from db
+		const [userCastItems, otherItems] = await Promise.all([
+			db.getAllDebridUserCastStreams(castKey, userid, 5),
+			db.getAllDebridOtherStreams(
+				castKey,
+				userid,
+				otherStreamsLimit,
+				maxSize > 0 ? maxSize : undefined
+			),
+		]);
+
+		const allHashes = [
+			...userCastItems.map((item) => item.hash),
+			...otherItems.map((item) => item.hash),
+		];
+		const uniqueHashes = Array.from(new Set(allHashes));
+
+		const snapshots = await db.getSnapshotsByHashes(uniqueHashes);
+		const snapshotMap = new Map(snapshots.map((s) => [s.hash, s]));
+
+		console.log('[Stremio-AD Stream] Metadata enrichment stats:', {
+			totalStreams: userCastItems.length + otherItems.length,
+			uniqueHashes: uniqueHashes.length,
+			snapshotsFound: snapshots.length,
+			hitRate:
+				uniqueHashes.length > 0
+					? `${((snapshots.length / uniqueHashes.length) * 100).toFixed(1)}%`
+					: 'N/A',
+		});
+
+		for (const item of userCastItems) {
+			// Skip items without magnetId/fileIndex (should not happen for AllDebrid)
+			if (item.magnetId == null || item.fileIndex == null) {
+				continue;
+			}
+
+			const snapshot = snapshotMap.get(item.hash);
+			const metadata = snapshot ? extractStreamMetadata(snapshot.payload) : null;
+			const title = formatStremioStreamTitle(
+				item.filename ?? 'Unknown Title',
+				item.size,
+				metadata,
+				true,
+				'AD' // AllDebrid suffix
+			);
+			const name = generateStreamName(item.size, metadata);
+
+			streams.push({
+				name,
+				title,
+				url: `${process.env.DMM_ORIGIN}/api/stremio-ad/${userid}/play/${item.magnetId}:${item.fileIndex}`,
+				behaviorHints: {
+					bingeGroup: releaseBingeGroup('dmm-ad', item.hash),
+				},
+			} as any);
+		}
+
+		for (let i = 0; i < otherItems.length; i++) {
+			const item = otherItems[i];
+
+			// Skip items without magnetId/fileIndex (should not happen for AllDebrid)
+			if (item.magnetId == null || item.fileIndex == null) {
+				continue;
+			}
+
+			const snapshot = snapshotMap.get(item.hash);
+			const metadata = snapshot ? extractStreamMetadata(snapshot.payload) : null;
+			const title = formatStremioStreamTitle(
+				item.filename ?? 'Unknown Title',
+				item.size,
+				metadata,
+				false,
+				'AD' // AllDebrid suffix
+			);
+			const name = generateStreamName(item.size, metadata);
+
+			streams.push({
+				name,
+				title,
+				url: `${process.env.DMM_ORIGIN}/api/stremio-ad/${userid}/play/${item.magnetId}:${item.fileIndex}`,
+				behaviorHints: {
+					bingeGroup: releaseBingeGroup('dmm-ad', item.hash),
+				},
+			} as any);
+		}
+
+		res.status(200).json({
+			streams,
+			cacheMaxAge: 0,
+		});
+	} catch (error) {
+		sendStreamError(res, 'ad', error);
+		return;
+	}
+}
+
+export default withRateLimit(handler);

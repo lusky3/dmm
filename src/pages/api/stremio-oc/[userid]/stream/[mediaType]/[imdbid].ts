@@ -1,0 +1,204 @@
+import { resolveStreamTarget } from '@/services/anime/stremioAnime';
+import { checkOffcloudCache } from '@/services/offcloud';
+import { withRateLimit } from '@/services/rateLimit/withRateLimit';
+import { repository as db } from '@/services/repository';
+import { sendStreamError, sendStreamFailure } from '@/utils/castAddonResponses';
+import { effectiveOtherStreamsLimit } from '@/utils/castOtherStreamsLimit';
+import {
+	extractStreamMetadata,
+	formatStremioStreamTitle,
+	generateStreamName,
+} from '@/utils/streamMetadata';
+import { releaseBingeGroup } from '@/utils/stremioBingeGroup';
+import { NextApiRequest, NextApiResponse } from 'next';
+
+// lists all available streams for a movie or show (Offcloud version)
+async function handler(req: NextApiRequest, res: NextApiResponse) {
+	res.setHeader('access-control-allow-origin', '*');
+
+	const { userid, mediaType, imdbid } = req.query;
+
+	if (typeof userid !== 'string' || typeof imdbid !== 'string' || typeof mediaType !== 'string') {
+		res.status(400).json({
+			status: 'error',
+			errorMessage: 'Invalid "userid", "imdbid" or "mediaType" query parameter',
+		});
+		return;
+	}
+
+	if (req.method === 'OPTIONS') {
+		return res.status(200).end();
+	}
+
+	let profile;
+	try {
+		profile = await db.getOffcloudCastProfile(userid);
+	} catch (error) {
+		sendStreamError(res, 'oc', error);
+		return;
+	}
+	if (!profile) {
+		// An install whose profile is gone: say so on the stream list, where
+		// the member is looking, instead of a 500 on every title they open.
+		sendStreamFailure(res, 'oc', 'not-connected');
+		return;
+	}
+
+	const imdbidStr = imdbid.replace(/\.json$/, '');
+	// An anime id (`kitsu:46474:5`) resolves to the AniDB key its casts are
+	// filed under; an IMDb id keeps its own.
+	const target = await resolveStreamTarget(imdbidStr, mediaType, process.env.DMM_ORIGIN);
+	if (!target) {
+		res.status(200).json({ streams: [], cacheMaxAge: 0 });
+		return;
+	}
+	const { castKey, typeSlug, externalUrl } = target;
+
+	const streams: any[] = [];
+
+	if (!profile.hideCastOption) {
+		streams.push({
+			name: 'DMM Cast OC✨',
+			title: 'Cast a file inside a torrent',
+			externalUrl,
+			behaviorHints: { bingeGroup: `dmm-oc:${imdbidStr}:cast` },
+		});
+	}
+
+	try {
+		const maxSize = typeSlug === 'movie' ? profile.movieMaxSize : profile.episodeMaxSize;
+		// Above 5 only while the sponsorship that saved it is still active.
+		const otherStreamsLimit = await effectiveOtherStreamsLimit(
+			'oc',
+			userid,
+			profile.otherStreamsLimit
+		);
+
+		const [userCastItems, otherItems, troveCandidates] = await Promise.all([
+			db.getOffcloudUserCastStreams(castKey, userid, 5),
+			db.getOffcloudOtherStreams(
+				castKey,
+				userid,
+				otherStreamsLimit,
+				maxSize > 0 ? maxSize : undefined
+			),
+			// The scraped pool behind the DMM detail page: every release for the
+			// title, offered once Offcloud confirms the hash is cached. This is
+			// the same probe the page runs to paint its green tokens.
+			target.trove(maxSize > 0 ? maxSize : undefined),
+		]);
+
+		// Offcloud can answer "will this actually play?" before offering it:
+		// `POST /api/cache` is free, non-destructive and batched (5,000 hashes in
+		// 2.1 s), so a hash that has fallen out of the cache is dropped here
+		// rather than handed over as a stream that errors on click.
+		const candidates = [...userCastItems, ...otherItems];
+		const offeredHashes = new Set(candidates.map((item) => item.hash.toLowerCase()));
+		const troveCandidatesToProbe = troveCandidates.filter(
+			(item) => !offeredHashes.has(item.hash.toLowerCase())
+		);
+		const uniqueHashes = Array.from(
+			new Set([
+				...candidates.map((item) => item.hash),
+				...troveCandidatesToProbe.map((i) => i.hash),
+			])
+		);
+		const cached = new Set<string>();
+		let cacheProbeFailed = false;
+		if (uniqueHashes.length > 0) {
+			try {
+				const results = await checkOffcloudCache(profile.apiKey, uniqueHashes);
+				for (const result of results) {
+					if (result.cached) cached.add(result.hash.toLowerCase());
+				}
+			} catch (error) {
+				// A failed probe must not empty the list - fall back to offering
+				// every *cast* and let play report the truth. Trove releases get no
+				// such pass: nobody chose them, so an unverified one is noise, not
+				// a fallback.
+				cacheProbeFailed = true;
+				console.error(
+					'[Stremio-OC Stream] Cache probe failed, offering casts unfiltered:',
+					error instanceof Error ? error.message : 'Unknown error'
+				);
+				uniqueHashes.forEach((hash) => cached.add(hash.toLowerCase()));
+			}
+		}
+
+		const isPlayable = (hash: string) => cached.has(hash.toLowerCase());
+		const playableUserItems = userCastItems.filter((item) => isPlayable(item.hash));
+		const playableOtherItems = otherItems.filter((item) => isPlayable(item.hash));
+		const playableTrove = cacheProbeFailed
+			? []
+			: troveCandidatesToProbe.filter((item) => isPlayable(item.hash));
+
+		const snapshots = await db.getSnapshotsByHashes(uniqueHashes);
+		const snapshotMap = new Map(snapshots.map((s) => [s.hash, s]));
+
+		console.log('[Stremio-OC Stream] Stream stats:', {
+			totalStreams: playableUserItems.length + playableOtherItems.length,
+			troveStreams: playableTrove.length,
+			droppedUncached:
+				candidates.length - (playableUserItems.length + playableOtherItems.length),
+			uniqueHashes: uniqueHashes.length,
+			snapshotsFound: snapshots.length,
+		});
+
+		const push = (
+			item: (typeof playableUserItems)[number],
+			isOwn: boolean,
+			bingeGroup: string | undefined
+		) => {
+			const snapshot = snapshotMap.get(item.hash);
+			const metadata = snapshot ? extractStreamMetadata(snapshot.payload) : null;
+			streams.push({
+				name: generateStreamName(item.size, metadata),
+				title: formatStremioStreamTitle(
+					item.filename ?? 'Unknown Title',
+					item.size,
+					metadata,
+					isOwn,
+					'OC'
+				),
+				// The hash and the stored path, never a link: an Offcloud CDN URL
+				// carries the caster's account token.
+				url: `${process.env.DMM_ORIGIN}/api/stremio-oc/${userid}/play/${item.hash}?file=${encodeURIComponent(item.path ?? item.filename ?? '')}`,
+				behaviorHints: { bingeGroup },
+			} as any);
+		};
+
+		for (const item of playableUserItems) {
+			push(item, true, releaseBingeGroup('dmm-oc', item.hash));
+		}
+		for (let i = 0; i < playableOtherItems.length; i++) {
+			push(
+				playableOtherItems[i],
+				false,
+				releaseBingeGroup('dmm-oc', playableOtherItems[i].hash)
+			);
+		}
+		// Cached scraped releases fill whatever the cast pool left open, in the
+		// same "other streams" budget the size-limits setting describes. No
+		// `?file=`: the play route resolves the release and picks the feature
+		// file, exactly as it does for a cast row without a stored path.
+		const troveSlots = Math.max(0, otherStreamsLimit - playableOtherItems.length);
+		for (let i = 0; i < Math.min(troveSlots, playableTrove.length); i++) {
+			const item = playableTrove[i];
+			const snapshot = snapshotMap.get(item.hash);
+			const metadata = snapshot ? extractStreamMetadata(snapshot.payload) : null;
+			streams.push({
+				name: generateStreamName(item.sizeMb, metadata),
+				title: formatStremioStreamTitle(item.title, item.sizeMb, metadata, false, 'OC'),
+				url: `${process.env.DMM_ORIGIN}/api/stremio-oc/${userid}/play/${item.hash}`,
+				behaviorHints: { bingeGroup: releaseBingeGroup('dmm-oc', item.hash) },
+			} as any);
+		}
+
+		res.status(200).json({ streams, cacheMaxAge: 0 });
+	} catch (error) {
+		sendStreamError(res, 'oc', error);
+		return;
+	}
+}
+
+export default withRateLimit(handler);

@@ -1,0 +1,715 @@
+/* oxlint-disable nextjs/no-img-element */
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import type { ReactNode } from 'react';
+import type * as HotToast from 'react-hot-toast';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const {
+	axiosGetMock,
+	toastMock,
+	AxiosErrorMock,
+	posterMock,
+	discoverMock,
+	runMock,
+	stopMock,
+	modalFireMock,
+	keys,
+	seasonStateMock,
+	addCachedMock,
+	delayMock,
+	callLog,
+	tvResultsProps,
+	sortByMeanMock,
+} = vi.hoisted(() => {
+	class AxiosError extends Error {
+		response?: { status?: number };
+	}
+	const toast = Object.assign(vi.fn(), {
+		success: vi.fn(),
+		error: vi.fn(),
+		loading: vi.fn(() => 'toast-id'),
+		dismiss: vi.fn(),
+	});
+	return {
+		axiosGetMock: vi.fn(),
+		toastMock: toast,
+		AxiosErrorMock: AxiosError,
+		posterMock: vi.fn(({ title }: { title: string }) => (
+			<div data-testid="poster-fallback">{title}</div>
+		)),
+		discoverMock: vi.fn(),
+		runMock: vi.fn(),
+		stopMock: vi.fn(),
+		modalFireMock: vi.fn(),
+		keys: {
+			rd: 'rd-token' as string | null,
+			ad: null as string | null,
+			tb: 'tb-token' as string | null,
+		},
+		seasonStateMock: {} as Record<number, string>,
+		addCachedMock: vi.fn(),
+		delayMock: vi.fn(),
+		callLog: [] as string[],
+		tvResultsProps: { current: null as any },
+		// The page's own sort, swapped in where the order on screen is the point
+		sortByMeanMock: vi.fn((results: any[]) => results),
+	};
+});
+
+vi.mock('@/components/poster', () => ({
+	__esModule: true,
+	default: posterMock,
+}));
+
+vi.mock('@/components/RelatedMedia', () => ({
+	__esModule: true,
+	default: () => <div data-testid="related-media" />,
+}));
+
+vi.mock('@/components/SearchTokens', () => ({
+	__esModule: true,
+	default: ({ title }: { title: string }) => (
+		<div data-testid="search-tokens">tokens:{title}</div>
+	),
+}));
+
+vi.mock('@/components/TvSearchResults', () => ({
+	__esModule: true,
+	default: (props: any) => {
+		tvResultsProps.current = props;
+		return <div data-testid="tv-search-results" />;
+	},
+}));
+
+vi.mock('@/components/showInfo', () => ({
+	__esModule: true,
+	showInfoForRD: vi.fn(),
+}));
+
+vi.mock('@/contexts/LibraryCacheContext', () => ({
+	useLibraryCache: () => ({
+		libraryItems: [],
+		isLoading: false,
+		isFetching: false,
+		lastFetchTime: null,
+		error: null,
+		refreshLibrary: vi.fn(),
+		setLibraryItems: vi.fn(),
+		addTorrent: vi.fn(),
+		removeTorrent: vi.fn(),
+		updateTorrent: vi.fn(),
+	}),
+}));
+
+vi.mock('@/hooks/auth', () => ({
+	useRealDebridAccessToken: () => [keys.rd],
+	useAllDebridApiKey: () => keys.ad,
+	useTorBoxAccessToken: () => keys.tb,
+	usePremiumizeCredential: () => null,
+	useOffcloudApiKey: () => null,
+	useDebridLinkCredential: () => null,
+}));
+
+vi.mock('@/hooks/useSeasonPackAdder', () => ({
+	useSeasonPackAdder: () => ({
+		discover: discoverMock,
+		run: runMock,
+		stop: stopMock,
+		discovering: false,
+		running: false,
+		seasonState: seasonStateMock,
+	}),
+}));
+
+vi.mock('@/components/modals/modal', () => ({
+	__esModule: true,
+	default: { fire: modalFireMock },
+}));
+
+vi.mock('@/hooks/useExternalSources', () => ({
+	useExternalSources: () => ({
+		fetchEpisodeFromExternalSource: vi.fn().mockResolvedValue([]),
+		getEnabledSources: () => [],
+	}),
+}));
+
+vi.mock('@/hooks/useAvailabilityCheck', () => ({
+	useAvailabilityCheck: () => ({
+		isAnyChecking: false,
+		isHashServiceChecking: () => false,
+		checkServiceAvailability: vi.fn(),
+		checkServiceAvailabilityBulk: vi.fn(),
+	}),
+}));
+
+vi.mock('@/hooks/useMassReport', () => ({
+	useMassReport: () => ({ handleMassReport: vi.fn() }),
+}));
+
+vi.mock('@/hooks/useTorrentManagement', () => ({
+	useTorrentManagement: () => ({
+		hashAndProgress: {},
+		fetchHashAndProgress: vi.fn().mockResolvedValue(undefined),
+		addRd: vi.fn(),
+		addCached: addCachedMock,
+		addAd: vi.fn(),
+		addTb: vi.fn(),
+		deleteRd: vi.fn(),
+		deleteAd: vi.fn(),
+		deleteTb: vi.fn(),
+	}),
+}));
+
+vi.mock('@/torrent/db', () => ({
+	__esModule: true,
+	default: class {
+		async initializeDB() {
+			return Promise.resolve();
+		}
+	},
+}));
+
+vi.mock('@/utils/browserStorage', () => ({
+	__esModule: true,
+	getLocalStorageBoolean: () => false,
+	getLocalStorageItemOrDefault: (_key: string, defaultValue: any) => defaultValue,
+	hideRdBlockedTorrentsDefault: (fallback: boolean) => fallback,
+}));
+
+vi.mock('@/utils/token', () => ({
+	__esModule: true,
+	generateTokenAndHash: () => Promise.resolve(['token', 'hash']),
+}));
+
+vi.mock('@/utils/instantChecks', () => ({
+	instantCheckInRd: vi.fn().mockResolvedValue(0),
+	instantCheckInTb: vi.fn().mockResolvedValue(0),
+	checkAvailabilityDl: vi.fn().mockResolvedValue(0),
+	checkAvailabilityOc: vi.fn().mockResolvedValue(0),
+	checkAvailabilityPm: vi.fn().mockResolvedValue(0),
+	checkDatabaseAvailabilityAd: vi.fn(
+		async (
+			_token: string,
+			_hash: string,
+			_imdbId: string,
+			hashes: string[],
+			setSearchResults: (fn: (prev: any[]) => any[]) => void
+		) => {
+			setSearchResults((prev) =>
+				prev.map((r) => (hashes.includes(r.hash) ? { ...r, adAvailable: true } : r))
+			);
+			return hashes.length;
+		}
+	),
+	// Rows arrive from the search with `rdAvailable: false` and it is this
+	// lookup that flips them, so the Instant RD buttons only exist once it has.
+	checkDatabaseAvailabilityRd: vi.fn(
+		async (
+			_token: string,
+			_hash: string,
+			_imdbId: string,
+			hashes: string[],
+			setSearchResults: (fn: (prev: any[]) => any[]) => void
+		) => {
+			setSearchResults((prev) =>
+				prev.map((r) => (hashes.includes(r.hash) ? { ...r, rdAvailable: true } : r))
+			);
+			return hashes.length;
+		}
+	),
+	checkDatabaseAvailabilityTb: vi.fn().mockResolvedValue(0),
+}));
+
+vi.mock('@/utils/results', () => ({
+	sortByMean: (results: any[]) => sortByMeanMock(results),
+}));
+
+vi.mock('@/utils/quickSearch', () => ({
+	quickSearch: (_query: string, results: any[]) => results,
+}));
+
+vi.mock('@/utils/selectable', () => ({
+	isVideo: () => true,
+}));
+
+vi.mock('@/utils/trackerStats', () => ({
+	getMultipleTrackerStats: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock('@/utils/castApiClient', () => ({
+	handleCastTvShow: vi.fn(),
+}));
+
+vi.mock('@/utils/copyMagnet', () => ({
+	handleCopyOrDownloadMagnet: vi.fn(),
+}));
+
+vi.mock('@/utils/withAuth', () => ({
+	__esModule: true,
+	withAuth: (component: any) => component,
+}));
+vi.mock('axios', () => ({
+	__esModule: true,
+	default: {
+		get: axiosGetMock,
+		create: () => ({
+			get: axiosGetMock,
+			post: vi.fn(),
+			delete: vi.fn(),
+			interceptors: {
+				request: { use: vi.fn() },
+				response: { use: vi.fn() },
+			},
+		}),
+	},
+	get: axiosGetMock,
+	AxiosError: AxiosErrorMock,
+}));
+
+vi.mock('next/image', () => ({
+	__esModule: true,
+	default: ({ alt, ...props }: any) => <img alt={alt} {...props} />,
+}));
+
+vi.mock('next/router', () => ({
+	__esModule: true,
+	useRouter: () => ({
+		query: { imdbid: 'tt1234567', seasonNum: '1' },
+		push: vi.fn(),
+		prefetch: vi.fn(),
+	}),
+}));
+
+vi.mock('next/head', () => ({
+	__esModule: true,
+	default: ({ children }: { children: ReactNode }) => <>{children}</>,
+}));
+
+vi.mock('next/link', () => ({
+	__esModule: true,
+	default: ({ href, children, ...props }: any) => (
+		<a href={typeof href === 'string' ? href : String(href)} {...props}>
+			{children}
+		</a>
+	),
+}));
+
+vi.mock('react-hot-toast', () => ({
+	__esModule: true,
+	default: toastMock,
+	Toaster: () => null,
+}));
+
+vi.mock('@/utils/delay', () => ({
+	__esModule: true,
+	delay: delayMock,
+}));
+
+import ShowSeasonPage from '@/pages/show/[imdbid]/[seasonNum]';
+import { RD_ADD_MIN_SPACING_MS } from '@/services/realDebrid';
+import recorded from '@/test/fixtures/scraped/cyrillic-led-pages-2026-10-07.json';
+import { checkDatabaseAvailabilityRd } from '@/utils/instantChecks';
+
+const SHOW = {
+	title: 'Example Show',
+	description: 'Example description',
+	poster: '',
+	backdrop: 'https://example.com/backdrop.jpg',
+	season_count: 1,
+	season_names: ['Season One'],
+	imdb_score: 7.2,
+	season_episode_counts: { 1: 3 },
+};
+
+const episodeRow = (n: number, available: Record<string, boolean> = { rdAvailable: true }) => ({
+	hash: `hash-${n}`,
+	title: `Example.Show.S01E0${n}.1080p.WEB.h265-GRP`,
+	fileSize: 1000,
+	medianFileSize: 1000,
+	biggestFileSize: 1000,
+	videoCount: 1,
+	rdAvailable: false,
+	adAvailable: false,
+	tbAvailable: false,
+	pmAvailable: false,
+	ocAvailable: false,
+	dlAvailable: false,
+	files: [],
+	...available,
+});
+
+const mountSeason = async (
+	available: Record<string, boolean> = { rdAvailable: true },
+	buttonName: RegExp = /Instant RD \(Every Episode\)/i
+) => {
+	axiosGetMock.mockImplementation((url: string) => {
+		if (url.startsWith('/api/info/show')) {
+			return Promise.resolve({ status: 200, data: SHOW });
+		}
+		if (url.startsWith('/api/torrents/tv')) {
+			return Promise.resolve({
+				status: 200,
+				headers: {},
+				data: {
+					results: [
+						episodeRow(1, available),
+						episodeRow(2, available),
+						episodeRow(3, available),
+					],
+				},
+			});
+		}
+		return Promise.resolve({ status: 200, data: {} });
+	});
+	render(<ShowSeasonPage />);
+	return screen.findByRole('button', { name: buttonName });
+};
+
+// Adding every episode of a season is a burst of `addMagnet` calls against one
+// account, and RD's budget for those is about 30 a minute (measured
+// 2026-09-17), not the 250/min it publishes for the API as a whole. This loop
+// used to run flat out: a season of any length spent the allowance partway
+// through and every episode after that was refused, which the user then saw as
+// RD refusing their next manual add too.
+describe('Instant RD (Every Episode) pacing', () => {
+	beforeEach(() => {
+		axiosGetMock.mockReset();
+		posterMock.mockClear();
+		toastMock.mockClear();
+		toastMock.success.mockClear();
+		toastMock.error.mockClear();
+		addCachedMock.mockReset();
+		addCachedMock.mockImplementation(async () => {
+			callLog.push('add');
+			return true;
+		});
+		delayMock.mockReset();
+		delayMock.mockImplementation(async (ms: number) => {
+			callLog.push(`delay:${ms}`);
+		});
+		callLog.length = 0;
+		keys.rd = 'rd-token';
+		keys.ad = null;
+		keys.tb = null;
+		localStorage.removeItem('settings:instantService');
+	});
+
+	it('waits the add budget between episodes instead of adding flat out', async () => {
+		const button = await mountSeason();
+
+		await userEvent.click(button);
+
+		await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(3));
+		expect(addCachedMock.mock.calls.map((call) => call[0])).toEqual(['rd', 'rd', 'rd']);
+
+		// One add, then a gap, for every episode after the first.
+		expect(callLog.filter((entry) => entry === 'add')).toHaveLength(3);
+		expect(callLog).toEqual([
+			'add',
+			`delay:${RD_ADD_MIN_SPACING_MS}`,
+			'add',
+			`delay:${RD_ADD_MIN_SPACING_MS}`,
+			'add',
+		]);
+	});
+
+	it('lets the viewer dismiss the final episode counts', async () => {
+		const button = await mountSeason();
+		await userEvent.click(button);
+		await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(3));
+		const summary = toastMock.success.mock.calls.at(-1)![0];
+		render(<>{typeof summary === 'function' ? summary({ id: 'final-summary' }) : summary}</>);
+		const dismiss = screen.getByRole('button', { name: 'Dismiss episode summary' });
+		await userEvent.click(dismiss);
+		expect(toastMock.dismiss).toHaveBeenCalledWith('final-summary');
+	});
+
+	it('does not resurrect an old page summary or replace the next page summary after navigation', async () => {
+		const actual = await vi.importActual<typeof HotToast>('react-hot-toast');
+		const ActualToaster = actual.Toaster;
+		const pendingAdd = Promise.withResolvers<boolean>();
+		toastMock.success.mockImplementation(actual.default.success);
+		toastMock.dismiss.mockImplementation(actual.default.dismiss);
+		addCachedMock.mockImplementationOnce(() => pendingAdd.promise);
+		try {
+			const oldButton = await mountSeason();
+			render(<ActualToaster />);
+			await userEvent.click(oldButton);
+			await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(1));
+			cleanup();
+
+			const newButton = await mountSeason();
+			render(<ActualToaster />);
+			await userEvent.click(newButton);
+			const currentSummary = await screen.findByRole('button', {
+				name: 'Dismiss episode summary',
+			});
+			await act(async () => pendingAdd.resolve(true));
+			await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(6));
+
+			expect(screen.getAllByRole('button', { name: 'Dismiss episode summary' })).toHaveLength(
+				1
+			);
+			expect(screen.getByRole('button', { name: 'Dismiss episode summary' })).toBe(
+				currentSummary
+			);
+			expect(
+				toastMock.success.mock.calls.filter(([message]) => typeof message === 'function')
+			).toHaveLength(1);
+		} finally {
+			pendingAdd.resolve(true);
+			act(() => actual.default.remove());
+			toastMock.success.mockReset();
+			toastMock.dismiss.mockReset();
+		}
+	});
+
+	it('keeps both totals when RD and AD Every Episode run at the same time', async () => {
+		const actual = await vi.importActual<typeof HotToast>('react-hot-toast');
+		const ActualToaster = actual.Toaster;
+		const pendingAdd = Promise.withResolvers<boolean>();
+		toastMock.success.mockImplementation(actual.default.success);
+		toastMock.dismiss.mockImplementation(actual.default.dismiss);
+		addCachedMock.mockImplementationOnce(() => pendingAdd.promise);
+		keys.ad = 'ad-key';
+		try {
+			const rdButton = await mountSeason({ rdAvailable: true, adAvailable: true });
+			render(<ActualToaster />);
+			await userEvent.click(rdButton);
+			await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(1));
+
+			// One Every Episode button serves both services; the picker switches it to AD.
+			await userEvent.click(screen.getByRole('button', { name: 'AD' }));
+			await userEvent.click(
+				screen.getByRole('button', { name: /Instant AD \(Every Episode\)/i })
+			);
+			await screen.findByRole('button', { name: 'Dismiss episode summary' });
+			await act(async () => pendingAdd.resolve(true));
+			await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(6));
+
+			await waitFor(() =>
+				expect(
+					screen.getAllByRole('button', { name: 'Dismiss episode summary' })
+				).toHaveLength(2)
+			);
+		} finally {
+			pendingAdd.resolve(true);
+			act(() => actual.default.remove());
+			toastMock.success.mockReset();
+			toastMock.dismiss.mockReset();
+		}
+	});
+
+	it('offers an AllDebrid user the same action, adding to AllDebrid', async () => {
+		keys.rd = null;
+		keys.ad = 'ad-key';
+		const button = await mountSeason({ adAvailable: true }, /Instant AD \(Every Episode\)/i);
+		expect(screen.queryByRole('button', { name: /Instant RD/i })).toBeNull();
+
+		await userEvent.click(button);
+
+		await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(3));
+		expect(addCachedMock.mock.calls.map((call) => [call[0], call[1]])).toEqual([
+			['ad', 'hash-1'],
+			['ad', 'hash-2'],
+			['ad', 'hash-3'],
+		]);
+	});
+
+	it('counts an episode the service turns out not to have as not cached', async () => {
+		addCachedMock.mockImplementation(async (_service: string, hash: string) => {
+			callLog.push('add');
+			return hash !== 'hash-2';
+		});
+		const button = await mountSeason();
+
+		await userEvent.click(button);
+
+		await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(3));
+		await waitFor(() => expect(toastMock.success).toHaveBeenCalled());
+		const summary = toastMock.success.mock.calls.at(-1)![0];
+		render(<>{typeof summary === 'function' ? summary({ id: 'summary' }) : summary}</>);
+		expect(screen.getByText(/2 added, 1 not cached/)).toBeTruthy();
+	});
+
+	// RD answers a 451 while it refuses every add on the account for a while
+	// (measured 2026-10-04/05, src/utils/rdAddPause.ts). An episode it refused
+	// that way is tried again once the pause is over, and if still refused is
+	// counted as refused for now, never as "not cached".
+	it('tries an episode Real-Debrid paused once more instead of calling it not cached', async () => {
+		const tries: Record<string, number> = {};
+		addCachedMock.mockImplementation(
+			async (_service: string, hash: string, opts?: { onPaused?: () => void }) => {
+				callLog.push('add');
+				tries[hash] = (tries[hash] ?? 0) + 1;
+				// hash-2 lands on its second try; hash-3 is refused both times.
+				if ((hash === 'hash-2' && tries[hash] === 1) || hash === 'hash-3') {
+					opts?.onPaused?.();
+					return false;
+				}
+				return true;
+			}
+		);
+		const button = await mountSeason();
+
+		await userEvent.click(button);
+
+		await waitFor(() => expect(addCachedMock).toHaveBeenCalledTimes(5));
+		expect(addCachedMock.mock.calls.map((call) => call[1])).toEqual([
+			'hash-1',
+			'hash-2',
+			'hash-2',
+			'hash-3',
+			'hash-3',
+		]);
+		await waitFor(() => expect(toastMock.success).toHaveBeenCalled());
+		const summary = toastMock.success.mock.calls.at(-1)![0];
+		render(<>{typeof summary === 'function' ? summary({ id: 'summary' }) : summary}</>);
+		expect(screen.getByText(/2 added, 1 refused by Real-Debrid for now/)).toBeTruthy();
+		expect(toastMock.error.mock.calls.some((call) => /Not cached/.test(String(call[0])))).toBe(
+			false
+		);
+	});
+});
+
+// Card 248: the season page lists trusted releases named in Russian, but Whole
+// Season picks for the viewer. Timecop season 1 as production held it on
+// 2026-10-07: three RD-cached nine-file packs, the largest of them the Russian
+// SATRip. Before the page listed it, Whole Season tried the TVRip first.
+describe('Instant RD (Whole Season) next to a release named in Russian', () => {
+	const timecop = recorded.pages.find((p) => p.key === 'tv:tt0118492:1')!;
+	const RUSSIAN_SATRIP = 'e3436e032eb4979f86c086394a3003340c8bb6a3';
+	const ENGLISH_TVRIP = '201f55a65d6604564d64be005f91d0b2004c38eb';
+
+	beforeEach(() => {
+		axiosGetMock.mockReset();
+		addCachedMock.mockReset();
+		addCachedMock.mockResolvedValue(true);
+		delayMock.mockReset();
+		keys.rd = 'rd-token';
+		keys.ad = null;
+		keys.tb = null;
+		// What the RD lookup answers: the recorded cached hashes, each with the
+		// file count its Available row lists.
+		const files = timecop.rdFiles as unknown as Record<string, number>;
+		vi.mocked(checkDatabaseAvailabilityRd).mockImplementationOnce(
+			async (_token, _solution, _imdbId, hashes, setSearchResults) => {
+				setSearchResults((prev) =>
+					prev.map((r) =>
+						files[r.hash] ? { ...r, rdAvailable: true, videoCount: files[r.hash] } : r
+					)
+				);
+				return hashes.filter((h) => files[h]).length;
+			}
+		);
+		axiosGetMock.mockImplementation((url: string) => {
+			if (url.startsWith('/api/info/show')) {
+				return Promise.resolve({
+					status: 200,
+					data: { ...SHOW, title: 'Timecop', season_episode_counts: { 1: 9 } },
+				});
+			}
+			if (url.startsWith('/api/torrents/tv')) {
+				const rows = [...(timecop.value as { hash: string; fileSize: number }[])]
+					.sort((a, b) => b.fileSize - a.fileSize)
+					.map((r) => ({ ...r, files: [], videoCount: 0 }));
+				return Promise.resolve({ status: 200, headers: {}, data: { results: rows } });
+			}
+			return Promise.resolve({ status: 200, data: {} });
+		});
+	});
+
+	it('adds the English pack, not the larger Russian one', async () => {
+		render(<ShowSeasonPage />);
+		const button = await screen.findByRole('button', { name: /Instant RD \(Whole Season\)/i });
+
+		await userEvent.click(button);
+
+		await waitFor(() => expect(addCachedMock).toHaveBeenCalled());
+		expect(addCachedMock.mock.calls[0].slice(0, 2)).toEqual(['rd', ENGLISH_TVRIP]);
+		expect(addCachedMock.mock.calls.map((call) => call[1])).not.toContain(RUSSIAN_SATRIP);
+	});
+});
+
+// Card 248: cached first, then the biggest average episode, put LostFilm's
+// Russian Blu-ray remux packs at the top of Mad Men season 2 once the page
+// listed them. The Cyrillic-led releases now follow the rest, each group in the
+// page's own order. Mad Men season 2 as production held it on 2026-10-07.
+describe('Season list next to releases named in Russian', () => {
+	const madMen = recorded.pages.find((p) => p.key === 'tv:tt0804503:2')!;
+	const files = madMen.rdFiles as unknown as Record<string, number>;
+	type Row = { hash: string; title: string; fileSize: number };
+	// Restored after each test: the other suites here mark every hash cached.
+	const defaultRdCheck = vi.mocked(checkDatabaseAvailabilityRd).getMockImplementation()!;
+
+	beforeEach(async () => {
+		const actual = await vi.importActual<typeof import('@/utils/results')>('@/utils/results');
+		sortByMeanMock.mockImplementation(actual.sortByMean);
+		axiosGetMock.mockReset();
+		keys.rd = 'rd-token';
+		keys.ad = null;
+		keys.tb = null;
+		tvResultsProps.current = null;
+		// What the RD lookup answers: the recorded cached hashes, each with the
+		// file count its Available row lists, and the page re-sorts with it.
+		vi.mocked(checkDatabaseAvailabilityRd).mockImplementation(
+			async (_token, _solution, _imdbId, hashes, setSearchResults, sortFn) => {
+				setSearchResults((prev) =>
+					sortFn(
+						prev.map((r) =>
+							files[r.hash]
+								? { ...r, rdAvailable: true, videoCount: files[r.hash] }
+								: r
+						)
+					)
+				);
+				return hashes.filter((h) => files[h]).length;
+			}
+		);
+		axiosGetMock.mockImplementation((url: string) => {
+			if (url.startsWith('/api/info/show')) {
+				return Promise.resolve({
+					status: 200,
+					data: { ...SHOW, title: 'Mad Men', season_episode_counts: { 1: 13, 2: 13 } },
+				});
+			}
+			if (url.startsWith('/api/torrents/tv')) {
+				const rows = [...(madMen.value as Row[])]
+					.sort((a, b) => b.fileSize - a.fileSize)
+					.map((r) => ({ ...r, files: [], videoCount: 0 }));
+				return Promise.resolve({ status: 200, headers: {}, data: { results: rows } });
+			}
+			return Promise.resolve({ status: 200, data: {} });
+		});
+	});
+
+	afterEach(() => {
+		sortByMeanMock.mockImplementation((results: any[]) => results);
+		vi.mocked(checkDatabaseAvailabilityRd).mockImplementation(defaultRdCheck);
+	});
+
+	it('lists the releases named in Russian after the rest', async () => {
+		const actual = await vi.importActual<typeof import('@/utils/results')>('@/utils/results');
+		render(<ShowSeasonPage />);
+		await screen.findByRole('button', { name: /Instant RD \(Whole Season\)/i });
+		await waitFor(() =>
+			expect(tvResultsProps.current.filteredResults.some((r: any) => r.rdAvailable)).toBe(
+				true
+			)
+		);
+		const listed: (Row & { rdAvailable?: boolean })[] = tvResultsProps.current.filteredResults;
+		const russian = (r: Row) => /^[А-Яа-яЁё]/.test(r.title);
+
+		// The page's own order puts a Russian pack first.
+		expect(russian(actual.sortByMean([...listed] as any)[0])).toBe(true);
+		expect(listed).toHaveLength(madMen.value.length);
+		expect(listed.map((r) => r.hash)).toEqual(
+			[
+				...actual.sortByMean(listed.filter((r) => !russian(r)) as any),
+				...actual.sortByMean(listed.filter(russian) as any),
+			].map((r) => r.hash)
+		);
+		expect(listed.findIndex(russian)).toBe(listed.length - 15);
+	});
+});

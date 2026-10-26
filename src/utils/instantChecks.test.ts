@@ -1,0 +1,764 @@
+import { checkOffcloudCache } from '@/services/offcloud';
+import { checkPremiumizeCache } from '@/services/premiumize';
+import { checkCachedStatus } from '@/services/torbox';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+	checkAvailability,
+	checkAvailabilityAd,
+	checkAvailabilityAdByHashes,
+	checkAvailabilityByHashes,
+	checkPlayableCachedHashes,
+} from './availability';
+import {
+	checkAvailabilityOc,
+	checkAvailabilityOc2,
+	checkAvailabilityPm,
+	checkAvailabilityPm2,
+	checkDatabaseAvailabilityAd,
+	checkDatabaseAvailabilityRd,
+	checkDatabaseAvailabilityTb,
+	checkDatabaseAvailabilityTb2,
+	checkPlayableAvailabilityAd,
+	checkPlayableAvailabilityRd,
+	wrapLoading,
+} from './instantChecks';
+
+vi.mock('./availability', () => ({
+	checkAvailabilityByHashes: vi.fn(),
+	checkAvailability: vi.fn(),
+	checkAvailabilityAd: vi.fn(),
+	checkAvailabilityAdByHashes: vi.fn(),
+	checkPlayableCachedHashes: vi.fn(),
+	MAX_PLAYABLE_HASHES: 500,
+}));
+
+vi.mock('@/services/torbox', () => ({
+	checkCachedStatus: vi.fn(),
+}));
+
+vi.mock('@/services/premiumize', () => ({
+	checkPremiumizeCache: vi.fn(),
+}));
+
+vi.mock('@/services/offcloud', () => ({
+	checkOffcloudCache: vi.fn(),
+}));
+
+vi.mock('react-hot-toast', () => {
+	const promise = vi.fn((p) => p);
+	const success = vi.fn();
+	const loading = vi.fn(() => 'toast-id');
+	const error = vi.fn();
+	return {
+		toast: {
+			promise,
+			success,
+			loading,
+			error,
+		},
+	};
+});
+
+vi.mock('@/utils/selectable', () => ({
+	isVideo: ({ path }: { path: string }) => path.endsWith('.mkv'),
+}));
+
+const mockCheckAvailabilityByHashes = vi.mocked(checkAvailabilityByHashes);
+const mockCheckAvailability = vi.mocked(checkAvailability);
+const mockCheckAvailabilityAd = vi.mocked(checkAvailabilityAd);
+const mockCheckAvailabilityAdByHashes = vi.mocked(checkAvailabilityAdByHashes);
+const mockCheckPlayableCachedHashes = vi.mocked(checkPlayableCachedHashes);
+const mockCheckCachedStatus = vi.mocked(checkCachedStatus);
+const mockCheckPremiumizeCache = vi.mocked(checkPremiumizeCache);
+const mockCheckOffcloudCache = vi.mocked(checkOffcloudCache);
+
+const createStateHarness = <T extends { hash: string }>(initial: T[]) => {
+	let state = [...initial];
+	const setter = vi.fn((updater: ((prev: T[]) => T[]) | T[]) => {
+		state = typeof updater === 'function' ? updater(state) : updater;
+		return state;
+	});
+	return {
+		getState: () => state,
+		setter,
+	};
+};
+
+describe('instantChecks utilities', () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+	});
+
+	it('marks TB torrents as available when cached data exists', async () => {
+		mockCheckCachedStatus.mockResolvedValue({
+			success: true,
+			data: {
+				'hash-tb': {
+					files: [{ name: 'Show.mkv', size: 2048 }],
+				},
+			},
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-tb',
+				noVideos: false,
+				tbAvailable: false,
+				files: [],
+			},
+		] as any[]);
+
+		const hits = await checkDatabaseAvailabilityTb2('tb-key', ['hash-tb'], setter);
+
+		expect(hits).toBe(1);
+		expect(getState()[0].tbAvailable).toBe(true);
+		expect(getState()[0].files[0]).toMatchObject({ filename: 'Show.mkv' });
+	});
+
+	// Regression: TorBox file ids are not the listing order. Measured 2026-08-24
+	// against four real season packs, 50 of 52 files resolved to a *different*
+	// file when the array position was sent back as the id - so casting an
+	// episode saved the wrong one, under the wrong episode key, with no error.
+	it('keeps the file id TorBox reports rather than the array position', async () => {
+		mockCheckCachedStatus.mockResolvedValue({
+			success: true,
+			data: {
+				'hash-tb': {
+					files: [
+						{ id: 8, name: 'Show.S01E01.mkv', size: 2048 },
+						{ id: 12, name: 'Show.S01E02.mkv', size: 2048 },
+						{ id: 0, name: 'RARBG.txt', size: 30 },
+					],
+				},
+			},
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{ hash: 'hash-tb', noVideos: false, tbAvailable: false, files: [] },
+		] as any[]);
+
+		await checkDatabaseAvailabilityTb2('tb-key', ['hash-tb'], setter);
+
+		expect(getState()[0].files.map((f: any) => f.fileId)).toEqual([8, 12, 0]);
+		expect(getState()[0].tbFiles.map((f: any) => f.fileId)).toEqual([8, 12, 0]);
+	});
+
+	it('falls back to the array position only when TorBox omits the id', async () => {
+		mockCheckCachedStatus.mockResolvedValue({
+			success: true,
+			data: {
+				'hash-tb': {
+					files: [
+						{ name: 'Show.S01E01.mkv', size: 2048 },
+						{ name: 'Show.S01E02.mkv', size: 2048 },
+					],
+				},
+			},
+		} as any);
+		const { setter, getState } = createStateHarness([
+			{ hash: 'hash-tb', noVideos: false, tbAvailable: false, files: [] },
+		] as any[]);
+
+		await checkDatabaseAvailabilityTb2('tb-key', ['hash-tb'], setter);
+
+		expect(getState()[0].files.map((f: any) => f.fileId)).toEqual([0, 1]);
+	});
+
+	// The four availability checks run concurrently and each overwrites `files`,
+	// so a cast button that reads `files` casts with whichever provider's
+	// numbering happened to land last.
+	it('does not let a TorBox check clobber the RD file ids', async () => {
+		mockCheckCachedStatus.mockResolvedValue({
+			success: true,
+			data: {
+				'hash-both': {
+					files: [
+						{ id: 8, name: 'Show.S01E01.mkv', size: 2048 },
+						{ id: 12, name: 'Show.S01E02.mkv', size: 2048 },
+					],
+				},
+			},
+		} as any);
+		const rdFiles = [
+			{ fileId: 1, filename: 'Show.S01E01.mkv', filesize: 2048 },
+			{ fileId: 2, filename: 'Show.S01E02.mkv', filesize: 2048 },
+		];
+		const { setter, getState } = createStateHarness([
+			{
+				hash: 'hash-both',
+				noVideos: false,
+				rdAvailable: true,
+				tbAvailable: false,
+				files: [...rdFiles],
+				rdFiles,
+			},
+		] as any[]);
+
+		// TorBox answering second overwrites `files` - expected, and fine for
+		// display, which is exactly why the ids have to live somewhere else.
+		await checkDatabaseAvailabilityTb2('tb-key', ['hash-both'], setter);
+
+		expect(getState()[0].files.map((f: any) => f.fileId)).toEqual([8, 12]);
+		expect(getState()[0].rdFiles.map((f: any) => f.fileId)).toEqual([1, 2]);
+		expect(getState()[0].tbFiles.map((f: any) => f.fileId)).toEqual([8, 12]);
+	});
+
+	it('wrapLoading proxies toast.promise to surface async results', async () => {
+		const asyncCheck = Promise.resolve(3);
+		const result = await wrapLoading('RD', asyncCheck);
+		expect(result).toBe(3);
+	});
+
+	// The hashlist page's check: hashes only, 500 at a time, merged per batch.
+	describe('hashlist playable check', () => {
+		const rows = (hashes: string[]) =>
+			hashes.map((hash) => ({
+				hash,
+				noVideos: false,
+				rdAvailable: false,
+				adAvailable: false,
+				files: [],
+			}));
+
+		it('marks the rows Real-Debrid holds and leaves files and sizes alone', async () => {
+			mockCheckPlayableCachedHashes.mockResolvedValue(['hash-1']);
+			const { setter, getState } = createStateHarness(rows(['hash-1', 'hash-2']) as any[]);
+
+			const hits = await checkPlayableAvailabilityRd(
+				'problem',
+				'solution',
+				['hash-1', 'hash-2'],
+				setter
+			);
+
+			expect(mockCheckPlayableCachedHashes).toHaveBeenCalledWith(
+				'problem',
+				'solution',
+				'rd',
+				['hash-1', 'hash-2']
+			);
+			expect(hits).toBe(1);
+			expect(getState().map((t: any) => t.rdAvailable)).toEqual([true, false]);
+			expect(getState()[0].files).toEqual([]);
+			expect(getState()[0]).not.toHaveProperty('fileSize');
+			expect(getState()[0].adAvailable).toBe(false);
+		});
+
+		// AllDebrid and the endpoint answer lowercase while hashlists can carry
+		// uppercase, so a case-sensitive join would mark everything unavailable.
+		it('marks AllDebrid rows regardless of hash case', async () => {
+			mockCheckPlayableCachedHashes.mockResolvedValue(['abcdef']);
+			const { setter, getState } = createStateHarness(rows(['ABCDEF']) as any[]);
+
+			const hits = await checkPlayableAvailabilityAd(
+				'problem',
+				'solution',
+				['ABCDEF'],
+				setter
+			);
+
+			expect(mockCheckPlayableCachedHashes).toHaveBeenCalledWith(
+				'problem',
+				'solution',
+				'ad',
+				['ABCDEF']
+			);
+			expect(hits).toBe(1);
+			expect(getState()[0].adAvailable).toBe(true);
+			expect(getState()[0].rdAvailable).toBe(false);
+		});
+
+		it('asks 500 hashes at a time and merges each batch as it answers', async () => {
+			const hashes = Array.from({ length: 1200 }, (_, i) => `hash-${i}`);
+			mockCheckPlayableCachedHashes.mockImplementation(
+				async (_p: string, _s: string, _service: string, group: string[]) => group
+			);
+			const { setter, getState } = createStateHarness(rows(hashes) as any[]);
+
+			const hits = await checkPlayableAvailabilityRd('problem', 'solution', hashes, setter);
+
+			expect(mockCheckPlayableCachedHashes.mock.calls.map((c) => c[3].length)).toEqual([
+				500, 500, 200,
+			]);
+			expect(setter).toHaveBeenCalledTimes(3);
+			expect(hits).toBe(1200);
+			expect(getState().every((t: any) => t.rdAvailable)).toBe(true);
+		});
+
+		it('keeps the list when a batch finds nothing', async () => {
+			mockCheckPlayableCachedHashes.mockResolvedValue([]);
+			const { setter } = createStateHarness(rows(['hash-1']) as any[]);
+
+			expect(
+				await checkPlayableAvailabilityRd('problem', 'solution', ['hash-1'], setter)
+			).toBe(0);
+			expect(setter).not.toHaveBeenCalled();
+		});
+
+		it('fails only when every batch failed, so a partial answer still counts', async () => {
+			const hashes = Array.from({ length: 600 }, (_, i) => `hash-${i}`);
+			mockCheckPlayableCachedHashes
+				.mockRejectedValueOnce(new Error('503'))
+				.mockResolvedValueOnce(['hash-500']);
+			const { setter, getState } = createStateHarness(rows(hashes) as any[]);
+
+			expect(await checkPlayableAvailabilityRd('problem', 'solution', hashes, setter)).toBe(
+				1
+			);
+			expect(getState()[500].rdAvailable).toBe(true);
+
+			mockCheckPlayableCachedHashes.mockRejectedValue(new Error('503'));
+			await expect(
+				checkPlayableAvailabilityRd('problem', 'solution', hashes, setter)
+			).rejects.toThrow('503');
+		});
+	});
+
+	describe('imdb-based availability checks', () => {
+		const identity = (r: any[]) => r;
+
+		it('checkDatabaseAvailabilityRd calls checkAvailability with imdbId and marks matching results as rdAvailable', async () => {
+			mockCheckAvailability.mockResolvedValue({
+				available: [
+					{
+						hash: 'hash-rd-imdb',
+						files: [{ file_id: 1, path: 'Movie.mkv', bytes: 4096 }],
+					},
+				],
+			} as any);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-rd-imdb',
+					noVideos: false,
+					rdAvailable: false,
+					files: [],
+				},
+			] as any[]);
+
+			const hits = await checkDatabaseAvailabilityRd(
+				'problem',
+				'solution',
+				'tt1234567',
+				['hash-rd-imdb'],
+				setter,
+				identity
+			);
+
+			expect(mockCheckAvailability).toHaveBeenCalledWith('problem', 'solution', 'tt1234567', [
+				'hash-rd-imdb',
+			]);
+			expect(hits).toBe(1);
+			expect(getState()[0].rdAvailable).toBe(true);
+			expect(getState()[0].files).toHaveLength(1);
+			expect(getState()[0].files[0]).toMatchObject({ filename: 'Movie.mkv', filesize: 4096 });
+		});
+
+		it('checkDatabaseAvailabilityAd calls checkAvailabilityAd with imdbId and marks matching results as adAvailable', async () => {
+			mockCheckAvailabilityAd.mockResolvedValue({
+				available: [
+					{
+						hash: 'hash-ad-imdb',
+						files: [{ file_id: 1, path: 'Episode.mkv', bytes: 2048 }],
+					},
+				],
+			} as any);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-ad-imdb',
+					noVideos: false,
+					adAvailable: false,
+					files: [],
+				},
+			] as any[]);
+
+			const hits = await checkDatabaseAvailabilityAd(
+				'problem',
+				'solution',
+				'tt7654321',
+				['hash-ad-imdb'],
+				setter,
+				identity
+			);
+
+			expect(mockCheckAvailabilityAd).toHaveBeenCalledWith(
+				'problem',
+				'solution',
+				'tt7654321',
+				['hash-ad-imdb']
+			);
+			expect(hits).toBe(1);
+			expect(getState()[0].adAvailable).toBe(true);
+			expect(getState()[0].files).toHaveLength(1);
+			expect(getState()[0].files[0]).toMatchObject({
+				filename: 'Episode.mkv',
+				filesize: 2048,
+			});
+		});
+
+		it('checkDatabaseAvailabilityTb calls checkCachedStatus and marks matching results as tbAvailable', async () => {
+			mockCheckCachedStatus.mockResolvedValue({
+				success: true,
+				data: {
+					'hash-tb-imdb': {
+						files: [{ name: 'Show.mkv', size: 3072 }],
+					},
+				},
+			} as any);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-tb-imdb',
+					noVideos: false,
+					tbAvailable: false,
+					files: [],
+				},
+			] as any[]);
+
+			const hits = await checkDatabaseAvailabilityTb(
+				'tb-key',
+				['hash-tb-imdb'],
+				setter,
+				identity
+			);
+
+			expect(hits).toBe(1);
+			expect(getState()[0].tbAvailable).toBe(true);
+			expect(getState()[0].files[0]).toMatchObject({ filename: 'Show.mkv', filesize: 3072 });
+		});
+
+		it('returns 0 and marks nothing available when checkAvailability returns no matches', async () => {
+			mockCheckAvailability.mockResolvedValue({
+				available: [],
+			} as any);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-no-match',
+					noVideos: false,
+					rdAvailable: false,
+					files: [],
+				},
+			] as any[]);
+
+			const hits = await checkDatabaseAvailabilityRd(
+				'problem',
+				'solution',
+				'tt0000000',
+				['hash-no-match'],
+				setter,
+				identity
+			);
+
+			expect(hits).toBe(0);
+			expect(getState()[0].rdAvailable).toBe(false);
+			expect(getState()[0].files).toHaveLength(0);
+		});
+
+		// `noVideos` only ever comes from another provider's check, which may hold
+		// the same hash as an archive; it must not hide RD's own listing.
+		it('takes a video listing for a row another provider marked noVideos', async () => {
+			mockCheckAvailability.mockResolvedValue({
+				available: [
+					{
+						hash: 'hash-novideo',
+						files: [{ file_id: 1, path: 'Movie.mkv', bytes: 1024 }],
+					},
+				],
+			} as any);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-novideo',
+					noVideos: true,
+					rdAvailable: false,
+					files: [],
+				},
+			] as any[]);
+
+			const hits = await checkDatabaseAvailabilityRd(
+				'problem',
+				'solution',
+				'tt1111111',
+				['hash-novideo'],
+				setter,
+				identity
+			);
+
+			expect(hits).toBe(1);
+			expect(getState()[0].rdAvailable).toBe(true);
+			expect(getState()[0].noVideos).toBe(false);
+			expect(getState()[0].files).toHaveLength(1);
+		});
+	});
+
+	describe('batch processing', () => {
+		const identity = (r: any[]) => r;
+
+		it('processes all hash batches through rate limiter for RD', async () => {
+			const hashes = Array.from({ length: 250 }, (_, i) => `hash-${i}`);
+			const torrents = hashes.map((hash) => ({
+				hash,
+				noVideos: false,
+				rdAvailable: false,
+				files: [],
+			}));
+
+			mockCheckAvailability.mockImplementation(async (_p, _s, _id, hashGroup: string[]) => ({
+				available: hashGroup.map((h: string) => ({
+					hash: h,
+					files: [{ file_id: 1, path: 'Movie.mkv', bytes: 2048 }],
+				})),
+			}));
+
+			const { setter, getState } = createStateHarness(torrents as any[]);
+
+			const hits = await checkDatabaseAvailabilityRd(
+				'problem',
+				'solution',
+				'tt9999999',
+				hashes,
+				setter,
+				identity
+			);
+
+			// 250 hashes / 100 batch size = 3 batches
+			expect(mockCheckAvailability).toHaveBeenCalledTimes(3);
+			expect(hits).toBe(250);
+			expect(getState().every((t: any) => t.rdAvailable)).toBe(true);
+		});
+
+		it('handles partial availability across batches', async () => {
+			const hashes = ['hash-0', 'hash-1', 'hash-2', 'hash-3'];
+			const torrents = hashes.map((hash) => ({
+				hash,
+				noVideos: false,
+				rdAvailable: false,
+				files: [],
+			}));
+
+			mockCheckAvailability.mockResolvedValue({
+				available: [
+					{ hash: 'hash-0', files: [{ file_id: 1, path: 'A.mkv', bytes: 1024 }] },
+					{ hash: 'hash-2', files: [{ file_id: 1, path: 'B.mkv', bytes: 2048 }] },
+				],
+			} as any);
+
+			const { setter, getState } = createStateHarness(torrents as any[]);
+
+			const hits = await checkDatabaseAvailabilityRd(
+				'problem',
+				'solution',
+				'tt0000001',
+				hashes,
+				setter,
+				identity
+			);
+
+			expect(hits).toBe(2);
+			expect(getState()[0].rdAvailable).toBe(true);
+			expect(getState()[1].rdAvailable).toBe(false);
+			expect(getState()[2].rdAvailable).toBe(true);
+			expect(getState()[3].rdAvailable).toBe(false);
+		});
+	});
+
+	describe('Premiumize', () => {
+		const identity = <T>(rows: T[]) => rows;
+
+		it('marks cached hashes available without touching files', async () => {
+			// cache/check reports one filename and one size per hash and no file
+			// listing, so whatever another service worked out has to survive.
+			mockCheckPremiumizeCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: true, filename: 'Movie', filesize: 2147483648 },
+				{ hash: 'hash-2', cached: false, filename: null, filesize: null },
+			]);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-1',
+					noVideos: false,
+					pmAvailable: false,
+					files: [{ fileId: 0, filename: 'Movie.mkv', filesize: 5 }],
+					fileSize: 1024,
+					medianFileSize: 1024,
+					videoCount: 1,
+				},
+				{ hash: 'hash-2', noVideos: false, pmAvailable: false, files: [] },
+			] as any[]);
+
+			const hits = await checkAvailabilityPm(
+				'pm-key',
+				['hash-1', 'hash-2'],
+				setter,
+				identity
+			);
+
+			expect(hits).toBe(1);
+			expect(getState()[0].pmAvailable).toBe(true);
+			expect(getState()[0].files).toHaveLength(1);
+			expect(getState()[0].fileSize).toBe(1024);
+			expect(getState()[1].pmAvailable).toBe(false);
+		});
+
+		it('repairs a missing size from the cache probe', async () => {
+			mockCheckPremiumizeCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: true, filename: 'Movie', filesize: 2147483648 },
+			]);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-1',
+					noVideos: false,
+					pmAvailable: false,
+					files: [],
+					fileSize: 0,
+					medianFileSize: 0,
+					videoCount: 0,
+				},
+			] as any[]);
+
+			await checkAvailabilityPm('pm-key', ['hash-1'], setter, identity);
+
+			expect(getState()[0].fileSize).toBeCloseTo(2048, 5);
+		});
+
+		it('matches case-insensitively, because the probe echoes what it was sent', async () => {
+			mockCheckPremiumizeCache.mockResolvedValue([
+				{ hash: 'AABBCC', cached: true, filename: 'Show', filesize: 10 },
+			]);
+			const { setter, getState } = createStateHarness([
+				{ hash: 'aabbcc', noVideos: false, pmAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityPm2('pm-key', ['AABBCC'], setter)).toBe(1);
+			expect(getState()[0].pmAvailable).toBe(true);
+		});
+
+		it('leaves a row with no videos alone', async () => {
+			mockCheckPremiumizeCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: true, filename: 'Archive', filesize: 10 },
+			]);
+			const { setter, getState } = createStateHarness([
+				{ hash: 'hash-1', noVideos: true, pmAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityPm2('pm-key', ['hash-1'], setter)).toBe(0);
+			expect(getState()[0].pmAvailable).toBe(false);
+		});
+
+		it('does not re-render when nothing is cached', async () => {
+			mockCheckPremiumizeCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: false, filename: null, filesize: null },
+			]);
+			const { setter } = createStateHarness([
+				{ hash: 'hash-1', noVideos: false, pmAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityPm2('pm-key', ['hash-1'], setter)).toBe(0);
+			expect(setter).not.toHaveBeenCalled();
+		});
+	});
+	describe('Offcloud', () => {
+		const identity = <T>(rows: T[]) => rows;
+
+		it('marks the cached hashes and leaves the rest alone', async () => {
+			// `/cache` answers with hits only; `checkOffcloudCache` has already
+			// turned that into one answer per input by set membership, so this
+			// consumes `cached: false` rows as genuine misses rather than gaps.
+			mockCheckOffcloudCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: true },
+				{ hash: 'hash-2', cached: false },
+			]);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-1',
+					noVideos: false,
+					ocAvailable: false,
+					files: [{ fileId: 0, filename: 'Movie.mkv', filesize: 5 }],
+					fileSize: 1024,
+					medianFileSize: 1024,
+					videoCount: 1,
+				},
+				{ hash: 'hash-2', noVideos: false, ocAvailable: false, files: [] },
+			] as any[]);
+
+			const hits = await checkAvailabilityOc(
+				'oc-key',
+				['hash-1', 'hash-2'],
+				setter,
+				identity
+			);
+
+			expect(hits).toBe(1);
+			expect(getState()[0].ocAvailable).toBe(true);
+			expect(getState()[1].ocAvailable).toBe(false);
+		});
+
+		it('leaves files, counts and sizes untouched - the probe reports none', async () => {
+			// `/cache` carries no filenames and no sizes at all (its `/cache/info`
+			// sibling does, at the cost of a second request that only a modal or a
+			// cast is worth spending). So unlike Premiumize's probe there is not
+			// even a total to repair a missing size with, and whatever another
+			// service worked out has to survive verbatim.
+			mockCheckOffcloudCache.mockResolvedValue([{ hash: 'hash-1', cached: true }]);
+			const { setter, getState } = createStateHarness([
+				{
+					hash: 'hash-1',
+					noVideos: false,
+					ocAvailable: false,
+					files: [{ fileId: 0, filename: 'Movie.mkv', filesize: 5 }],
+					fileSize: 0,
+					medianFileSize: 7,
+					videoCount: 1,
+				},
+			] as any[]);
+
+			await checkAvailabilityOc('oc-key', ['hash-1'], setter, identity);
+
+			expect(getState()[0].files).toHaveLength(1);
+			expect(getState()[0].fileSize).toBe(0);
+			expect(getState()[0].medianFileSize).toBe(7);
+			expect(getState()[0].videoCount).toBe(1);
+		});
+
+		it('matches case-insensitively, because the probe echoes what it was sent', async () => {
+			mockCheckOffcloudCache.mockResolvedValue([{ hash: 'AABBCC', cached: true }]);
+			const { setter, getState } = createStateHarness([
+				{ hash: 'aabbcc', noVideos: false, ocAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityOc2('oc-key', ['AABBCC'], setter)).toBe(1);
+			expect(getState()[0].ocAvailable).toBe(true);
+		});
+
+		it('ignores a hash Offcloud volunteered that was never asked about', async () => {
+			// Set membership, not position: an extra entry in the reply can only
+			// fail to match a row, never shift another row's answer onto it.
+			mockCheckOffcloudCache.mockResolvedValue([
+				{ hash: 'hash-1', cached: true },
+				{ hash: 'someone-elses-hash', cached: true },
+			]);
+			const { setter, getState } = createStateHarness([
+				{ hash: 'hash-1', noVideos: false, ocAvailable: false, files: [] },
+				{ hash: 'hash-2', noVideos: false, ocAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityOc2('oc-key', ['hash-1', 'hash-2'], setter)).toBe(1);
+			expect(getState()[0].ocAvailable).toBe(true);
+			expect(getState()[1].ocAvailable).toBe(false);
+		});
+
+		it('leaves a row with no videos alone', async () => {
+			mockCheckOffcloudCache.mockResolvedValue([{ hash: 'hash-1', cached: true }]);
+			const { setter, getState } = createStateHarness([
+				{ hash: 'hash-1', noVideos: true, ocAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityOc2('oc-key', ['hash-1'], setter)).toBe(0);
+			expect(getState()[0].ocAvailable).toBe(false);
+		});
+
+		it('does not re-render when nothing is cached', async () => {
+			mockCheckOffcloudCache.mockResolvedValue([{ hash: 'hash-1', cached: false }]);
+			const { setter } = createStateHarness([
+				{ hash: 'hash-1', noVideos: false, ocAvailable: false, files: [] },
+			] as any[]);
+
+			expect(await checkAvailabilityOc2('oc-key', ['hash-1'], setter)).toBe(0);
+			expect(setter).not.toHaveBeenCalled();
+		});
+	});
+});

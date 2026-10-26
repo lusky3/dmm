@@ -1,158 +1,150 @@
 import Poster from '@/components/poster';
-import { PlanetScaleCache } from '@/services/planetscale';
-import { TraktMediaItem, getMediaData } from '@/services/trakt';
+import { useCachedList } from '@/hooks/useCachedList';
+import { TraktMediaItem } from '@/services/trakt';
+import { toasterPosition } from '@/utils/toastOptions';
 import { withAuth } from '@/utils/withAuth';
-import { GetServerSideProps } from 'next';
 import Head from 'next/head';
 import Link from 'next/link';
-import { FunctionComponent } from 'react';
+import { useRouter } from 'next/router';
+import { FunctionComponent, useMemo } from 'react';
 import { Toaster } from 'react-hot-toast';
 
-const movieEndpoints = new Map<string, string>([
-	['Box Office', 'movies/boxoffice'],
-	['Most Played Today', 'movies/played/daily'],
-	['Most Played This Month', 'movies/played/monthly'],
-	['Most Played All Time', 'movies/played/all'],
-	['Most Watched Today', 'movies/watched/daily'],
-	['Most Watched This Month', 'movies/watched/monthly'],
-	['Most Watched', 'movies/watched/all'],
-	['Most Collected Today', 'movies/collected/daily'],
-	['Most Collected This Month', 'movies/collected/monthly'],
-	['Most Collected All Time', 'movies/collected/all'],
-	['Most Favorited Today', 'movies/favorited/daily'],
-	['Most Favorited This Month', 'movies/favorited/monthly'],
-	['Most Favorited All Time', 'movies/favorited/all'],
-	['Popular', 'movies/popular'],
-	['Trending', 'movies/trending'],
-	['Most Anticipated', 'movies/anticipated'],
-]);
-
-const showEndpoints = new Map<string, string>([
-	['Most Played Today', 'shows/played/daily'],
-	['Most Played This Month', 'shows/played/monthly'],
-	['Most Played All Time', 'shows/played/all'],
-	['Most Watched Today', 'shows/watched/daily'],
-	['Most Watched This Month', 'shows/watched/monthly'],
-	['Most Watched All Time', 'shows/watched/all'],
-	['Most Collected Today', 'shows/collected/daily'],
-	['Most Collected This Month', 'shows/collected/monthly'],
-	['Most Collected All Time', 'shows/collected/all'],
-	['Most Favorited Today', 'shows/favorited/daily'],
-	['Most Favorited This Month', 'shows/favorited/monthly'],
-	['Most Favorited All Time', 'shows/favorited/all'],
-	['Popular', 'shows/popular'],
-	['Trending', 'shows/trending'],
-	['Most Anticipated', 'shows/anticipated'],
-]);
+type Category = {
+	name: string;
+	results: Record<string, TraktMediaItem[]>;
+};
 
 type TraktBrowseProps = {
 	mediaType: string;
-	arrayOfResults: Record<string, TraktMediaItem[]>;
+	categories: Category[];
 };
 
-export const TraktBrowse: FunctionComponent<TraktBrowseProps> = ({ mediaType, arrayOfResults }) => {
-	const title = mediaType === 'movie' ? 'Movies 🎥' : 'Shows 📺';
+type RankedItem = {
+	imdbid: string;
+	title: string;
+	year: number;
+	dateTs: number;
+	appearances: number;
+};
+
+// Sort key: movies use `released` (theatrical date), shows use `first_aired`
+// (series premiere). Both come from Trakt's extended=full payload; fall back to
+// the release year when the date is missing (e.g. a not-yet-refreshed cache).
+function getDateTs(media: any): number {
+	const raw = media?.released || media?.first_aired || null;
+	const parsed = raw ? Date.parse(raw) : NaN;
+	if (!isNaN(parsed)) return parsed;
+	return media?.year ? Date.parse(`${media.year}-01-01`) : 0;
+}
+
+function rankItems(categories: Category[]): RankedItem[] {
+	const map = new Map<string, RankedItem>();
+
+	for (const category of categories) {
+		for (const items of Object.values(category.results)) {
+			for (const item of items) {
+				// Endpoints return the media either wrapped (`{ ..., movie }`) or
+				// as the bare object (e.g. movies/popular), so unwrap all shapes.
+				const media = (item.movie || item.show || item) as any;
+				const imdbid = media?.ids?.imdb;
+				if (!imdbid) continue;
+
+				const existing = map.get(imdbid);
+				if (existing) {
+					existing.appearances++;
+				} else {
+					map.set(imdbid, {
+						imdbid,
+						title: media?.title || 'Unknown',
+						year: media?.year || 0,
+						dateTs: getDateTs(media),
+						appearances: 1,
+					});
+				}
+			}
+		}
+	}
+
+	// Already-released titles come first, newest → oldest. Upcoming titles
+	// (e.g. Trakt's "Most Anticipated") have future dates, so they're bucketed to
+	// the end, soonest → latest, instead of dominating the top. Popularity
+	// (appearances across Trakt lists) breaks ties within each bucket.
+	const now = Date.now();
+	return Array.from(map.values()).sort((a, b) => {
+		const aUpcoming = a.dateTs > now;
+		const bUpcoming = b.dateTs > now;
+		if (aUpcoming !== bUpcoming) return aUpcoming ? 1 : -1;
+		if (aUpcoming) {
+			return a.dateTs - b.dateTs || b.appearances - a.appearances;
+		}
+		return b.dateTs - a.dateTs || b.appearances - a.appearances;
+	});
+}
+
+export const TraktBrowse: FunctionComponent = () => {
+	const router = useRouter();
+	const { browse } = router.query;
+	const browseKey = typeof browse === 'string' ? browse : '';
+
+	const { data, loading, error } = useCachedList<TraktBrowseProps>(
+		browseKey ? `trakt:${browseKey}` : null,
+		async () => {
+			const response = await fetch(`/api/info/trakt?browse=${browseKey}`);
+			if (!response.ok) {
+				throw new Error('Failed to fetch data');
+			}
+			return response.json();
+		}
+	);
+
+	const ranked = useMemo(() => (data ? rankItems(data.categories) : []), [data]);
+
+	if (!browseKey || (loading && !data)) {
+		return <div className="mx-2 my-1 min-h-screen bg-gray-900 text-white">Loading...</div>;
+	}
+
+	if (error) {
+		return (
+			<div className="mx-2 my-1 min-h-screen bg-gray-900 text-white">
+				Error: Failed to load data
+			</div>
+		);
+	}
+
+	if (!data) {
+		return (
+			<div className="mx-2 my-1 min-h-screen bg-gray-900 text-white">No data available</div>
+		);
+	}
+
+	const title = data.mediaType === 'movie' ? 'Movies' : 'Shows';
+
 	return (
-		<div className="mx-2 my-1 max-w-full">
+		<div className="mx-2 my-1 min-h-screen bg-gray-900">
 			<Head>
 				<title>Debrid Media Manager - Trakt - {title}</title>
 			</Head>
-			<Toaster position="bottom-right" />
-			<div className="flex justify-between items-center mb-2">
-				<h1 className="text-xl font-bold">Trakt - {title}</h1>
+			<Toaster position={toasterPosition()} />
+
+			<div className="mb-2 flex items-center justify-between">
+				<h1 className="text-xl font-bold text-white">Trakt - {title}</h1>
 				<Link
 					href="/"
-					className="text-sm bg-cyan-800 hover:bg-cyan-700 text-white py-1 px-2 rounded"
+					className="shrink-0 rounded border-2 border-cyan-500 bg-cyan-900/30 px-2 py-1 text-sm whitespace-nowrap text-cyan-100 transition-colors hover:bg-cyan-800/50"
 				>
 					Go Home
 				</Link>
 			</div>
-			{Object.keys(arrayOfResults).map((listName: string, idx: number) => (
-				<>
-					<h2 className="mt-4 text-2xl font-bold" key={idx}>
-						<span className="text-yellow-500">{idx + 1}</span> {listName}
-					</h2>
-					<div className="grid grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10 gap-2">
-						{arrayOfResults[listName].map((item: TraktMediaItem) => {
-							const imdbid =
-								item.movie?.ids?.imdb ||
-								item.show?.ids?.imdb ||
-								(item as any).ids?.imdb;
-							if (!imdbid) {
-								return null;
-							}
-							const title =
-								item.movie?.title || item.show?.title || (item as any).title;
-							return (
-								<Link key={imdbid} href={`/${mediaType}/${imdbid}`} className="">
-									<Poster imdbId={imdbid} title={title} />
-								</Link>
-							);
-						})}
-					</div>
-				</>
-			))}
+
+			<div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10">
+				{ranked.map((item) => (
+					<Link key={item.imdbid} href={`/${data.mediaType}/${item.imdbid}`}>
+						<Poster imdbId={item.imdbid} title={item.title} />
+					</Link>
+				))}
+			</div>
 		</div>
 	);
-};
-
-type TraktBrowseResponseCache = {
-	lastUpdated: number;
-	results: TraktMediaItem[];
-};
-const responseCache: Record<string, TraktBrowseResponseCache> = {};
-
-const traktClientID = process.env.TRAKT_CLIENT_ID;
-const db = new PlanetScaleCache();
-
-export const getServerSideProps: GetServerSideProps = async (context) => {
-	const { params } = context;
-	let mediaType = 'movie';
-	if (params?.browse) {
-		mediaType = (params.browse as string).toLowerCase() === 'shows' ? 'show' : 'movie';
-	}
-
-	const arrayOfResults: Record<string, TraktMediaItem[]> = {};
-
-	let endpoints = mediaType === 'movie' ? movieEndpoints : showEndpoints;
-	const keys = Array.from(endpoints.keys());
-	for (let i = 0; i < keys.length; i++) {
-		const key = keys[i];
-		const endpoint = endpoints.get(key)!;
-		if (
-			responseCache[endpoint] &&
-			responseCache[endpoint].results.length &&
-			responseCache[endpoint].lastUpdated > new Date().getTime() - 1000 * 60 * 10
-		) {
-			arrayOfResults[key] = responseCache[endpoint].results;
-			continue;
-		}
-
-		try {
-			let searchResults = await db.getSearchResults<TraktMediaItem[]>(`trakt:${endpoint}`);
-			if (!searchResults?.length) {
-				searchResults = await getMediaData(traktClientID!, endpoint);
-				await db.saveSearchResults(`trakt:${endpoint}`, searchResults);
-			}
-			responseCache[endpoint] = {
-				lastUpdated: new Date().getTime(),
-				results: searchResults,
-			};
-			arrayOfResults[key] = responseCache[endpoint].results;
-		} catch (error: any) {
-			console.error(error);
-			return {
-				notFound: true,
-			};
-		}
-	}
-
-	return {
-		props: {
-			mediaType,
-			arrayOfResults,
-		},
-	};
 };
 
 export default withAuth(TraktBrowse);

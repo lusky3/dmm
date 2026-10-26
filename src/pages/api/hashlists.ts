@@ -1,5 +1,15 @@
 // pages/api/shorturl.ts
+import {
+	HASHLIST_APP_URL,
+	HASHLIST_HOST,
+	MAX_IFRAME_URL_LENGTH,
+	hashlistDataPath,
+	hashlistFragmentForId,
+	hashlistPageHtml,
+	isLzUriSafe,
+} from '@/utils/hashlistSource';
 import { Octokit } from '@octokit/rest';
+import lzString from 'lz-string';
 import { NextApiRequest, NextApiResponse } from 'next';
 import { v4 as uuidv4 } from 'uuid';
 
@@ -7,19 +17,88 @@ const OWNER = 'debridmediamanager';
 const REPO = 'hashlists';
 const REF = 'heads/main';
 
+export const config = {
+	api: {
+		bodyParser: {
+			sizeLimit: '100mb',
+		},
+	},
+};
+
+// Whether `data` is lz-string text that decodes to a hash list: an object
+// with a `torrents` array, or the bare array a single-torrent share carries.
+function isHashlistData(data: unknown): data is string {
+	if (typeof data !== 'string' || !isLzUriSafe(data)) return false;
+	try {
+		const parsed = JSON.parse(lzString.decompressFromEncodedURIComponent(data) ?? '');
+		return Array.isArray(parsed) || Array.isArray(parsed?.torrents);
+	} catch {
+		return false;
+	}
+}
+
+const APP_PAGE = new URL(HASHLIST_APP_URL);
+
+// The list an old-form `url` carries, when the url is the one shape clients
+// have sent: DMM's hash list page over https, nothing but the list after the
+// `#`. Any other url is refused, so nothing the caller sends is ever written
+// into the page's markup; the page's iframe is always the app's own link.
+function listInUrl(url: unknown): string | undefined {
+	if (typeof url !== 'string') return undefined;
+	let parsed: URL;
+	try {
+		parsed = new URL(url);
+	} catch {
+		return undefined;
+	}
+	const isAppPage =
+		parsed.protocol === 'https:' &&
+		parsed.host === APP_PAGE.host &&
+		parsed.pathname === APP_PAGE.pathname &&
+		!parsed.username &&
+		!parsed.password &&
+		!parsed.search;
+	if (!isAppPage) return undefined;
+	const fragment = parsed.hash.slice(1);
+	return isHashlistData(fragment) ? fragment : undefined;
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
 	if (req.method !== 'POST') {
 		res.status(405).json({ message: 'Method not allowed' });
+		return;
 	}
-	// Generate short URL for the given URL
-	const { url } = req.body;
+	// `data` is the list itself, stored beside its page (see hashlistSource).
+	// `url` is the old form, the whole list in the iframe URL, which clients
+	// still send. A list it carries is stored the same way as `data`: left in
+	// the URL, a list past 1 MiB is a white page in Firefox and past 2 MiB in
+	// Chrome.
+	const { url, data } = req.body ?? {};
 
-	if (!url) {
+	if (data !== undefined && !isHashlistData(data)) {
+		res.status(400).json({ message: 'data must be an lz-string encoded hash list' });
+		return;
+	}
+	if (data === undefined && !url) {
 		res.status(400).json({ message: 'URL is required' });
 		return;
 	}
 
+	const list: string | undefined = data ?? listInUrl(url);
+	if (list === undefined) {
+		res.status(400).json({
+			message: `url must be ${HASHLIST_APP_URL}#<lz-string encoded hash list>`,
+		});
+		return;
+	}
 	const uuid = uuidv4();
+	// A list that fits in the iframe URL is published there, the form every
+	// page had before 2026-09-30 and the one other hash list readers parse
+	// (Zilean reads only the page's iframe, card 433); only a longer one goes
+	// beside its page, where every browser can open it.
+	const inline = `${HASHLIST_APP_URL}#${list}`;
+	const fitsInUrl = inline.length <= MAX_IFRAME_URL_LENGTH;
+	const iframeSrc = fitsInUrl ? inline : `${HASHLIST_APP_URL}#${hashlistFragmentForId(uuid)}`;
 
 	const token = process.env.GH_PAT;
 
@@ -33,37 +112,33 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 			ref: REF,
 		});
 
-		// Create a new blob with the file content
-		const { data: blobData } = await octokit.rest.git.createBlob({
-			owner: OWNER,
-			repo: REPO,
-			content: `<!doctype html>
-<html>
-<head>
-<meta charset=UTF-8>
-<title>Debrid Media Manager Hash List</title>
-<style>iframe{border:none;position:absolute;top:0;left:0;width:100%;height:100%}</style>
-</head>
-<body>
-<iframe src="${url}"></iframe>
-</body>
-</html>`,
-			encoding: 'utf-8',
-		});
+		const files: { path: string; content: string }[] = [
+			{ path: `${uuid}.html`, content: hashlistPageHtml(iframeSrc) },
+		];
+		if (!fitsInUrl) files.push({ path: hashlistDataPath(uuid), content: list });
 
-		// Create a new tree with the new file
+		// Create the blobs, then one tree and one commit holding all of them
+		const blobs = await Promise.all(
+			files.map((file) =>
+				octokit.rest.git.createBlob({
+					owner: OWNER,
+					repo: REPO,
+					content: file.content,
+					encoding: 'utf-8',
+				})
+			)
+		);
+
 		const { data: treeData } = await octokit.rest.git.createTree({
 			owner: OWNER,
 			repo: REPO,
 			base_tree: refData.object.sha,
-			tree: [
-				{
-					path: `${uuid}.html`,
-					mode: '100644',
-					type: 'blob',
-					sha: blobData.sha,
-				},
-			],
+			tree: files.map((file, i) => ({
+				path: file.path,
+				mode: '100644' as const,
+				type: 'blob' as const,
+				sha: blobs[i].data.sha,
+			})),
 		});
 
 		// Create a new commit
@@ -83,7 +158,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
 			sha: commitData.sha,
 		});
 
-		res.status(200).json({ shortUrl: `https://hashlists.debridmediamanager.com/${uuid}.html` });
+		res.status(200).json({ shortUrl: `${HASHLIST_HOST}/${uuid}.html` });
 	} catch (error) {
 		console.error(error);
 		res.status(500).send('Error adding file to GitHub repository');

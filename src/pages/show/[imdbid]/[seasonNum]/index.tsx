@@ -1,0 +1,2389 @@
+import AnimeEntryLinks from '@/components/AnimeEntryLinks';
+import AvailabilityTokens from '@/components/AvailabilityTokens';
+import CheckAvailabilityButtons from '@/components/CheckAvailabilityButtons';
+import EasynewsResults from '@/components/EasynewsResults';
+import EpisodeChips, { type EpisodeChipItem } from '@/components/EpisodeChips';
+import { showEpisodeSummary } from '@/components/EpisodeSummaryToast';
+import MediaHeader from '@/components/MediaHeader';
+import ResultsTabs, { NoTorrentsYet } from '@/components/ResultsTabs';
+import SearchSourceProgress from '@/components/SearchSourceProgress';
+import SearchTokens from '@/components/SearchTokens';
+import TvSearchResults from '@/components/TvSearchResults';
+import UsenetResults from '@/components/UsenetResults';
+import WantedButton from '@/components/WantedButton';
+import Modal from '@/components/modals/modal';
+import { useLibraryCache } from '@/contexts/LibraryCacheContext';
+import {
+	useAllDebridApiKey,
+	useDebridLinkCredential,
+	useOffcloudApiKey,
+	usePremiumizeCredential,
+	useRealDebridAccessToken,
+	useTorBoxAccessToken,
+} from '@/hooks/auth';
+import useLocalStorage from '@/hooks/localStorage';
+import { useAnimeEntries } from '@/hooks/useAnimeEntries';
+import { useAvailabilityCheck } from '@/hooks/useAvailabilityCheck';
+import { useExternalSources } from '@/hooks/useExternalSources';
+import { useMassReport } from '@/hooks/useMassReport';
+import {
+	useSeasonPackAdder,
+	type SeasonAdderService,
+	type SeasonRunState,
+} from '@/hooks/useSeasonPackAdder';
+import { useTorrentManagement } from '@/hooks/useTorrentManagement';
+import { SearchApiResponse, SearchResult, hasSubstantialTitle } from '@/services/mediasearch';
+import type { UsenetResult } from '@/services/nzb2rd';
+import { RD_ADD_MIN_SPACING_MS } from '@/services/realDebrid';
+import UserTorrentDB from '@/torrent/db';
+import { handleCastTvShowAllDebrid } from '@/utils/allDebridCastApiClient';
+import axiosWithRetry from '@/utils/axiosWithRetry';
+import {
+	getLocalStorageBoolean,
+	getLocalStorageItemOrDefault,
+	hideRdBlockedTorrentsDefault,
+} from '@/utils/browserStorage';
+import { handleCastTvShow } from '@/utils/castApiClient';
+import { fileContentRequest } from '@/utils/contentRequestsApi';
+import { handleCopyOrDownloadMagnet } from '@/utils/copyMagnet';
+import { cyrillicLedLast, isCyrillicLed } from '@/utils/cyrillicLed';
+import { handleCastTvShowDebridLink } from '@/utils/debridLinkCastApiClient';
+import { markTransferredHashes } from '@/utils/debridUploader';
+import { delay } from '@/utils/delay';
+import {
+	episodeChipClasses,
+	getColorScale,
+	getExpectedEpisodeCount,
+	getQueryForEpisodeCount,
+} from '@/utils/episodeUtils';
+import {
+	checkAvailabilityOc,
+	checkAvailabilityPm,
+	checkDatabaseAvailabilityAd,
+	checkDatabaseAvailabilityRd,
+	checkDatabaseAvailabilityTb,
+} from '@/utils/instantChecks';
+import { handleCastTvShowOffcloud } from '@/utils/offcloudCastApiClient';
+import { handleCastTvShowPremiumize } from '@/utils/premiumizeCastApiClient';
+import { quickSearch } from '@/utils/quickSearch';
+import { RD_ADD_PAUSE_GIVE_UP_MS, RdPauseStreak, addThroughRdPause } from '@/utils/rdAddPause';
+import { foundTorrentsMessage, isRdBlockedFilename } from '@/utils/rdFilenameFilter';
+import { canReportWith } from '@/utils/reporterId';
+import { sortByMean } from '@/utils/results';
+import { opensOnUsenet, usenetRouteFor } from '@/utils/resultsTab';
+import { searchStateFromStatusHeader } from '@/utils/searchNotice';
+import { showInfoForSearchResult } from '@/utils/searchResultInfo';
+import {
+	DMM_SOURCE,
+	SearchSourceStates,
+	SearchSourceStatus,
+	initSourceStates,
+	markSourceResults,
+	markSourceStatus,
+} from '@/utils/searchSources';
+import { buildSeasonRegex } from '@/utils/seasonFilter';
+import {
+	defaultEpisodeSize,
+	defaultTorrentsFilter as defaultFilterSetting,
+	defaultPlayer,
+	defaultShowSeasonFilter,
+} from '@/utils/settings';
+import { getStremioDetailUrl } from '@/utils/stremioLinks';
+import { castToastOptions, searchToastOptions, toasterPosition } from '@/utils/toastOptions';
+import { generateTokenAndHash } from '@/utils/token';
+import { handleCastTvShowTorBox } from '@/utils/torboxCastApiClient';
+import { getMultipleTrackerStats } from '@/utils/trackerStats';
+import {
+	TvEpisodeFilter,
+	createTvEpisodeReader,
+	firstUnairedEpisode,
+	matchesTvEpisodeFilter,
+	parseTvEpisodeFilter,
+	summarizeTvEpisodes,
+} from '@/utils/tvEpisodes';
+import { withAuth } from '@/utils/withAuth';
+import { AxiosError } from 'axios';
+import {
+	Calendar,
+	CheckCircle,
+	CircleSlash,
+	CloudOff,
+	Layers,
+	Loader2,
+	RotateCcw,
+	Sparkles,
+	Square,
+	X,
+	Zap,
+} from 'lucide-react';
+import Head from 'next/head';
+import Link from 'next/link';
+import { useRouter } from 'next/router';
+import { FunctionComponent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
+import toast, { Toaster } from 'react-hot-toast';
+
+/**
+ * The services the Instant buttons can promise "cached only" on, and how each
+ * one's buttons are drawn. Debrid-Link has no cache signal, so it has none.
+ * Class names are written out whole: the build cannot see an assembled one.
+ */
+const INSTANT_SERVICES: {
+	service: SeasonAdderService;
+	short: string;
+	label: string;
+	available: 'rdAvailable' | 'adAvailable' | 'tbAvailable' | 'pmAvailable' | 'ocAvailable';
+	button: string;
+	icon: string;
+	/** The provider picker, in the service's identity colour (AGENTS.md). */
+	picked: string;
+	unpicked: string;
+}[] = [
+	{
+		service: 'rd',
+		short: 'RD',
+		label: 'Real-Debrid',
+		available: 'rdAvailable',
+		button: 'border-green-500 bg-green-900/30 text-green-100 hover:bg-green-800/50',
+		icon: 'text-yellow-500',
+		picked: 'border-[#b5d496] bg-[#b5d496] text-black',
+		unpicked: 'border-[#b5d496] bg-gray-900/80 text-[#b5d496] hover:bg-[#b5d496]/20',
+	},
+	{
+		service: 'ad',
+		short: 'AD',
+		label: 'AllDebrid',
+		available: 'adAvailable',
+		button: 'border-orange-500 bg-orange-900/30 text-orange-100 hover:bg-orange-800/50',
+		icon: 'text-orange-400',
+		picked: 'border-[#fbc730] bg-[#fbc730] text-black',
+		unpicked: 'border-[#fbc730] bg-gray-900/80 text-[#fbc730] hover:bg-[#fbc730]/20',
+	},
+	{
+		service: 'tb',
+		short: 'TB',
+		label: 'TorBox',
+		available: 'tbAvailable',
+		button: 'border-indigo-500 bg-indigo-900/30 text-indigo-100 hover:bg-indigo-800/50',
+		icon: 'text-indigo-300',
+		picked: 'border-[#4f46e5] bg-[#4f46e5] text-white',
+		unpicked: 'border-[#4f46e5] bg-gray-900/80 text-indigo-200 hover:bg-[#4f46e5]/30',
+	},
+	{
+		service: 'pm',
+		short: 'PM',
+		label: 'Premiumize',
+		available: 'pmAvailable',
+		button: 'border-rose-500 bg-rose-900/30 text-rose-100 hover:bg-rose-800/50',
+		icon: 'text-rose-300',
+		picked: 'border-[#aa0000] bg-[#aa0000] text-white',
+		unpicked: 'border-[#aa0000] bg-gray-900/80 text-red-200 hover:bg-[#aa0000]/30',
+	},
+	{
+		service: 'oc',
+		short: 'OC',
+		label: 'Offcloud',
+		available: 'ocAvailable',
+		button: 'border-teal-500 bg-teal-900/30 text-teal-100 hover:bg-teal-800/50',
+		icon: 'text-teal-300',
+		picked: 'border-[#f97316] bg-[#f97316] text-black',
+		unpicked: 'border-[#f97316] bg-gray-900/80 text-[#f97316] hover:bg-[#f97316]/20',
+	},
+];
+
+/** "S29" for the generic "Season 29" the metadata names most seasons; a real name stays. */
+const seasonLabel = (name: string | undefined, season: number) =>
+	name && name.trim().toLowerCase() !== `season ${season}` ? name : `S${season}`;
+
+const labelFor = (service: SeasonAdderService) =>
+	INSTANT_SERVICES.find((entry) => entry.service === service)!.label;
+
+type EpisodeAirInfo = {
+	first_aired: string;
+	episode_number: number;
+	season_number: number;
+	name: string;
+};
+
+type ShowInfo = {
+	title: string;
+	description: string;
+	poster: string;
+	backdrop: string;
+	season_count: number;
+	season_names: string[];
+	has_specials: boolean;
+	imdb_score: number;
+	season_episode_counts: Record<number, number>;
+	trailer: string;
+	status?: string;
+	next_episode_to_air?: EpisodeAirInfo;
+	last_episode_to_air?: EpisodeAirInfo;
+	series_imdbid?: string;
+	/** Set when the id is a film's. */
+	is_movie?: boolean;
+};
+
+const torrentDB = new UserTorrentDB();
+
+const TvSearch: FunctionComponent = () => {
+	const isMounted = useRef(true);
+	const hasLoadedTrackerStats = useRef(false);
+	const player = getLocalStorageItemOrDefault('settings:player', defaultPlayer);
+	const episodeMaxSize = getLocalStorageItemOrDefault(
+		'settings:episodeMaxSize',
+		defaultEpisodeSize
+	);
+	const onlyTrustedTorrents = getLocalStorageBoolean('settings:onlyTrustedTorrents', false);
+	const hideRdBlockedTorrents = hideRdBlockedTorrentsDefault(false);
+	const storedTorrentsFilter = useMemo(
+		() => getLocalStorageItemOrDefault('settings:defaultTorrentsFilter', defaultFilterSetting),
+		[]
+	);
+	const showSeasonFilter = getLocalStorageBoolean(
+		'settings:showSeasonFilter',
+		defaultShowSeasonFilter
+	);
+
+	const [showInfo, setShowInfo] = useState<ShowInfo | null>(null);
+	// imdb id showInfo belongs to - lets the search wait for its own metadata
+	// instead of running against the previously viewed show's
+	const [infoImdbId, setInfoImdbId] = useState<string | null>(null);
+	const [isLoading, setIsLoading] = useState(true);
+	const [searchState, setSearchState] = useState<string>('loading');
+	const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+	const [errorMessage, setErrorMessage] = useState('');
+	// One summary per service, so concurrent RD and AD runs each keep their totals.
+	const episodeSummaryIds = useRef(new Map<string, string>());
+	const episodeSummaryRuns = useRef(new Map<string, number>());
+	const episodeSummaryGeneration = useRef(0);
+	const [query, setQuery] = useState(storedTorrentsFilter);
+	const [descLimit, setDescLimit] = useState(100);
+	const [rdKey] = useRealDebridAccessToken();
+	const adKey = useAllDebridApiKey();
+	const torboxKey = useTorBoxAccessToken();
+	const premiumizeKey = usePremiumizeCredential();
+	const offcloudKey = useOffcloudApiKey();
+	// Debrid-Link joins the add buttons and nothing else: it has no cache probe,
+	// so it takes no part in the availability sweep, the cached/uncached counts
+	// or the `is:` filters.
+	const debridLinkKey = useDebridLinkCredential();
+
+	// Library sync status - used to prevent auto-availability check while library is still loading
+	const { isFetching: isLibrarySyncing, libraryItems } = useLibraryCache();
+
+	const [onlyShowCached, setOnlyShowCached] = useState<boolean>(false);
+	const [currentPage, setCurrentPage] = useState(0);
+	const [hasMoreResults, setHasMoreResults] = useState(true);
+	const [sourceStates, setSourceStates] = useState<SearchSourceStates>({});
+	const [searchCompleteInfo, setSearchCompleteInfo] = useState<{
+		finalResults: number;
+		totalAvailableCount: number;
+		rdAvailableCount?: number;
+		adAvailableCount?: number;
+		tbAvailableCount?: number;
+		pmAvailableCount?: number;
+		ocAvailableCount?: number;
+		allSourcesCompleted: boolean;
+		pendingAvailabilityChecks: number;
+		isAvailabilityOnly?: boolean;
+	} | null>(null);
+	const [shouldDownloadMagnets] = useState(
+		() =>
+			typeof window !== 'undefined' &&
+			window.localStorage.getItem('settings:downloadMagnets') === 'true'
+	);
+	const [showMassReportButtons] = useState(
+		() =>
+			typeof window !== 'undefined' &&
+			window.localStorage.getItem('settings:showMassReportButtons') === 'true'
+	);
+
+	const router = useRouter();
+	// `/show/tt…/N/usenet` renders this page on its Usenet tab; its season and episode
+	// links stay on that tab.
+	const usenetTab = !!router.pathname?.endsWith('/usenet');
+	// A viewer whose results open on Usenet lands on that tab instead.
+	useEffect(() => {
+		if (router.isReady && !usenetTab && opensOnUsenet(router.query)) {
+			router.replace(usenetRouteFor(router.pathname, router.query));
+		}
+	}, [router, usenetTab]);
+	const tabSuffix = usenetTab ? '/usenet' : '';
+	// Torrents asked for over a Usenet default stay asked for across seasons and chips.
+	const torrentsAsked = !usenetTab && router.query.tab === 'torrents';
+	const seasonLinkSuffix = torrentsAsked ? '?tab=torrents' : tabSuffix;
+	const { imdbid, seasonNum } = router.query;
+	useEffect(
+		() => () => {
+			episodeSummaryGeneration.current++;
+			episodeSummaryIds.current.forEach((id) => toast.dismiss(id));
+			episodeSummaryIds.current.clear();
+		},
+		[imdbid, seasonNum]
+	);
+
+	/**
+	 * The AniDB entries this show is split into. IMDb files every season, cour
+	 * and OVA under one id while AniDB gives each its own entry, so these links
+	 * reach the releases this page's season numbering cannot place.
+	 */
+	const animeEntries = useAnimeEntries(typeof imdbid === 'string' ? [imdbid] : []);
+	const animeLinks = typeof imdbid === 'string' ? (animeEntries[imdbid] ?? []) : [];
+
+	/** The episode chip picked, from `?episode=` so back and forward walk the chips. */
+	const episodeFilter = parseTvEpisodeFilter(router.query.episode);
+
+	/**
+	 * Usenet rows, once that section has been opened and searched. Keyed by
+	 * show and season: the section keeps its rows when the season changes
+	 * under it, and another season's rows must not count here.
+	 */
+	const usenetKey = `${imdbid}:${seasonNum}`;
+	const [usenetRows, setUsenetRows] = useState<{ key: string; rows: UsenetResult[] } | null>(
+		null
+	);
+	const handleUsenetResults = useCallback(
+		(rows: UsenetResult[]) => setUsenetRows({ key: usenetKey, rows }),
+		[usenetKey]
+	);
+	const currentUsenetRows = useMemo(
+		() => (usenetRows?.key === usenetKey ? usenetRows.rows : []),
+		[usenetRows, usenetKey]
+	);
+
+	/**
+	 * A user holding only Real-Debrid cannot start a transfer at all: the uploader
+	 * needs a TorBox key for the source side. They are exactly the
+	 * people the request board exists for, so the Request button appears for them
+	 * and for nobody else — anyone with a second service can just send it.
+	 */
+	// The Request button is for Real-Debrid users: it files an ask for a
+	// release, which somebody with a TorBox account then fulfils.
+	// It used to hide from a user who also held one of those keys, but that
+	// conflated "can ask" with "cannot fetch" — a user with both may still want
+	// to leave the ask for someone else rather than spend their own quota.
+	const canRequest = Boolean(rdKey);
+
+	const handleRequestContent = useCallback(
+		async (result: SearchResult) => {
+			if (!rdKey) return;
+			try {
+				const filed = await fileContentRequest(rdKey, {
+					hash: result.hash,
+					imdbId: imdbid as string,
+					title: result.title,
+					mediaType: 'show',
+					// Whole release, in bytes: the transfer cap is about what the uploader
+					// moves, and a row's sizes are in MB.
+					sizeBytes: result.fileSize
+						? Math.round(result.fileSize * 1024 * 1024)
+						: undefined,
+					returnPath: window.location.pathname,
+				});
+				if (filed.delivered) {
+					toast.success('Real-Debrid already had this. It is in your library now.', {
+						duration: 6000,
+					});
+					return;
+				}
+				toast.success(
+					'Requested. Anyone with TorBox can now send it to your library. Follow it under Requests.',
+					{ duration: 6000 }
+				);
+			} catch (error) {
+				toast.error(
+					`Could not request: ${error instanceof Error ? error.message : 'unreachable'}`
+				);
+			}
+		},
+		[rdKey, imdbid]
+	);
+
+	// Use shared hooks
+	const {
+		hashAndProgress,
+		fetchHashAndProgress,
+		addRd,
+		addAd,
+		addTb,
+		addPm,
+		addOc,
+		addDl,
+		addCached,
+		sendTbToRd,
+		deleteRd,
+		deleteAd,
+		deleteTb,
+		deletePm,
+		deleteOc,
+		deleteDl,
+	} = useTorrentManagement(
+		rdKey,
+		adKey,
+		torboxKey,
+		premiumizeKey,
+		offcloudKey,
+		debridLinkKey,
+		imdbid as string,
+		searchResults,
+		setSearchResults
+	);
+
+	const { fetchEpisodeFromExternalSource, getEnabledSources } = useExternalSources(
+		rdKey,
+		adKey,
+		torboxKey
+	);
+
+	const {
+		isAnyChecking,
+		isHashServiceChecking,
+		checkServiceAvailability,
+		checkServiceAvailabilityBulk,
+	} = useAvailabilityCheck(
+		rdKey,
+		adKey,
+		torboxKey,
+		premiumizeKey,
+		offcloudKey,
+		debridLinkKey,
+		imdbid as string,
+		searchResults,
+		setSearchResults,
+		hashAndProgress,
+		addRd,
+		addAd,
+		deleteRd,
+		deleteAd,
+		sortByMean
+	);
+
+	const reporterKeys = {
+		rdKey,
+		adKey,
+		torboxKey,
+		premiumizeKey,
+		offcloudKey,
+		debridLinkKey,
+	};
+	const canReport = canReportWith(reporterKeys);
+	const { handleMassReport } = useMassReport(reporterKeys, imdbid as string);
+
+	const showFacts = useMemo(
+		() =>
+			showInfo
+				? {
+						title: showInfo.title,
+						seasonCount: showInfo.season_count,
+						episodeCounts: showInfo.season_episode_counts ?? {},
+						lastEpisodeToAir: showInfo.last_episode_to_air ?? null,
+					}
+				: null,
+		[showInfo]
+	);
+
+	const {
+		discover: discoverSeasons,
+		run: runSeasons,
+		stop: stopSeasons,
+		discovering: isDiscoveringSeasons,
+		running: isAddingSeasons,
+		seasonState,
+	} = useSeasonPackAdder({
+		imdbId: (imdbid as string) ?? '',
+		show: showFacts,
+		libraryItems,
+		hashAndProgress,
+		addCached,
+		episodeMaxSize,
+	});
+
+	/**
+	 * Adds every season this library is missing, in one go.
+	 *
+	 * Discovery runs first and adds nothing: the dialog it leads to is the only
+	 * point at which the cost is knowable, and a user with a slot limit needs to
+	 * see "four seasons have no cached pack" before spending the other fourteen.
+	 */
+	const handleAllSeasons = useCallback(
+		async (service: SeasonAdderService) => {
+			if (!showInfo) return;
+			const label = labelFor(service);
+			const discoverToast = toast.loading(`Checking all ${showInfo.season_count} seasons...`);
+			let plan;
+			try {
+				plan = await discoverSeasons(service, {
+					tb: torboxKey,
+					pm: premiumizeKey,
+					oc: offcloudKey,
+				});
+			} catch (error) {
+				toast.error('Could not check the other seasons. Please try again.', {
+					id: discoverToast,
+				});
+				return;
+			}
+			toast.dismiss(discoverToast);
+			if (!plan) return;
+
+			const { summary } = plan;
+			if (summary.totalAddCount === 0) {
+				toast(
+					summary.held.length > 0
+						? `Nothing to add - all ${summary.held.length} seasons are already in your ${label} library.`
+						: `Nothing cached for any season of this show on ${label}.`,
+					{ duration: 6000 }
+				);
+				return;
+			}
+
+			// Seasons that were already complete episode by episode are named apart
+			// from the ones that were missing something. Nothing is deleted, so
+			// those seasons end up holding the pack and the episodes at once, and
+			// a confirmation that folded them together would read as if the
+			// library were merely being filled in.
+			const newPackCount = summary.packs.length - summary.upgrades.length;
+			const lines: string[] = [];
+			if (newPackCount > 0) {
+				lines.push(
+					`${newPackCount} season${newPackCount === 1 ? '' : 's'} as a complete pack`
+				);
+			}
+			if (summary.upgrades.length > 0) {
+				lines.push(
+					`${summary.upgrades.length} season${
+						summary.upgrades.length === 1 ? '' : 's'
+					} you already have episode by episode, upgraded to a pack (the episodes stay)`
+				);
+			}
+			if (summary.episodes.length > 0) {
+				lines.push(
+					`${summary.episodes.length} season${
+						summary.episodes.length === 1 ? '' : 's'
+					} episode by episode (${summary.episodeAddCount} episodes)`
+				);
+			}
+			if (summary.held.length > 0) {
+				lines.push(`${summary.held.length} already in your library`);
+			}
+			if (summary.gaps.length > 0) {
+				lines.push(
+					`${summary.gaps.length} with nothing cached (${summary.gaps
+						.map((entry) => `S${entry.season}`)
+						.join(', ')})`
+				);
+			}
+
+			const confirmed = (
+				await Modal.fire({
+					title: `Add all seasons to ${label}?`,
+					text: `${lines.join('. ')}. That is ${summary.totalAddCount} torrent${
+						summary.totalAddCount === 1 ? '' : 's'
+					} in total. Only cached releases are added, and the filter box is ignored.`,
+					icon: 'question',
+					showCancelButton: true,
+					confirmButtonColor: '#0891b2',
+					cancelButtonColor: '#374151',
+					confirmButtonText: `Yes, add ${summary.totalAddCount}`,
+					background: '#111827',
+					color: '#f3f4f6',
+					customClass: {
+						popup: 'bg-gray-900',
+						htmlContainer: 'text-gray-100',
+					},
+				})
+			).isConfirmed;
+			if (!confirmed) return;
+
+			// No duration: a run that sits through a Real-Debrid backoff outlives
+			// any fixed one, and a progress notice that vanishes mid-run reads as
+			// a crash.
+			const runToast = toast.loading(`Adding seasons to ${label}...`);
+			try {
+				const outcome = await runSeasons(plan, (paused) =>
+					toast.loading(
+						paused
+							? `${label} is pausing adds on your account. Waiting for it to lift, then trying again...`
+							: `Adding seasons to ${label}...`,
+						{ id: runToast }
+					)
+				);
+				toast.dismiss(runToast);
+
+				const parts: string[] = [];
+				if (outcome.added > 0) parts.push(`${outcome.added} added`);
+				if (summary.held.length > 0) parts.push(`${summary.held.length} already held`);
+				if (outcome.gaps.length > 0) {
+					parts.push(
+						`${outcome.gaps.length} with nothing cached (${outcome.gaps
+							.map((season) => `S${season}`)
+							.join(', ')})`
+					);
+				}
+				if (outcome.refused.length > 0) {
+					parts.push(
+						`${outcome.refused.length} refused by ${label} for now (${outcome.refused
+							.map((season) => `S${season}`)
+							.join(', ')})`
+					);
+				}
+				const summaryText = parts.length > 0 ? parts.join(', ') : 'nothing to do';
+
+				if (outcome.abortedByThrottle) {
+					toast.error(
+						`${label} refused every add for over ${RD_ADD_PAUSE_GIVE_UP_MS / 60_000} minutes, so the run stopped early: ${summaryText}. Try the rest later.`,
+						{ duration: 10000 }
+					);
+				} else if (outcome.stopped) {
+					toast(`Stopped: ${summaryText}.`, { duration: 8000 });
+				} else if (outcome.added > 0) {
+					toast.success(`${summaryText}.`, { duration: 8000 });
+				} else {
+					toast.error(`${summaryText}.`, { duration: 8000 });
+				}
+			} catch (error) {
+				toast.error('The run failed part way through.', { id: runToast });
+			}
+		},
+		[showInfo, discoverSeasons, runSeasons, torboxKey, premiumizeKey, offcloudKey]
+	);
+
+	const instantServices = INSTANT_SERVICES.filter(
+		({ service }) =>
+			({
+				rd: rdKey,
+				ad: adKey,
+				tb: torboxKey,
+				pm: premiumizeKey,
+				oc: offcloudKey,
+			})[service]
+	);
+	// With several services the header shows one button per action and a picker
+	// for which service it adds to, remembered across titles.
+	const [pickedInstant, setPickedInstant] = useLocalStorage<string>('settings:instantService');
+	const multiInstant = instantServices.length > 1;
+	const shownInstantServices = multiInstant
+		? [instantServices.find((entry) => entry.service === pickedInstant) ?? instantServices[0]]
+		: instantServices;
+
+	const expectedEpisodeCount = useMemo(
+		() =>
+			getExpectedEpisodeCount(
+				seasonNum as string | undefined,
+				showInfo?.season_episode_counts || {}
+			),
+		[seasonNum, showInfo]
+	);
+
+	const [redirectPath, setRedirectPath] = useState<string | null>(null);
+
+	// Fetch show info - keyed on the show alone so switching seasons reuses it
+	useEffect(() => {
+		if (!imdbid) return;
+		const id = imdbid as string;
+
+		// Drop the previous show's metadata so nothing downstream reads it as if
+		// it belonged to this one
+		setShowInfo(null);
+		setInfoImdbId(null);
+		setRedirectPath(null);
+		setIsLoading(true);
+		setErrorMessage('');
+
+		const fetchShowInfo = async () => {
+			try {
+				const response = await axiosWithRetry.get(`/api/info/show?imdbid=${id}`);
+				// An episode's IMDb id filed as a show's: the series it belongs to
+				// has every season, this id only the ones its providers agree on.
+				const seriesImdbId = response.data?.series_imdbid;
+				if (typeof seriesImdbId === 'string' && seriesImdbId !== id) {
+					setRedirectPath(`/show/${seriesImdbId}/1`);
+					return;
+				}
+				// A film's id: its releases and its page are the movie route's.
+				if (response.data?.is_movie === true) {
+					setRedirectPath(`/movie/${id}`);
+					return;
+				}
+				setShowInfo(response.data);
+				setInfoImdbId(id);
+			} catch (error) {
+				console.error('Error fetching show info:', error);
+				setErrorMessage('Failed to fetch show information');
+			} finally {
+				setIsLoading(false);
+			}
+		};
+
+		fetchShowInfo();
+	}, [imdbid]);
+
+	useEffect(() => {
+		if (redirectPath) router.replace(redirectPath);
+	}, [redirectPath, router]);
+
+	// Redirect away from seasons this show doesn't have
+	useEffect(() => {
+		if (!showInfo || !seasonNum || infoImdbId !== imdbid) return;
+		const requestedSeason = parseInt(seasonNum as string, 10);
+		if (
+			isNaN(requestedSeason) ||
+			requestedSeason > showInfo.season_count ||
+			(requestedSeason === 0 && !showInfo.has_specials) ||
+			requestedSeason < 0
+		) {
+			router.push(`/show/${imdbid}/1`);
+		}
+	}, [showInfo, infoImdbId, seasonNum, imdbid, router]);
+
+	useEffect(() => {
+		// The Usenet tab searches on its own and never shows the torrents.
+		if (
+			!imdbid ||
+			!seasonNum ||
+			infoImdbId !== imdbid ||
+			usenetTab ||
+			opensOnUsenet(router.query)
+		)
+			return;
+		const parsedSeason = parseInt(seasonNum as string, 10);
+		if (isNaN(parsedSeason)) return;
+
+		// Clear previous results and query input when the show or season changes
+		setSearchResults([]);
+		setQuery(storedTorrentsFilter);
+		setCurrentPage(0);
+		setHasMoreResults(true);
+
+		const initializeData = async () => {
+			await torrentDB.initializeDB();
+			await Promise.all([
+				fetchData(imdbid as string, parsedSeason, 0),
+				fetchHashAndProgress(),
+			]);
+		};
+
+		initializeData();
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [imdbid, seasonNum, infoImdbId, storedTorrentsFilter]);
+
+	// Apply season prefilter when the season loads. Keyed on show + season so it
+	// reapplies when switching to another show at the same season number.
+	const hasAppliedSeasonFilter = useRef<string | null>(null);
+	useEffect(() => {
+		if (!showSeasonFilter || !seasonNum || infoImdbId !== imdbid) return;
+		const sn = Array.isArray(seasonNum) ? seasonNum[0] : seasonNum;
+		if (!sn) return;
+		const filterKey = `${infoImdbId}:${sn}`;
+		if (hasAppliedSeasonFilter.current === filterKey) return;
+		const seasonNumParsed = parseInt(sn, 10);
+		if (isNaN(seasonNumParsed)) return;
+		hasAppliedSeasonFilter.current = filterKey;
+		const seasonPattern = buildSeasonRegex(seasonNumParsed);
+		setQuery((prev) => (prev ? `${prev} ${seasonPattern}` : seasonPattern));
+	}, [showSeasonFilter, seasonNum, infoImdbId, imdbid]);
+
+	useEffect(() => {
+		return () => {
+			isMounted.current = false;
+		};
+	}, []);
+
+	async function fetchData(imdbId: string, seasonNum: number, page: number = 0) {
+		// The search token is minted by the server now, so obtaining it can fail
+		// where the old client-side computation could not. This is the first await in
+		// the function and `initializeData` does not catch, so an unguarded rejection
+		// escapes as an unhandled promise and leaves the page blank — no results, no
+		// spinner, no message. Surface it the way a failed search is surfaced instead.
+		let tokenWithTimestamp: string;
+		let tokenHash: string;
+		try {
+			[tokenWithTimestamp, tokenHash] = await generateTokenAndHash();
+		} catch (error) {
+			console.error(
+				'Could not obtain a search token:',
+				error instanceof Error ? error.message : 'Unknown error'
+			);
+			setErrorMessage('There was an error searching for the query. Please try again later.');
+			setSearchState('loaded');
+			setHasMoreResults(false);
+			return;
+		}
+		if (page === 0) {
+			setSearchResults([]);
+		}
+		setErrorMessage('');
+		setSearchState('loading');
+		// Newly fetched results have no tracker stats yet
+		hasLoadedTrackerStats.current = false;
+
+		// External addons only run on the first page; "Show More Results" is DMM only
+		const enabledSources = page === 0 ? getEnabledSources() : [];
+		setSourceStates(initSourceStates(enabledSources));
+
+		// Track completion
+		let completedSources = 0;
+		let totalSources = 1 + enabledSources.length; // DMM + external addons
+		let rdAvailableCount = 0;
+		let adAvailableCount = 0;
+		let tbAvailableCount = 0;
+		let pmAvailableCount = 0;
+		let ocAvailableCount = 0;
+		let pendingAvailabilityChecks = 0;
+		let allSourcesCompleted = false;
+		let finalResultCount = 0;
+		let latestResultCount = 0;
+		let toastShown = false;
+
+		// Helper to check if everything is done and show toast only once
+		const checkAndShowFinalToast = () => {
+			if (toastShown) return;
+			if (!allSourcesCompleted || pendingAvailabilityChecks > 0) return;
+
+			toastShown = true;
+			setSearchCompleteInfo({
+				finalResults: finalResultCount,
+				totalAvailableCount:
+					rdAvailableCount +
+					adAvailableCount +
+					tbAvailableCount +
+					pmAvailableCount +
+					ocAvailableCount,
+				rdAvailableCount,
+				adAvailableCount,
+				tbAvailableCount,
+				pmAvailableCount,
+				ocAvailableCount,
+				allSourcesCompleted: true,
+				pendingAvailabilityChecks: 0,
+			});
+		};
+
+		const titleStartsWithYear = showInfo ? /^\d{4}\b/.test(showInfo.title) : false;
+
+		// Counted once per source, never per episode batch - an external source
+		// streams in many batches, and counting those overran totalSources and
+		// completed the search while results were still arriving
+		const markSourceComplete = (source: string, status: SearchSourceStatus = 'done') => {
+			setSourceStates((prev) => markSourceStatus(prev, source, status));
+			completedSources++;
+			if (completedSources < totalSources) return;
+			allSourcesCompleted = true;
+			finalResultCount = latestResultCount;
+			// keep the "processing" notice if the API returned one
+			setSearchState((prev) => (prev === 'processing' ? prev : 'loaded'));
+			checkAndShowFinalToast();
+		};
+
+		// Helper to process results from any source
+		const processSourceResults = async (sourceResults: SearchResult[], sourceName: string) => {
+			if (!isMounted.current) return;
+
+			let hashesToCheck: string[] = [];
+			let addedCount = 0;
+
+			flushSync(() => {
+				setSearchResults((prevResults) => {
+					const existingHashes = new Set(prevResults.map((r) => r.hash));
+					const newUniqueResults = sourceResults.filter(
+						(r) =>
+							r.hash &&
+							!existingHashes.has(r.hash) &&
+							hasSubstantialTitle(r.title) &&
+							(titleStartsWithYear || !/^\d{4}\)/.test(r.title))
+					);
+
+					if (newUniqueResults.length === 0) {
+						latestResultCount = prevResults.length;
+						return prevResults;
+					}
+
+					// Same ordering the availability checks re-apply as they land, so
+					// rows do not jump between two different sorts
+					const sorted = sortByMean([...prevResults, ...newUniqueResults]);
+
+					hashesToCheck = newUniqueResults
+						.filter(
+							(r) =>
+								!r.rdAvailable &&
+								!r.adAvailable &&
+								!r.tbAvailable &&
+								!r.pmAvailable &&
+								!r.ocAvailable
+						)
+						.map((r) => r.hash);
+
+					addedCount = newUniqueResults.length;
+					latestResultCount = sorted.length;
+					return sorted;
+				});
+			});
+
+			if (addedCount > 0) {
+				setSourceStates((prev) => markSourceResults(prev, sourceName, addedCount));
+			}
+
+			// Fire availability checks outside the state updater
+			if (hashesToCheck.length > 0) {
+				if (rdKey) {
+					pendingAvailabilityChecks++;
+					generateTokenAndHash().then(async ([tokenWithTimestamp, tokenHash]) => {
+						const count = await checkDatabaseAvailabilityRd(
+							tokenWithTimestamp,
+							tokenHash,
+							imdbId,
+							hashesToCheck,
+							setSearchResults,
+							sortByMean
+						);
+						rdAvailableCount += count;
+						pendingAvailabilityChecks--;
+						checkAndShowFinalToast();
+					});
+				}
+
+				if (adKey) {
+					pendingAvailabilityChecks++;
+					generateTokenAndHash().then(async ([tokenWithTimestamp, tokenHash]) => {
+						const count = await checkDatabaseAvailabilityAd(
+							tokenWithTimestamp,
+							tokenHash,
+							imdbId,
+							hashesToCheck,
+							setSearchResults,
+							sortByMean
+						);
+						adAvailableCount += count;
+						pendingAvailabilityChecks--;
+						checkAndShowFinalToast();
+					});
+				}
+
+				if (premiumizeKey) {
+					pendingAvailabilityChecks++;
+					// One request for the whole batch, and nothing is added to the
+					// account - the cheapest availability check of the four.
+					checkAvailabilityPm(
+						premiumizeKey,
+						hashesToCheck,
+						setSearchResults,
+						sortByMean
+					).then((count) => {
+						pmAvailableCount += count;
+						pendingAvailabilityChecks--;
+						checkAndShowFinalToast();
+					});
+				}
+
+				if (offcloudKey) {
+					pendingAvailabilityChecks++;
+					// One batch POST, nothing added to the account. Offcloud serves
+					// Premiumize's cache, so this and the check above almost always
+					// agree - they stay two requests because the keys, the accounts
+					// and the outages are separate.
+					checkAvailabilityOc(
+						offcloudKey,
+						hashesToCheck,
+						setSearchResults,
+						sortByMean
+					).then((count) => {
+						ocAvailableCount += count;
+						pendingAvailabilityChecks--;
+						checkAndShowFinalToast();
+					});
+				}
+
+				if (torboxKey) {
+					pendingAvailabilityChecks++;
+					checkDatabaseAvailabilityTb(
+						torboxKey,
+						hashesToCheck,
+						setSearchResults,
+						sortByMean
+					).then((count) => {
+						tbAvailableCount += count;
+						pendingAvailabilityChecks--;
+						checkAndShowFinalToast();
+					});
+				}
+
+				// Suppress the redundant "TB → RD" button on rows already transferred
+				// to RD by any user (content lives in RD under a rewritten hash).
+				if (rdKey && torboxKey) {
+					markTransferredHashes(hashesToCheck, setSearchResults);
+				}
+			}
+
+			checkAndShowFinalToast();
+		};
+
+		try {
+			// Start DMM fetch
+			const dmmPromise = axiosWithRetry.get<SearchApiResponse>(
+				`/api/torrents/tv?imdbId=${imdbId}&seasonNum=${seasonNum}&dmmProblemKey=${tokenWithTimestamp}&solution=${tokenHash}&onlyTrusted=${onlyTrustedTorrents}&maxSize=${episodeMaxSize}&page=${page}`
+			);
+
+			// Start external sources if first page
+			if (enabledSources.length > 0) {
+				const episodeCount = expectedEpisodeCount || 10;
+
+				// Process each source in parallel
+				enabledSources.forEach(async (source) => {
+					let failed = false;
+					try {
+						let episodeNum = 1;
+						let consecutiveEmpty = 0;
+
+						// Keep fetching episodes, 2 at a time
+						while (episodeNum <= episodeCount + 10) {
+							// Allow some buffer beyond expected
+							const batch = [episodeNum, episodeNum + 1];
+							const batchPromises = batch.map((ep) =>
+								fetchEpisodeFromExternalSource(imdbId, seasonNum, ep, source)
+							);
+
+							const batchResults = await Promise.all(batchPromises);
+
+							// Process each episode's results immediately
+							let allEmpty = true;
+							for (let i = 0; i < batchResults.length; i++) {
+								const episodeResults = batchResults[i];
+								if (episodeResults.length > 0) {
+									allEmpty = false;
+									// Send results immediately for progressive display
+									await processSourceResults(episodeResults, source);
+								}
+							}
+
+							if (allEmpty) {
+								consecutiveEmpty++;
+								// Stop if we get 2 consecutive empty batches (4 episodes)
+								if (consecutiveEmpty >= 2) {
+									break;
+								}
+							} else {
+								consecutiveEmpty = 0;
+							}
+
+							episodeNum += 2;
+
+							// Add a small delay to avoid hammering the API
+							await delay(100);
+						}
+					} catch (error) {
+						console.error(`Error fetching ${source}:`, error);
+						failed = true;
+					} finally {
+						// Source completed
+						markSourceComplete(source, failed ? 'error' : 'done');
+					}
+				});
+			}
+
+			// Process DMM results
+			const response = await dmmPromise;
+
+			if (response.status !== 200) {
+				// 204 carries no results, but DMM still has to count as done or the
+				// external sources never complete
+				setSearchState(searchStateFromStatusHeader(response.headers.status));
+				setHasMoreResults(false);
+				markSourceComplete(DMM_SOURCE);
+				return;
+			}
+
+			const dmmResults = response.data.results || [];
+			setHasMoreResults(dmmResults.length > 0);
+
+			// Always process DMM results through processSourceResults for consistency
+			const formattedResults = dmmResults.map((r) => ({
+				...r,
+				rdAvailable: false,
+				adAvailable: false,
+				tbAvailable: false,
+				pmAvailable: false,
+				ocAvailable: false,
+				noVideos: false,
+				files: r.files || [],
+			}));
+			await processSourceResults(formattedResults, DMM_SOURCE);
+			markSourceComplete(DMM_SOURCE);
+		} catch (error) {
+			console.error(
+				'Error fetching torrents:',
+				error instanceof Error ? error.message : 'Unknown error'
+			);
+			if ((error as AxiosError).response?.status === 403) {
+				setErrorMessage(
+					'Please check the time in your device. If it is correct, please try again.'
+				);
+			} else {
+				setErrorMessage(
+					'There was an error searching for the query. Please try again later.'
+				);
+				setHasMoreResults(false);
+			}
+			// DMM failed outright - stop showing it as still searching
+			setSourceStates((prev) => markSourceStatus(prev, DMM_SOURCE, 'error'));
+			setSearchState('loaded');
+		}
+	}
+
+	// Derive filtered results and uncached count using useMemo to prevent setState during render
+	const chipSeason = typeof seasonNum === 'string' ? Number.parseInt(seasonNum, 10) : NaN;
+	const isAnimeShow = animeLinks.length > 0;
+	/**
+	 * Reads every title once for this season. A new reader, with an empty
+	 * cache, only when the season or what it knows about the show changes;
+	 * availability updates and new pages reuse the answers already read.
+	 */
+	const episodeReader = useMemo(() => {
+		if (!showInfo || infoImdbId !== imdbid || !Number.isInteger(chipSeason)) return null;
+		return createTvEpisodeReader({
+			season: chipSeason,
+			episodeCounts: showInfo.season_episode_counts ?? {},
+			seasonCount: showInfo.season_count,
+			anime: isAnimeShow,
+		});
+	}, [showInfo, infoImdbId, imdbid, chipSeason, isAnimeShow]);
+
+	/**
+	 * Whether the user's settings let a row on the page at all. A Real-Debrid
+	 * only account hides the names RD refuses by default, and keeps one only
+	 * when it can still reach RD through a TorBox or AllDebrid transfer (which
+	 * de-infringes the name) - that's where the block matters least and the
+	 * Send-to-RD button is the whole point.
+	 */
+	const shownBySettings = useCallback(
+		(r: SearchResult) => {
+			if (!hideRdBlockedTorrents || !isRdBlockedFilename(r.title)) return true;
+			return (
+				!!rdKey &&
+				!r.rdAvailable &&
+				((!!torboxKey && r.tbAvailable) || (!!adKey && r.adAvailable) || !!r.tbTransferred)
+			);
+		},
+		[hideRdBlockedTorrents, rdKey, torboxKey, adKey]
+	);
+
+	/**
+	 * Chip counts, over every row the page lists - every source's torrents and
+	 * the Usenet rows once loaded - before the text filter, so typing never
+	 * changes them. A row the settings hide is not on the page and not counted:
+	 * a chip opens as many rows as it says.
+	 */
+	const episodeSummary = useMemo(() => {
+		if (!episodeReader) return null;
+		const titles: string[] = [];
+		for (const r of searchResults) if (shownBySettings(r)) titles.push(r.title);
+		for (const row of currentUsenetRows) titles.push(row.title);
+		return summarizeTvEpisodes(titles, episodeReader);
+	}, [episodeReader, searchResults, currentUsenetRows, shownBySettings]);
+
+	const usenetRowFilter = useMemo(() => {
+		if (episodeFilter === null || !episodeReader) return undefined;
+		return (title: string) => matchesTvEpisodeFilter(episodeReader(title), episodeFilter);
+	}, [episodeFilter, episodeReader]);
+
+	const setEpisodeFilter = useCallback(
+		(filter: TvEpisodeFilter | null) => {
+			if (typeof imdbid !== 'string' || typeof seasonNum !== 'string') return;
+			const nextQuery: Record<string, string> = { imdbid, seasonNum };
+			if (filter !== null) nextQuery.episode = String(filter);
+			if (torrentsAsked) nextQuery.tab = 'torrents';
+			// Pushed, not replaced, so back and forward step through the chips.
+			router.push(
+				{ pathname: `/show/[imdbid]/[seasonNum]${tabSuffix}`, query: nextQuery },
+				undefined,
+				{
+					shallow: true,
+					scroll: false,
+				}
+			);
+		},
+		[imdbid, seasonNum, router, tabSuffix, torrentsAsked]
+	);
+
+	const filteredResults = useMemo(() => {
+		if (searchResults.length === 0) {
+			return [];
+		}
+		let results = searchResults;
+		if (episodeFilter !== null && episodeReader) {
+			results = results.filter((r) =>
+				matchesTvEpisodeFilter(episodeReader(r.title), episodeFilter)
+			);
+		}
+		results = quickSearch(query, results);
+		if (hideRdBlockedTorrents) results = results.filter(shownBySettings);
+		return cyrillicLedLast(results);
+	}, [
+		query,
+		searchResults,
+		episodeFilter,
+		episodeReader,
+		hideRdBlockedTorrents,
+		shownBySettings,
+	]);
+
+	const totalUncachedCount = useMemo(() => {
+		return filteredResults.filter(
+			(r) =>
+				!r.rdAvailable &&
+				!r.adAvailable &&
+				!r.tbAvailable &&
+				!r.pmAvailable &&
+				!r.ocAvailable
+		).length;
+	}, [filteredResults]);
+
+	// Handle toast notifications when search completes
+	useEffect(() => {
+		if (!searchCompleteInfo) return;
+
+		const {
+			finalResults,
+			totalAvailableCount,
+			rdAvailableCount,
+			adAvailableCount,
+			tbAvailableCount,
+			pmAvailableCount,
+			ocAvailableCount,
+			allSourcesCompleted,
+			pendingAvailabilityChecks,
+			isAvailabilityOnly,
+		} = searchCompleteInfo;
+
+		// Show search results toast (only if this is not an availability-only update)
+		if (!isAvailabilityOnly) {
+			const hidden = searchResults.filter((r) => !shownBySettings(r)).length;
+			toast(foundTorrentsMessage(finalResults, hidden), searchToastOptions);
+		}
+
+		// Show availability toast and/or auto-trigger availability check per service
+		if (allSourcesCompleted && pendingAvailabilityChecks === 0) {
+			// Build service-specific availability message
+			const servicesWithCache = [];
+			if (rdKey && (rdAvailableCount ?? 0) > 0)
+				servicesWithCache.push(`RD: ${rdAvailableCount}`);
+			if (adKey && (adAvailableCount ?? 0) > 0)
+				servicesWithCache.push(`AD: ${adAvailableCount}`);
+			if (torboxKey && (tbAvailableCount ?? 0) > 0)
+				servicesWithCache.push(`TB: ${tbAvailableCount}`);
+			if (premiumizeKey && (pmAvailableCount ?? 0) > 0)
+				servicesWithCache.push(`PM: ${pmAvailableCount}`);
+			if (offcloudKey && (ocAvailableCount ?? 0) > 0)
+				servicesWithCache.push(`OC: ${ocAvailableCount}`);
+
+			// Show toast for cached torrents if any found
+			if (totalAvailableCount > 0) {
+				const message =
+					servicesWithCache.length > 0
+						? `${totalAvailableCount} cached (${servicesWithCache.join(', ')})`
+						: `${totalAvailableCount} cached torrents available`;
+				toast(message, searchToastOptions);
+			}
+		}
+
+		// Clear the info after handling
+		setSearchCompleteInfo(null);
+	}, [
+		searchCompleteInfo,
+		rdKey,
+		adKey,
+		torboxKey,
+		premiumizeKey,
+		offcloudKey,
+		isAnyChecking,
+		isLibrarySyncing,
+		checkServiceAvailabilityBulk,
+		filteredResults,
+		searchResults,
+		shownBySettings,
+		imdbid,
+		seasonNum,
+	]);
+
+	// Load cached tracker stats from database for uncached torrents
+	useEffect(() => {
+		async function loadCachedTrackerStats() {
+			// Find uncached results that don't have tracker stats yet
+			const uncachedResults = searchResults.filter(
+				(r) =>
+					!r.rdAvailable &&
+					!r.adAvailable &&
+					!r.tbAvailable &&
+					!r.pmAvailable &&
+					!r.ocAvailable &&
+					!r.trackerStats
+			);
+
+			if (uncachedResults.length === 0) {
+				return;
+			}
+
+			try {
+				// Bulk fetch existing tracker stats from database (no new scraping)
+				const hashes = uncachedResults.map((r) => r.hash);
+				const trackerStatsArray = await getMultipleTrackerStats(hashes, imdbid as string);
+
+				if (!isMounted.current) return;
+
+				// Update search results with cached tracker stats
+				if (trackerStatsArray.length > 0) {
+					setSearchResults((prev) => {
+						return prev.map((r) => {
+							const stats = trackerStatsArray.find((s) => s.hash === r.hash);
+							if (stats) {
+								return {
+									...r,
+									trackerStats: {
+										seeders: stats.seeders,
+										leechers: stats.leechers,
+										downloads: stats.downloads,
+										hasActivity:
+											stats.seeders >= 1 &&
+											stats.leechers + stats.downloads >= 1,
+									},
+								};
+							}
+							return r;
+						});
+					});
+				}
+				// Mark that we've loaded tracker stats
+				hasLoadedTrackerStats.current = true;
+			} catch (error) {
+				console.error('Error loading cached tracker stats:', error);
+			}
+		}
+
+		// Runs once per fetch - fetchData clears the flag, so "Show More Results"
+		// pages get their stats too
+		if (
+			searchState === 'loaded' &&
+			searchResults.length > 0 &&
+			!hasLoadedTrackerStats.current
+		) {
+			loadCachedTrackerStats();
+		}
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [searchState]); // Depend on searchState only
+
+	const handleShowInfo = (result: SearchResult) => {
+		showInfoForSearchResult({
+			result,
+			keys: { rdKey, adKey, torboxKey },
+			player,
+			imdbId: imdbid as string,
+			mediaType: 'tv',
+			shouldDownloadMagnets,
+			adInLibrary: `ad:${result.hash}` in hashAndProgress,
+		});
+	};
+
+	// The cast helpers reject when no episode was cast, with the reason (an RD
+	// name refusal or account pause, a provider's own error), so the toast says
+	// it and Stremio opens only on a cast that saved something.
+	async function castInStremio(loading: string, cast: Promise<void>) {
+		try {
+			await toast.promise(
+				cast,
+				{
+					loading,
+					success: 'Casting succeeded.',
+					error: (e) => (e instanceof Error && e.message) || 'Casting failed.',
+				},
+				castToastOptions
+			);
+		} catch {
+			return;
+		}
+		window.open(
+			getStremioDetailUrl(imdbid as string, { season: String(seasonNum), episode: 1 })
+		);
+	}
+
+	const handleCast = (hash: string, fileIds: string[]) =>
+		castInStremio(
+			`Casting ${fileIds.length} episodes...`,
+			handleCastTvShow(imdbid as string, rdKey!, hash, fileIds)
+		);
+	const handleCastTorBox = (hash: string, fileIds: string[]) =>
+		castInStremio(
+			`Casting ${fileIds.length} episodes (TorBox)...`,
+			handleCastTvShowTorBox(imdbid as string, torboxKey!, hash, fileIds)
+		);
+	const handleCastAllDebrid = (hash: string, files: { filename: string }[]) =>
+		castInStremio(
+			`Casting ${files.length} episodes (AllDebrid)...`,
+			handleCastTvShowAllDebrid(imdbid as string, adKey!, hash, files)
+		);
+	// No file list goes over for Debrid-Link, Offcloud or Premiumize: the server
+	// resolves the release and casts every episode in it. Debrid-Link's
+	// `POST /seedbox/add` and Offcloud's `cache/info` answer with the whole
+	// listing; Premiumize's cache probe reports no files, so this browser could
+	// not have built one anyway.
+	const handleCastDebridLink = (hash: string) =>
+		castInStremio(
+			'Casting episodes (Debrid-Link)...',
+			handleCastTvShowDebridLink(imdbid as string, debridLinkKey!, hash)
+		);
+	const handleCastOffcloud = (hash: string) =>
+		castInStremio(
+			'Casting episodes (Offcloud)...',
+			handleCastTvShowOffcloud(imdbid as string, offcloudKey!, hash)
+		);
+	const handleCastPremiumize = (hash: string) =>
+		castInStremio(
+			'Casting episodes (Premiumize)...',
+			handleCastTvShowPremiumize(imdbid as string, premiumizeKey!, hash)
+		);
+
+	// Complete season torrents the service holds: its own availability, and a
+	// video count within two of the season's episode count. The instant actions
+	// pick for the viewer, so they pass over a release named in Russian, which
+	// the list still shows (see isCyrillicLed).
+	const getCompleteSeasonTorrents = (entry: (typeof INSTANT_SERVICES)[number]) => {
+		const minEpisodes = Math.max(1, expectedEpisodeCount - 2);
+		const maxEpisodes = expectedEpisodeCount + 2;
+		return filteredResults.filter((result) => {
+			if (!result[entry.available] || isCyrillicLed(result.title)) return false;
+			return result.videoCount >= minEpisodes && result.videoCount <= maxEpisodes;
+		});
+	};
+
+	// Single-episode torrents (exactly one video) the service holds.
+	const getIndividualEpisodeTorrents = (entry: (typeof INSTANT_SERVICES)[number]) =>
+		filteredResults.filter(
+			(result) =>
+				result[entry.available] && result.videoCount === 1 && !isCyrillicLed(result.title)
+		);
+
+	async function handleInstantWholeSeason(entry: (typeof INSTANT_SERVICES)[number]) {
+		const { service, label } = entry;
+		const candidates = getCompleteSeasonTorrents(entry);
+		if (candidates.length === 0) {
+			toast.error('No complete season torrents found.');
+			return;
+		}
+
+		let attempted = 0;
+		let sawPause = false;
+		for (const candidate of candidates) {
+			// Skip if already in library
+			if (`${service}:${candidate.hash}` in hashAndProgress) {
+				toast.success(`Season already in your ${label} library.`);
+				return;
+			}
+
+			// Walking the candidates is a burst of adds like any other.
+			if (attempted > 0) await delay(RD_ADD_MIN_SPACING_MS);
+			attempted++;
+			// Cached only: a release the service does not serve at once is
+			// removed again (and, on RD, cleaned out of the availability table).
+			// An RD add refused with a 451 its name does not explain has already
+			// had its second try, and was not shown to be uncached.
+			const wasInstant = await addCached(service, candidate.hash, {
+				onPaused: () => {
+					sawPause = true;
+				},
+			});
+			if (wasInstant) return;
+		}
+
+		toast.error(
+			sawPause
+				? `${label} refused these releases. If other releases get refused too, wait a few minutes and try again.`
+				: 'No truly instant season torrents found. False positives were cleaned up.'
+		);
+	}
+
+	async function handleInstantEveryEpisode(entry: (typeof INSTANT_SERVICES)[number]) {
+		const { service, label } = entry;
+		const individualEpisodes = getIndividualEpisodeTorrents(entry);
+		if (individualEpisodes.length === 0) {
+			toast.error('No individual episode torrents found.');
+			return;
+		}
+
+		// Extract episode numbers from torrents
+		const episodesWithNumbers = individualEpisodes.map((ep) => {
+			// Try to extract episode number from title or filename
+			let episodeNum = 0;
+			const title = ep.title.toLowerCase();
+
+			// Common patterns: S##E##, ##x##, E##, Episode ##
+			const patterns = [
+				/s\d+e(\d+)/i, // S01E05
+				/\d+x(\d+)/i, // 1x05
+				/episode\s*(\d+)/i, // Episode 5
+				/ep\s*(\d+)/i, // Ep 5
+				/e(\d+)/i, // E05
+				/\s(\d{1,2})\s/, // isolated numbers
+			];
+
+			for (const pattern of patterns) {
+				const match = title.match(pattern);
+				if (match && match[1]) {
+					episodeNum = parseInt(match[1]);
+					break;
+				}
+			}
+
+			// If still no match, check first file in torrent
+			if (episodeNum === 0 && ep.files && ep.files.length > 0) {
+				const filename = ep.files[0].filename.toLowerCase();
+				for (const pattern of patterns) {
+					const match = filename.match(pattern);
+					if (match && match[1]) {
+						episodeNum = parseInt(match[1]);
+						break;
+					}
+				}
+			}
+
+			return { ...ep, episodeNum };
+		});
+
+		// Sort by episode number (0 will go to the end)
+		episodesWithNumbers.sort((a, b) => {
+			if (a.episodeNum === 0) return 1;
+			if (b.episodeNum === 0) return -1;
+			return a.episodeNum - b.episodeNum;
+		});
+
+		// Create a map for quick episode lookup
+		const episodeMap = new Map<number, (typeof episodesWithNumbers)[0]>();
+		episodesWithNumbers.forEach((ep) => {
+			if (ep.episodeNum > 0 && !episodeMap.has(ep.episodeNum)) {
+				episodeMap.set(ep.episodeNum, ep);
+			}
+		});
+
+		// Determine the range of episodes to add
+		const maxEpisode = Math.max(expectedEpisodeCount, ...Array.from(episodeMap.keys()));
+		const summaryGeneration = episodeSummaryGeneration.current;
+		const summaryRun = (episodeSummaryRuns.current.get(service) ?? 0) + 1;
+		episodeSummaryRuns.current.set(service, summaryRun);
+
+		const toastId = toast.loading(`Checking episodes 1-${maxEpisode}...`);
+
+		let addedCount = 0;
+		let skippedCount = 0;
+		let notFoundCount = 0;
+		let uncachedCount = 0;
+		let refusedCount = 0;
+		const notFoundEpisodes: number[] = [];
+		const pauseStreak = new RdPauseStreak();
+
+		try {
+			// Process episodes sequentially from 1 to max
+			for (let epNum = 1; epNum <= maxEpisode; epNum++) {
+				const episode = episodeMap.get(epNum);
+
+				if (!episode) {
+					notFoundCount++;
+					notFoundEpisodes.push(epNum);
+					toast.error(`Episode ${epNum}: Not found`, { duration: 2000 });
+					continue;
+				}
+
+				// Check if already in library
+				if (`${service}:${episode.hash}` in hashAndProgress) {
+					skippedCount++;
+					toast(`Episode ${epNum}: Already in library`, { duration: 2000 });
+					continue;
+				}
+
+				// Update progress toast
+				toast.loading(
+					`Adding Episode ${epNum} (${addedCount} added, ${skippedCount} skipped, ${notFoundCount + uncachedCount} missing)...`,
+					{ id: toastId }
+				);
+
+				// Spaced: RD's `addMagnet` sustains about 30 adds a minute per
+				// account, and this loop used to run flat out, so a season of
+				// any length spent the user's whole add budget partway through
+				// and then failed every episode after that.
+				if (addedCount + uncachedCount + refusedCount > 0) {
+					await delay(RD_ADD_MIN_SPACING_MS);
+				}
+				// Cached only, like the button says: a miss is removed again
+				// rather than left downloading. An RD add refused with a 451 its
+				// name does not explain is the account's pause far more often
+				// than the release, so it is tried again once the pause is over
+				// (the add itself waits) instead of being called "not cached".
+				const outcome = await addThroughRdPause((onPaused) =>
+					addCached(service, episode.hash, {
+						silent: true,
+						onPaused: () => {
+							toast.loading(
+								`Episode ${epNum}: ${label} is pausing adds on your account. Trying again when it lifts...`,
+								{ id: toastId }
+							);
+							onPaused();
+						},
+					})
+				);
+				pauseStreak.note(outcome);
+				if (outcome === 'added') {
+					addedCount++;
+					toast.success(`Episode ${epNum}: Added`, { duration: 2000 });
+				} else if (outcome === 'paused') {
+					refusedCount++;
+					toast.error(`Episode ${epNum}: Refused by ${label} for now`, {
+						duration: 2000,
+					});
+					// RD has refused everything for longer than it was ever
+					// seen to pause; the rest is better left for later.
+					if (pauseStreak.exhausted) break;
+				} else {
+					uncachedCount++;
+					toast.error(`Episode ${epNum}: Not cached`, { duration: 2000 });
+				}
+			}
+
+			// Final summary
+			toast.dismiss(toastId);
+			// Finish provider work, but do not resurrect a summary on another page or
+			// replace a newer run's summary for the same service.
+			if (
+				summaryGeneration !== episodeSummaryGeneration.current ||
+				summaryRun !== episodeSummaryRuns.current.get(service)
+			)
+				return;
+
+			const summaryParts = [];
+			if (addedCount > 0) summaryParts.push(`${addedCount} added`);
+			if (skippedCount > 0) summaryParts.push(`${skippedCount} already in library`);
+			if (uncachedCount > 0) summaryParts.push(`${uncachedCount} not cached`);
+			if (refusedCount > 0) {
+				summaryParts.push(
+					`${refusedCount} refused by ${label} for now (try again in a few minutes)`
+				);
+			}
+			if (notFoundCount > 0) {
+				summaryParts.push(`${notFoundCount} not found`);
+				if (notFoundEpisodes.length <= 5) {
+					summaryParts.push(`(Episodes ${notFoundEpisodes.join(', ')})`);
+				}
+			}
+
+			const summaryMessage = `Episodes 1-${maxEpisode}: ${summaryParts.join(', ')}`;
+
+			const previousSummary = episodeSummaryIds.current.get(service);
+			if (previousSummary) toast.dismiss(previousSummary);
+			const summaryId = showEpisodeSummary(
+				summaryMessage,
+				(notFoundCount === 0 && uncachedCount === 0 && refusedCount === 0) || addedCount > 0
+			);
+			episodeSummaryIds.current.set(service, summaryId);
+		} catch (error) {
+			toast.error('Failed to add some episodes.', { id: toastId });
+			console.error('Error adding episodes:', error);
+		}
+	}
+
+	if (isLoading) {
+		return <div className="mx-2 my-1 min-h-screen bg-gray-900 text-white">Loading...</div>;
+	}
+
+	if (!showInfo) {
+		return (
+			<div className="mx-2 my-1 min-h-screen bg-gray-900 text-white">
+				No show information available
+			</div>
+		);
+	}
+
+	const imdbId = (Array.isArray(imdbid) ? imdbid[0] : imdbid) ?? '';
+	const seasonId = (Array.isArray(seasonNum) ? seasonNum[0] : seasonNum) ?? '1';
+	const selectedSeason = Number.parseInt(seasonId, 10);
+
+	/**
+	 * What the All Seasons run did to each season, drawn on the season nav.
+	 *
+	 * Icons rather than colours: the nav builds its Tailwind classes by string
+	 * assembly (`border-${color}-500`), and the build cannot see an assembled
+	 * class name, so a state expressed as a colour would render unstyled.
+	 */
+	const seasonRunIcon = (season: number) => {
+		const state: SeasonRunState | undefined = seasonState[season];
+		if (!state || state === 'pending') return null;
+		if (state === 'running')
+			return <Loader2 className="ml-1 h-3 w-3 animate-spin text-cyan-300" />;
+		if (state === 'added') return <CheckCircle className="ml-1 h-3 w-3 text-green-400" />;
+		if (state === 'held') return <CheckCircle className="ml-1 h-3 w-3 text-gray-400" />;
+		if (state === 'gap') return <CircleSlash className="ml-1 h-3 w-3 text-gray-500" />;
+		return <X className="ml-1 h-3 w-3 text-red-400" />;
+	};
+
+	const seasonRunTitle = (season: number) => {
+		const state: SeasonRunState | undefined = seasonState[season];
+		if (state === 'running') return 'Adding this season';
+		if (state === 'added') return 'Added by the last All Seasons run';
+		if (state === 'held') return 'Already in your library';
+		if (state === 'gap') return 'Nothing cached for this season';
+		if (state === 'failed') return 'Could not be added';
+		return undefined;
+	};
+
+	// A lone "S1" only repeats the title, so a one-season show without specials has no nav.
+	const seasonNavigation = (showInfo.season_count > 1 || showInfo.has_specials) && (
+		<div className="flex items-center overflow-x-auto" data-testid="media-header-season-nav">
+			{showInfo.has_specials && (
+				<Link
+					href={`/show/${imdbId}/0${seasonLinkSuffix}`}
+					className={`inline-flex items-center border-2 p-1 text-xs border-${selectedSeason === 0 ? 'red' : 'yellow'}-500 bg-${selectedSeason === 0 ? 'red' : 'yellow'}-900/30 text-${selectedSeason === 0 ? 'red' : 'yellow'}-100 hover:bg-${selectedSeason === 0 ? 'red' : 'yellow'}-800/50 mr-2 mb-1 rounded transition-colors`}
+				>
+					<span className="whitespace-nowrap">Specials</span>
+				</Link>
+			)}
+			{Array.from({ length: showInfo.season_count }, (_, i) => showInfo.season_count - i).map(
+				(season, idx) => {
+					const color = selectedSeason === season ? 'red' : 'yellow';
+					return (
+						<Link
+							key={idx}
+							href={`/show/${imdbId}/${season}${seasonLinkSuffix}`}
+							title={seasonRunTitle(season)}
+							className={`inline-flex items-center border-2 p-1 text-xs border-${color}-500 bg-${color}-900/30 text-${color}-100 hover:bg-${color}-800/50 mr-2 mb-1 rounded transition-colors`}
+						>
+							<span className="whitespace-nowrap">
+								{seasonLabel(showInfo.season_names?.[season - 1], season)}
+							</span>
+							{seasonRunIcon(season)}
+						</Link>
+					);
+				}
+			)}
+		</div>
+	);
+
+	const formatAirDate = (dateStr: string) => {
+		const date = new Date(dateStr);
+		const datePart = new Intl.DateTimeFormat(undefined, {
+			weekday: 'short',
+			month: 'short',
+			day: 'numeric',
+		}).format(date);
+		const timePart = date.toLocaleTimeString([], {
+			hour: '2-digit',
+			minute: '2-digit',
+		});
+		return `${datePart} ${timePart}`;
+	};
+
+	const episodeCode = (ep: EpisodeAirInfo) =>
+		`S${String(ep.season_number).padStart(2, '0')}E${String(ep.episode_number).padStart(2, '0')}`;
+
+	// Ended, Canceled and an Airing show with nothing scheduled ride after the
+	// rating as a few words; a scheduled episode keeps its own chip.
+	const statusSuffix = (() => {
+		const status = showInfo.status;
+		const last = showInfo.last_episode_to_air;
+		if (status === 'Ended' || status === 'Canceled') {
+			return <span className="text-gray-300"> &middot; {status}</span>;
+		}
+		if (status === 'Returning Series' && !showInfo.next_episode_to_air) {
+			return (
+				<span
+					className="text-green-200"
+					title={last ? `Last aired ${formatAirDate(last.first_aired)}` : undefined}
+				>
+					{' '}
+					&middot; Airing{last ? ` (last ${episodeCode(last)})` : ''}
+				</span>
+			);
+		}
+		return null;
+	})();
+
+	const airingStatus = (() => {
+		const status = showInfo.status;
+		const next = showInfo.next_episode_to_air;
+		const episodeCount = showInfo.season_episode_counts[selectedSeason] ?? 0;
+
+		const badges: React.ReactNode[] = [];
+
+		if (status === 'In Production' || status === 'Planned' || status === 'Pilot') {
+			badges.push(
+				<span
+					key="status"
+					className="inline-flex items-center rounded border border-yellow-500 bg-yellow-900/30 px-2 py-0.5 text-xs text-yellow-100"
+				>
+					{status === 'Planned' ? 'Upcoming' : 'In Production'}
+				</span>
+			);
+		}
+
+		// Show next episode info
+		if (next) {
+			badges.push(
+				<span
+					key="next"
+					className="inline-flex items-center rounded border border-cyan-500 bg-cyan-900/30 px-2 py-0.5 text-xs text-cyan-100"
+				>
+					<Calendar className="mr-1 h-3 w-3" />
+					Next: {episodeCode(next)} &middot; {formatAirDate(next.first_aired)}
+				</span>
+			);
+		}
+
+		// Show warning for seasons with no episodes
+		if (episodeCount === 0 && selectedSeason > 0) {
+			badges.push(
+				<span
+					key="no-eps"
+					className="inline-flex items-center rounded border border-yellow-500 bg-yellow-900/30 px-2 py-0.5 text-xs text-yellow-100"
+				>
+					No episodes yet for this season
+				</span>
+			);
+		}
+
+		if (badges.length === 0) return null;
+
+		// The AniDB links share the row rather than taking one of their own.
+		return (
+			<div className="flex flex-wrap items-center gap-2">
+				{badges}
+				<AnimeEntryLinks entries={animeLinks} />
+			</div>
+		);
+	})();
+
+	const episodeNav = (() => {
+		if (!episodeSummary) return null;
+		if (searchResults.length === 0 && currentUsenetRows.length === 0) return null;
+		const seasonEpisodeCount = showInfo.season_episode_counts?.[selectedSeason] ?? 0;
+		// Every episode the season has, so one with no release shows as a 0.
+		// A season with no count yet shows the episodes its releases name.
+		const numbered = new Set<number>();
+		for (let episode = 1; episode <= seasonEpisodeCount; episode++) numbered.add(episode);
+		if (seasonEpisodeCount === 0) {
+			for (const episode of episodeSummary.episodes.keys()) numbered.add(episode);
+		}
+		if (typeof episodeFilter === 'number') numbered.add(episodeFilter);
+
+		const next = showInfo.next_episode_to_air;
+		const firstUnaired = firstUnairedEpisode(
+			selectedSeason,
+			next,
+			showInfo.last_episode_to_air
+		);
+		const items: EpisodeChipItem<TvEpisodeFilter>[] = [
+			{ filter: null, label: 'All' },
+			{
+				filter: 'packs',
+				label: 'Packs',
+				count: episodeSummary.packs,
+				empty: episodeSummary.packs === 0,
+				title: 'Whole-season packs, and multi-season packs that include this season',
+			},
+		];
+		for (const episode of [...numbered].sort((a, b) => a - b)) {
+			const count = episodeSummary.episodes.get(episode) ?? 0;
+			const unaired = firstUnaired !== null && episode >= firstUnaired;
+			const airsNext =
+				next?.season_number === selectedSeason && next.episode_number === episode;
+			items.push({
+				filter: episode,
+				label: String(episode).padStart(2, '0'),
+				count,
+				empty: count === 0,
+				unaired,
+				title: airsNext
+					? `Airs ${formatAirDate(next.first_aired)}`
+					: unaired
+						? 'Not aired yet'
+						: count === 0
+							? 'No releases for this episode yet'
+							: undefined,
+			});
+		}
+		if (episodeSummary.other > 0 || episodeFilter === 'other') {
+			items.push({
+				filter: 'other',
+				label: 'Other',
+				count: episodeSummary.other,
+				empty: episodeSummary.other === 0,
+				title: 'Releases whose names place them in no episode of this season',
+			});
+		}
+		return (
+			<EpisodeChips<TvEpisodeFilter>
+				testId="season-episode-nav"
+				items={items}
+				selected={episodeFilter}
+				onSelect={setEpisodeFilter}
+			/>
+		);
+	})();
+
+	const episodeEmptyMessage =
+		episodeFilter === null
+			? null
+			: episodeFilter === 'packs'
+				? query
+					? 'No packs match the filter.'
+					: 'No packs for this season.'
+				: episodeFilter === 'other'
+					? query
+						? 'Nothing else matches the filter.'
+						: 'Every release names an episode of this season or a pack.'
+					: query
+						? `No releases for episode ${episodeFilter} match the filter.`
+						: `No releases for episode ${episodeFilter}.`;
+
+	// Nothing scraped yet: the filter, chips and checks have nothing to work on.
+	const noTorrents = searchState === 'loaded' && searchResults.length === 0 && !errorMessage;
+	const hasInstantAction = instantServices.some(
+		(entry) =>
+			getCompleteSeasonTorrents(entry).length > 0 ||
+			getIndividualEpisodeTorrents(entry).length > 0
+	);
+	const finished = showInfo.status === 'Ended' || showInfo.status === 'Canceled';
+
+	const headerActionButtons = (
+		<div data-testid="media-header-actions">
+			{(rdKey || adKey || torboxKey || premiumizeKey || offcloudKey || debridLinkKey) && (
+				<>
+					{!noTorrents && (
+						<CheckAvailabilityButtons
+							rdKey={rdKey}
+							adKey={adKey}
+							debridLinkKey={debridLinkKey}
+							isAnyChecking={isAnyChecking}
+							onCheck={(services) =>
+								checkServiceAvailabilityBulk(filteredResults, services)
+							}
+						/>
+					)}
+					{multiInstant && (showInfo.season_count > 1 || hasInstantAction) && (
+						<span
+							role="group"
+							aria-label="Service the Instant buttons add to"
+							className="mt-0 mr-2 mb-1 inline-flex align-middle text-xs max-sm:m-0"
+						>
+							{instantServices.map((entry) => {
+								const picked = entry === shownInstantServices[0];
+								return (
+									<button
+										key={`pick-${entry.service}`}
+										className={`haptic-sm border-2 px-1.5 py-0.5 font-bold transition-colors first:rounded-l last:rounded-r ${picked ? entry.picked : entry.unpicked}`}
+										aria-pressed={picked}
+										title={`Instant buttons add to ${entry.label}`}
+										onClick={() => setPickedInstant(entry.service)}
+									>
+										{entry.short}
+									</button>
+								);
+							})}
+						</span>
+					)}
+					{shownInstantServices.map(
+						(entry) =>
+							getCompleteSeasonTorrents(entry).length > 0 && (
+								<button
+									key={`whole-${entry.service}`}
+									className={`haptic-sm mt-0 mr-2 mb-1 rounded border-2 p-1 text-xs transition-colors ${entry.button}`}
+									onClick={() => handleInstantWholeSeason(entry)}
+									aria-label={
+										multiInstant
+											? `Instant ${entry.short} (Whole Season)`
+											: undefined
+									}
+								>
+									<b className="flex items-center justify-center">
+										<Zap className={`mr-1 h-3 w-3 ${entry.icon}`} />
+										Instant {multiInstant ? '' : `${entry.short} `}(Whole
+										Season)
+									</b>
+								</button>
+							)
+					)}
+					{shownInstantServices.map(
+						(entry) =>
+							getIndividualEpisodeTorrents(entry).length > 0 && (
+								<button
+									key={`every-${entry.service}`}
+									className={`haptic-sm mt-0 mr-2 mb-1 rounded border-2 p-1 text-xs transition-colors ${entry.button}`}
+									onClick={() => handleInstantEveryEpisode(entry)}
+									aria-label={
+										multiInstant
+											? `Instant ${entry.short} (Every Episode)`
+											: undefined
+									}
+								>
+									<b className="flex items-center justify-center">
+										<Zap className={`mr-1 h-3 w-3 ${entry.icon}`} />
+										Instant {multiInstant ? '' : `${entry.short} `}(Every
+										Episode)
+									</b>
+								</button>
+							)
+					)}
+					{showInfo.season_count > 1 && (isAddingSeasons || isDiscoveringSeasons) && (
+						<button
+							className="haptic-sm mt-0 mr-2 mb-1 rounded border-2 border-red-500 bg-red-900/30 p-1 text-xs text-red-100 transition-colors hover:bg-red-800/50"
+							onClick={stopSeasons}
+						>
+							<b className="flex items-center justify-center">
+								<Square className="mr-1 h-3 w-3 text-red-400" />
+								Stop
+							</b>
+						</button>
+					)}
+					{/*
+					 * Deliberately not gated on this season having a cached pack the
+					 * way Whole Season is: that gate reads the rows on screen, and a
+					 * show-wide action must not disappear because season one's first
+					 * page happens to hold nothing.
+					 */}
+					{showInfo.season_count > 1 &&
+						!isAddingSeasons &&
+						shownInstantServices.map((entry) => (
+							<button
+								key={`all-${entry.service}`}
+								className={`haptic-sm mt-0 mr-2 mb-1 rounded border-2 p-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${entry.button}`}
+								onClick={() => handleAllSeasons(entry.service)}
+								disabled={isDiscoveringSeasons}
+								aria-label={
+									multiInstant
+										? `Instant ${entry.short} (All Seasons)`
+										: undefined
+								}
+							>
+								<b className="flex items-center justify-center">
+									{isDiscoveringSeasons ? (
+										<Loader2
+											className={`mr-1 h-3 w-3 animate-spin ${entry.icon}`}
+										/>
+									) : (
+										<Layers className={`mr-1 h-3 w-3 ${entry.icon}`} />
+									)}
+									Instant {multiInstant ? '' : `${entry.short} `}(All Seasons)
+								</b>
+							</button>
+						))}
+					<button
+						className="mt-0 mr-2 mb-1 rounded border-2 border-purple-500 bg-purple-900/30 p-1 text-xs text-purple-100 transition-colors hover:bg-purple-800/50"
+						onClick={() =>
+							window.open(
+								getStremioDetailUrl(imdbId, { season: seasonId, episode: 1 })
+							)
+						}
+					>
+						<b className="flex items-center justify-center">
+							<Sparkles className="mr-1 h-3 w-3 text-purple-500" />
+							Stremio
+						</b>
+					</button>
+				</>
+			)}
+			{/* zurg's acquisition takes no specials, so season 0 offers only the whole show;
+			    nor does a finished one-season show need its season wanted apart. */}
+			{selectedSeason >= 1 && !(finished && showInfo.season_count === 1) && (
+				<WantedButton
+					imdbId={imdbId}
+					kind="show"
+					title={showInfo.title}
+					season={selectedSeason}
+				/>
+			)}
+			<WantedButton imdbId={imdbId} kind="show" title={showInfo.title} />
+			{onlyShowCached && totalUncachedCount > 0 && (
+				<button
+					className="haptic-sm mt-0 mr-2 mb-1 rounded border-2 border-blue-500 bg-blue-900/30 p-1 text-xs text-blue-100 transition-colors hover:bg-blue-800/50"
+					onClick={() => {
+						setOnlyShowCached(false);
+					}}
+				>
+					<CloudOff className="mr-1 h-3 w-3 text-blue-500" />
+					Show {totalUncachedCount} uncached
+				</button>
+			)}
+		</div>
+	);
+
+	return (
+		<div className="min-h-screen max-w-full bg-gray-900 text-gray-100">
+			<Head>
+				<title>
+					Debrid Media Manager - TV Show - {showInfo.title} - Season {seasonNum}
+				</title>
+			</Head>
+			<Toaster position={toasterPosition()} />
+
+			<MediaHeader
+				mediaType="tv"
+				imdbId={imdbId}
+				title={showInfo.title}
+				seasonNum={seasonId}
+				description={showInfo.description}
+				poster={showInfo.poster}
+				backdrop={showInfo.backdrop}
+				imdbScore={showInfo.imdb_score}
+				descLimit={descLimit}
+				onDescToggle={() => setDescLimit(0)}
+				actionButtons={headerActionButtons}
+				scoreSuffix={statusSuffix}
+				additionalInfo={
+					airingStatus || seasonNavigation || animeLinks.length > 0 ? (
+						<>
+							{airingStatus}
+							{seasonNavigation}
+							{!airingStatus && <AnimeEntryLinks entries={animeLinks} />}
+						</>
+					) : null
+				}
+				trailer={showInfo.trailer}
+			/>
+
+			<ResultsTabs
+				basePath={`/show/${imdbId}/${seasonId}`}
+				active={usenetTab ? 'usenet' : 'torrents'}
+				query={episodeFilter !== null ? { episode: String(episodeFilter) } : undefined}
+				extra={
+					!usenetTab && searchState === 'loading' ? (
+						<SearchSourceProgress sources={sourceStates} />
+					) : null
+				}
+			/>
+			{usenetTab && (
+				<>
+					{episodeNav && <div className="p-2">{episodeNav}</div>}
+					<UsenetResults
+						imdbId={imdbId}
+						seasonNum={selectedSeason}
+						title={showInfo.title}
+						rdKey={rdKey}
+						onResults={handleUsenetResults}
+						rowFilter={usenetRowFilter}
+						episodeReader={episodeReader}
+					/>
+					<EasynewsResults
+						title={showInfo.title}
+						seasonNum={selectedSeason}
+						rowFilter={usenetRowFilter}
+					/>
+				</>
+			)}
+			{!usenetTab && (
+				<>
+					{searchState === 'processing' && (
+						<div className="relative mt-4 rounded border border-blue-400 bg-blue-700 px-4 py-3 text-blue-100">
+							<strong className="font-bold">Notice:</strong>
+							<span className="block sm:inline">
+								{' '}
+								Looking for torrents in the dark web. Please wait for 1-2 minutes.
+							</span>
+						</div>
+					)}
+					{errorMessage && (
+						<div className="relative mt-4 rounded border border-red-400 bg-red-900 px-4 py-3">
+							<strong className="font-bold">Error:</strong>
+							<span className="block sm:inline"> {errorMessage}</span>
+						</div>
+					)}
+
+					{noTorrents && <NoTorrentsYet basePath={`/show/${imdbId}/${seasonId}`} />}
+					{!noTorrents && (
+						<>
+							<div className="mb-1 flex items-center border-b-2 border-gray-600 py-2">
+								<input
+									className="mr-3 w-full appearance-none border-none bg-transparent px-2 py-1 text-sm leading-tight text-gray-100 focus:outline-hidden"
+									type="text"
+									id="query"
+									placeholder="filter results, supports regex"
+									value={query}
+									onChange={(e) => {
+										setQuery(e.target.value.toLocaleLowerCase());
+									}}
+								/>
+								<span
+									className="me-2 inline-flex cursor-pointer items-center rounded bg-yellow-100 px-2.5 py-0.5 text-xs font-medium text-yellow-800 dark:bg-yellow-900 dark:text-yellow-300"
+									onClick={() => setQuery('')}
+									title="Reset search"
+								>
+									<RotateCcw className="h-3 w-3" />
+									<span className="ml-1 hidden sm:inline">Reset</span>
+								</span>
+								<span className="text-xs text-gray-400">
+									{
+										filteredResults.filter(
+											(r) =>
+												r.rdAvailable ||
+												r.adAvailable ||
+												r.tbAvailable ||
+												r.pmAvailable ||
+												r.ocAvailable
+										).length
+									}
+									/{filteredResults.length}
+								</span>
+								{query &&
+									filteredResults.length > 0 &&
+									canReport &&
+									showMassReportButtons && (
+										<div className="ml-2 flex gap-2">
+											<span
+												className="cursor-pointer rounded border border-red-500 bg-red-900/30 px-2 py-0.5 text-xs whitespace-nowrap text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() =>
+													handleMassReport('porn', filteredResults)
+												}
+												title="Report all filtered torrents as pornographic content"
+											>
+												Report as Porn ({filteredResults.length})
+											</span>
+											<span
+												className="cursor-pointer rounded border border-red-500 bg-red-900/30 px-2 py-0.5 text-xs whitespace-nowrap text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() =>
+													handleMassReport('wrong_imdb', filteredResults)
+												}
+												title="Report all filtered torrents as wrong IMDB ID"
+											>
+												Report Wrong IMDB ({filteredResults.length})
+											</span>
+											<span
+												className="cursor-pointer rounded border border-red-500 bg-red-900/30 px-2 py-0.5 text-xs whitespace-nowrap text-red-100 transition-colors hover:bg-red-800/50"
+												onClick={() =>
+													handleMassReport(
+														'wrong_season',
+														filteredResults
+													)
+												}
+												title="Report all filtered torrents as wrong season"
+											>
+												Report Wrong Season ({filteredResults.length})
+											</span>
+										</div>
+									)}
+							</div>
+
+							<div className="mb-2 flex flex-col gap-2 p-2">
+								{episodeNav}
+								<div className="flex items-center gap-2 overflow-x-auto">
+									<SearchTokens
+										title={showInfo.title}
+										year={seasonNum as string}
+										isShow={true}
+										onTokenClick={(token) =>
+											setQuery((prev) => (prev ? `${prev} ${token}` : token))
+										}
+									/>
+									{getColorScale(expectedEpisodeCount).map((scale, idx) => (
+										<span
+											key={idx}
+											className={`${episodeChipClasses[scale.color]} cursor-pointer rounded px-2 py-1 text-xs whitespace-nowrap text-white`}
+											onClick={() => {
+												const queryText = getQueryForEpisodeCount(
+													scale.threshold,
+													expectedEpisodeCount
+												);
+												setQuery((prev) => {
+													const cleanedPrev = prev
+														.replace(/\bvideos:[^\s]+/g, '')
+														.trim();
+													return cleanedPrev
+														? `${cleanedPrev} ${queryText}`
+														: queryText;
+												});
+											}}
+										>
+											{scale.label}
+										</span>
+									))}
+									<AvailabilityTokens
+										query={query}
+										onQueryChange={setQuery}
+										rdKey={rdKey}
+										adKey={adKey}
+										torboxKey={torboxKey}
+										premiumizeKey={premiumizeKey}
+										offcloudKey={offcloudKey}
+									/>
+								</div>
+							</div>
+						</>
+					)}
+
+					{episodeEmptyMessage &&
+						searchState === 'loaded' &&
+						searchResults.length > 0 &&
+						filteredResults.length === 0 && (
+							<div
+								className="mx-2 my-4 rounded border border-gray-600 bg-gray-800/50 px-4 py-3 text-sm text-gray-300"
+								data-testid="season-episode-empty"
+							>
+								{episodeEmptyMessage}
+							</div>
+						)}
+
+					<TvSearchResults
+						filteredResults={filteredResults}
+						expectedEpisodeCount={expectedEpisodeCount}
+						onlyShowCached={onlyShowCached}
+						episodeMaxSize={episodeMaxSize}
+						rdKey={rdKey}
+						adKey={adKey}
+						torboxKey={torboxKey}
+						premiumizeKey={premiumizeKey}
+						offcloudKey={offcloudKey}
+						debridLinkKey={debridLinkKey}
+						player={player}
+						hashAndProgress={hashAndProgress}
+						handleShowInfo={handleShowInfo}
+						handleCast={handleCast}
+						handleCastTorBox={torboxKey ? handleCastTorBox : undefined}
+						handleCastAllDebrid={adKey ? handleCastAllDebrid : undefined}
+						handleCastPremiumize={premiumizeKey ? handleCastPremiumize : undefined}
+						handleCastOffcloud={offcloudKey ? handleCastOffcloud : undefined}
+						handleCastDebridLink={debridLinkKey ? handleCastDebridLink : undefined}
+						handleCopyMagnet={(hash) =>
+							handleCopyOrDownloadMagnet(hash, shouldDownloadMagnets)
+						}
+						checkServiceAvailability={checkServiceAvailability}
+						addRd={addRd}
+						addAd={addAd}
+						addTb={addTb}
+						addPm={addPm}
+						addOc={addOc}
+						addDl={addDl}
+						sendTbToRd={sendTbToRd}
+						requestContent={canRequest ? handleRequestContent : undefined}
+						deleteRd={deleteRd}
+						deleteAd={deleteAd}
+						deleteTb={deleteTb}
+						deletePm={deletePm}
+						deleteOc={deleteOc}
+						deleteDl={deleteDl}
+						imdbId={imdbid as string}
+						isHashServiceChecking={isHashServiceChecking}
+					/>
+
+					{searchResults.length > 0 && searchState === 'loaded' && hasMoreResults && (
+						<button
+							className="haptic my-4 w-full rounded border-2 border-gray-500 bg-gray-800/30 px-4 py-2 font-medium text-gray-100 shadow-md transition-colors duration-200 hover:bg-gray-700/50 hover:shadow-lg"
+							onClick={() => {
+								setCurrentPage((prev) => prev + 1);
+								fetchData(
+									imdbid as string,
+									parseInt(seasonNum as string),
+									currentPage + 1
+								);
+							}}
+						>
+							Show More Results
+						</button>
+					)}
+				</>
+			)}
+		</div>
+	);
+};
+
+export default withAuth(TvSearch);

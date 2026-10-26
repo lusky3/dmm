@@ -1,28 +1,45 @@
+import { CAST_STREAM_RESOURCE } from '@/services/anime/stremioAnimeIds';
+import { CAST_ADDON_VERSIONS } from '@/utils/castAddonVersions';
 import { NextApiRequest, NextApiResponse } from 'next';
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
 	res.setHeader('access-control-allow-origin', '*');
 	res.status(200).json({
 		id: 'com.debridmediamanager.cast',
-		name: 'DMM Cast',
+		name: 'DMM Cast for Real-Debrid',
 		description:
-			'Cast your preferred Debrid Media Manager streams to your Stremio device; now supports TV shows and Movies!',
-		logo: 'https://static.debridmediamanager.com/dmmcast.png',
+			'Cast your preferred Debrid Media Manager streams to your Stremio device using Real-Debrid; supports Anime, TV shows and Movies!',
+		logo: 'https://static.debridmediamanager.com/greenlogo.jpeg',
 		background: 'https://static.debridmediamanager.com/background.png',
-		version: '0.0.3',
-		resources: ['catalog', 'stream'],
-		types: ['movie', 'series'],
-		idPrefixes: ['tt'],
+		version: CAST_ADDON_VERSIONS.realdebrid,
+		resources: [
+			'catalog',
+			CAST_STREAM_RESOURCE,
+			{
+				name: 'meta',
+				types: ['other'],
+				idPrefixes: ['dmm'],
+			},
+		],
+		types: ['movie', 'series', 'anime', 'other'],
 		catalogs: [
 			{
 				id: 'casted-movies',
-				name: 'DMM Casted Movies',
+				name: 'DMM RD Movies',
 				type: 'movie',
+				extra: [{ name: 'skip' }],
 			},
 			{
 				id: 'casted-shows',
-				name: 'DMM Casted TV Shows',
+				name: 'DMM RD TV Shows',
 				type: 'series',
+				extra: [{ name: 'skip' }],
+			},
+			{
+				id: 'casted-other',
+				name: 'DMM RD Library',
+				type: 'other',
+				extra: [{ name: 'skip' }],
 			},
 		],
 		behaviorHints: { adult: false, p2p: false },

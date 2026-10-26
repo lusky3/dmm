@@ -1,0 +1,292 @@
+import handler from '@/pages/api/nzb2rd/jobs';
+import { addHashToRdAccount, fetchNzb, promoteJob, submitNzb } from '@/services/nzb2rd';
+import { repository } from '@/services/repository';
+import recordedWaiters from '@/test/fixtures/transfers/waiter-markers-2026-10-07.json';
+import { createMockRequest, createMockResponse } from '@/test/utils/api';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('@/services/repository');
+vi.mock('@/services/nzb2rd', async (importOriginal) => {
+	const actual = await importOriginal<typeof import('@/services/nzb2rd')>();
+	return {
+		...actual,
+		fetchNzb: vi.fn(),
+		submitNzb: vi.fn(),
+		addHashToRdAccount: vi.fn(),
+		promoteJob: vi.fn(),
+	};
+});
+
+const mockRepo = vi.mocked(repository);
+const mockFetchNzb = vi.mocked(fetchNzb);
+const mockSubmit = vi.mocked(submitNzb);
+const mockAddToRd = vi.mocked(addHashToRdAccount);
+const mockPromote = vi.mocked(promoteJob);
+
+const HASH = 'a'.repeat(40);
+const body = (over: Record<string, unknown> = {}) => ({
+	id: 'release-1',
+	title: 'Some.Release.1080p',
+	imdbId: 'tt1418646',
+	rdKey: 'rd-key-b',
+	...over,
+});
+
+const run = async (over: Record<string, unknown> = {}) => {
+	const req = createMockRequest({ method: 'POST', body: body(over) });
+	const res = createMockResponse();
+	await handler(req as any, res as any);
+	return res;
+};
+
+beforeEach(() => {
+	vi.clearAllMocks();
+	mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue(null);
+	mockRepo.recordNzb2rdTransferPending = vi.fn().mockResolvedValue(undefined);
+	mockRepo.recordTransferMeta = vi.fn().mockResolvedValue(undefined);
+	mockRepo.addNzb2rdWaiter = vi.fn().mockResolvedValue(undefined);
+	mockRepo.checkAvailabilityByHashes = vi.fn().mockResolvedValue([{ hash: HASH }]);
+	mockFetchNzb.mockResolvedValue('<nzb></nzb>');
+	mockSubmit.mockResolvedValue({ status: 201, data: { id: 'job-1', status: 'pending' } });
+	global.fetch = vi.fn().mockResolvedValue({
+		status: 200,
+		json: async () => ({ status: 'fetching' }),
+	}) as any;
+});
+
+describe('POST /api/nzb2rd/jobs — user B asks for a release user A is already fetching', () => {
+	beforeEach(() => {
+		mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue({
+			releaseId: 'release-1',
+			jobId: 'job-A',
+			imdbId: 'tt1418646',
+			status: 'pending',
+		});
+	});
+
+	it('queues B against A/s job instead of starting a second Usenet fetch', async () => {
+		const res = await run();
+
+		expect(mockRepo.addNzb2rdWaiter).toHaveBeenCalledWith(
+			'release-1',
+			'rd-key-b',
+			'tt1418646',
+			null
+		);
+		expect(res.json).toHaveBeenCalledWith({
+			duplicate: 'in_progress',
+			infoHash: null,
+			jobId: 'job-A',
+			queued: true,
+			// No sponsor token on this request, so nothing to promote.
+			promoted: false,
+		});
+		expect(mockPromote).not.toHaveBeenCalled();
+		// the expensive half never runs
+		expect(mockFetchNzb).not.toHaveBeenCalled();
+		expect(mockSubmit).not.toHaveBeenCalled();
+	});
+
+	// The waiter list is drained when A's job completes, days later, by which
+	// time B's access token has expired — so the credentials have to be parked
+	// with them or the delivery fails silently.
+	it('parks B/s refreshable credentials alongside their token', async () => {
+		const oauth = { clientId: 'CID', clientSecret: 'CSEC', refreshToken: 'CREF' };
+		await run({ oauth });
+
+		expect(mockRepo.addNzb2rdWaiter).toHaveBeenCalledWith(
+			'release-1',
+			'rd-key-b',
+			'tt1418646',
+			oauth
+		);
+	});
+
+	it('does not charge B an RD add while the job is still running', async () => {
+		await run();
+		expect(mockAddToRd).not.toHaveBeenCalled();
+	});
+});
+
+// A job deleted before it finished stays at its last stage in nzb2rd for good
+// (`deleted: 1`) and is never resumed. Taken for a live one, every later caller
+// was parked behind it, with their credentials, for a delivery that could not
+// come. Two of production's three waiter lists on 2026-10-07 were exactly that.
+describe('POST /api/nzb2rd/jobs — the job in flight was deleted', () => {
+	it.each(['nzb2rd-W1', 'nzb2rd-D1'])(
+		'starts a fresh fetch rather than parking the caller behind %s',
+		async (label) => {
+			const marker = recordedWaiters.markers.find((m) => m.jobId === label)!;
+			const job = (recordedWaiters.jobs as Record<string, any>)[label];
+			mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue(marker);
+			global.fetch = vi.fn().mockResolvedValue({
+				ok: true,
+				status: 200,
+				json: async () => job,
+			}) as any;
+
+			await run({ id: marker.releaseId, imdbId: marker.imdbId, title: marker.title });
+
+			expect(mockRepo.addNzb2rdWaiter).not.toHaveBeenCalled();
+			expect(mockSubmit).toHaveBeenCalledTimes(1);
+			expect(mockRepo.recordNzb2rdTransferPending).toHaveBeenCalledWith(
+				marker.releaseId,
+				'job-1',
+				marker.imdbId,
+				marker.title
+			);
+		}
+	);
+
+	it('still parks the caller behind a queued job nobody deleted', async () => {
+		const marker = recordedWaiters.markers.find((m) => m.jobId === 'nzb2rd-W3')!;
+		mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue(marker);
+		global.fetch = vi.fn().mockResolvedValue({
+			ok: true,
+			status: 200,
+			json: async () => recordedWaiters.jobs['nzb2rd-W3'],
+		}) as any;
+
+		await run({ id: marker.releaseId, imdbId: marker.imdbId });
+
+		expect(mockRepo.addNzb2rdWaiter).toHaveBeenCalledTimes(1);
+		expect(mockSubmit).not.toHaveBeenCalled();
+	});
+});
+
+describe('POST /api/nzb2rd/jobs — the release is already finished', () => {
+	beforeEach(() => {
+		mockRepo.getNzb2rdTransfer = vi.fn().mockResolvedValue({
+			releaseId: 'release-1',
+			jobId: 'job-A',
+			imdbId: 'tt1418646',
+			status: 'completed',
+			infoHash: HASH,
+		});
+	});
+
+	it('adds the cached torrent straight to the caller/s account', async () => {
+		mockAddToRd.mockResolvedValue('rd-torrent-1');
+
+		const res = await run();
+
+		expect(mockAddToRd).toHaveBeenCalledWith('rd-key-b', HASH);
+		expect(res.json).toHaveBeenCalledWith({
+			duplicate: 'completed',
+			infoHash: HASH,
+			jobId: 'job-A',
+			added: true,
+		});
+		expect(mockSubmit).not.toHaveBeenCalled();
+	});
+
+	it('reports added:false rather than failing when the RD add errors', async () => {
+		mockAddToRd.mockRejectedValue(new Error('RD 503'));
+
+		const res = await run();
+
+		expect(res.status).toHaveBeenCalledWith(200);
+		expect(res.json).toHaveBeenCalledWith(
+			expect.objectContaining({ duplicate: 'completed', added: false })
+		);
+	});
+
+	it('re-fetches when the cached torrent is no longer in RD', async () => {
+		mockRepo.checkAvailabilityByHashes = vi.fn().mockResolvedValue([]);
+
+		await run();
+
+		expect(mockSubmit).toHaveBeenCalledTimes(1);
+		expect(mockAddToRd).not.toHaveBeenCalled();
+	});
+});
+
+describe('POST /api/nzb2rd/jobs — nothing recorded yet', () => {
+	it('submits a new job and records it as pending', async () => {
+		const res = await run();
+
+		expect(mockSubmit).toHaveBeenCalledTimes(1);
+		expect(mockRepo.recordNzb2rdTransferPending).toHaveBeenCalledWith(
+			'release-1',
+			'job-1',
+			'tt1418646',
+			'Some.Release.1080p'
+		);
+		expect(res.status).toHaveBeenCalledWith(201);
+		expect(mockRepo.addNzb2rdWaiter).not.toHaveBeenCalled();
+	});
+
+	it('records the page context under the job id, so the Transfers page can label it', async () => {
+		// Keyed by job id rather than release id: the Transfers page knows a job,
+		// and the release id the record above is keyed by cannot be looked up
+		// from one.
+		await run({ returnPath: '/show/tt1418646/2' });
+
+		expect(mockRepo.recordTransferMeta).toHaveBeenCalledWith({
+			source: 'nzb2rd',
+			jobId: 'job-1',
+			imdbId: 'tt1418646',
+			title: 'Some.Release.1080p',
+			returnPath: '/show/tt1418646/2',
+			releaseId: 'release-1',
+		});
+	});
+
+	it('drops a returnPath that is not a DMM content page', async () => {
+		// It is rendered as a link on the Transfers page and comes from the
+		// caller, so only the two shapes DMM actually produces are stored.
+		await run({ returnPath: 'https://evil.example/steal' });
+
+		expect(mockRepo.recordTransferMeta).toHaveBeenCalledWith(
+			expect.objectContaining({ returnPath: undefined })
+		);
+	});
+
+	// Without these nzb2rd only has the 24h access token, and its queue is days
+	// deep — the job is then guaranteed to reach the RD hand-off with a dead
+	// credential and fail as `401 bad_token`.
+	it('forwards the refreshable credentials to nzb2rd', async () => {
+		const oauth = { clientId: 'CID', clientSecret: 'CSEC', refreshToken: 'CREF' };
+		await run({ oauth });
+
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ oauth }));
+	});
+
+	// A partial triple cannot mint anything, so it must not be stored downstream.
+	it('forwards null rather than an unusable partial triple', async () => {
+		await run({ oauth: { clientId: 'CID', refreshToken: 'CREF' } });
+
+		expect(mockSubmit).toHaveBeenCalledWith(expect.objectContaining({ oauth: null }));
+	});
+
+	it('rejects a missing RD key before spending anything', async () => {
+		const res = await run({ rdKey: '' });
+
+		expect(res.status).toHaveBeenCalledWith(400);
+		expect(mockFetchNzb).not.toHaveBeenCalled();
+	});
+});
+
+describe('POST /api/nzb2rd/jobs — takedown', () => {
+	it('refuses a blocked release by the title it was sent with', async () => {
+		const { setBlocklistForTests } = await import('@/services/takedown/blocklist');
+		const title = String(body().title);
+		const { normalizeReleaseName } = await import('@/utils/takedownParse');
+		setBlocklistForTests([], [normalizeReleaseName(title)]);
+		const res = await run();
+		expect(res.status).toHaveBeenCalledWith(451);
+		expect(mockFetchNzb).not.toHaveBeenCalled();
+		expect(mockSubmit).not.toHaveBeenCalled();
+	});
+
+	it('refuses a blocked release by the name its NZB declares, whatever the client called it', async () => {
+		const { setBlocklistForTests } = await import('@/services/takedown/blocklist');
+		setBlocklistForTests([], ['big.buck.bunny.2008.1080p']);
+		mockFetchNzb.mockResolvedValue(
+			'<nzb><head><meta type="name">Big.Buck.Bunny.2008.1080p</meta></head></nzb>'
+		);
+		const res = await run({ title: 'innocent.name' });
+		expect(res.status).toHaveBeenCalledWith(451);
+		expect(mockSubmit).not.toHaveBeenCalled();
+	});
+});

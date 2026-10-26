@@ -1,124 +1,240 @@
+import AnimeEntryLinks from '@/components/AnimeEntryLinks';
 import Poster from '@/components/poster';
-import MdbList from '@/services/mdblist';
-import { lcg, shuffle } from '@/utils/seededShuffle';
+import { useAnimeEntries } from '@/hooks/useAnimeEntries';
+import { useCachedList } from '@/hooks/useCachedList';
+import { parseBrowseKey } from '@/utils/browseKey';
+import { toasterPosition } from '@/utils/toastOptions';
 import { withAuth } from '@/utils/withAuth';
-import { GetServerSideProps } from 'next';
 import Head from 'next/head';
 import Link from 'next/link';
-import { FunctionComponent } from 'react';
+import { useRouter } from 'next/router';
+import { FunctionComponent, useMemo } from 'react';
 import { Toaster } from 'react-hot-toast';
 
-type BrowseProps = {
-	response: Record<string, string[]>;
-};
+type BrowseResponse = Record<string, string[]>;
 
-export const Browse: FunctionComponent<BrowseProps> = ({ response }) => {
+/** Lists whose titles are AniDB entries too, and so get links to their anime pages. */
+const ANIME_BROWSE_LISTS = new Set(['anime', 'donghua']);
+
+const genres = [
+	{
+		name: 'Action',
+		slug: 'action',
+	},
+	{
+		name: 'Adventure',
+		slug: 'adventure',
+	},
+	{
+		name: 'Animation',
+		slug: 'animation',
+	},
+	{
+		name: 'Anime',
+		slug: 'anime',
+	},
+	{
+		name: 'Comedy',
+		slug: 'comedy',
+	},
+	{
+		name: 'Crime',
+		slug: 'crime',
+	},
+	{
+		name: 'Documentary',
+		slug: 'documentary',
+	},
+	{
+		name: 'Donghua',
+		slug: 'donghua',
+	},
+	{
+		name: 'Drama',
+		slug: 'drama',
+	},
+	{
+		name: 'Family',
+		slug: 'family',
+	},
+	{
+		name: 'Fantasy',
+		slug: 'fantasy',
+	},
+	{
+		name: 'History',
+		slug: 'history',
+	},
+	{
+		name: 'Holiday',
+		slug: 'holiday',
+	},
+	{
+		name: 'Horror',
+		slug: 'horror',
+	},
+	{
+		name: 'Music',
+		slug: 'music',
+	},
+	{
+		name: 'Musical',
+		slug: 'musical',
+	},
+	{
+		name: 'Mystery',
+		slug: 'mystery',
+	},
+	{
+		name: 'None',
+		slug: 'none',
+	},
+	{
+		name: 'Romance',
+		slug: 'romance',
+	},
+	{
+		name: 'Science Fiction',
+		slug: 'science-fiction',
+	},
+	{
+		name: 'Short',
+		slug: 'short',
+	},
+	{
+		name: 'Sporting Event',
+		slug: 'sporting-event',
+	},
+	{
+		name: 'Superhero',
+		slug: 'superhero',
+	},
+	{
+		name: 'Suspense',
+		slug: 'suspense',
+	},
+	{
+		name: 'Thriller',
+		slug: 'thriller',
+	},
+	{
+		name: 'War',
+		slug: 'war',
+	},
+	{
+		name: 'Western',
+		slug: 'western',
+	},
+];
+
+export const Browse: FunctionComponent = () => {
+	const router = useRouter();
+	const { search } = router.query;
+	const searchKey = typeof search === 'string' ? search : '';
+
+	const { data, loading, error } = useCachedList<BrowseResponse>(
+		search !== undefined ? `browse:${searchKey}` : null,
+		async () => {
+			const response = await fetch(
+				`/api/info/browse${searchKey ? `?search=${searchKey}` : ''}`
+			);
+			if (!response.ok) {
+				throw new Error('Failed to fetch data');
+			}
+			return response.json();
+		}
+	);
+
+	// Lists are keyed `movie:tt…:title` / `show:tt…:title`, and a title with
+	// several AniDB entries (seasons, cours, OVAs) links to each of them.
+	const animeImdbIds = useMemo(
+		() =>
+			ANIME_BROWSE_LISTS.has(searchKey) && data
+				? Object.values(data)
+						.flat()
+						.map((key) => parseBrowseKey(key)?.imdbid ?? '')
+				: [],
+		[data, searchKey]
+	);
+	const animeEntries = useAnimeEntries(animeImdbIds);
+
+	if (loading && search && !data) {
+		return <div className="mx-2 my-1 text-white">Loading...</div>;
+	}
+
+	if (error) {
+		return <div className="mx-2 my-1 text-white">Error: Failed to load data</div>;
+	}
+
 	return (
 		<div className="mx-2 my-1 max-w-full">
 			<Head>
-				<title>Debrid Media Manager - Recently Updated</title>
+				<title>Debrid Media Manager - Browse</title>
 			</Head>
-			<Toaster position="bottom-right" />
-			<div className="flex justify-between items-center mb-2">
-				<h1 className="text-xl font-bold">Browse</h1>
+			<Toaster position={toasterPosition()} />
+			<div className="mb-2 flex items-center justify-between">
+				<h1 className="text-xl font-bold">
+					{searchKey ? `Browse: ${searchKey}` : 'Browse'}
+				</h1>
 				<Link
 					href="/"
-					className="text-sm bg-cyan-800 hover:bg-cyan-700 text-white py-1 px-2 rounded"
+					className="rounded bg-cyan-800 px-2 py-1 text-sm text-white hover:bg-cyan-700"
 				>
 					Go Home
 				</Link>
 			</div>
-			{Object.keys(response).length > 0 && (
-				<>
-					{Object.keys(response).map((listName: string, idx: number) => {
-						return (
-							<>
-								<h2 className="mt-4 text-xl font-bold" key={idx}>
-									<span className="text-yellow-500">{idx + 1}</span> {listName}
-								</h2>
-								<div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 xl:grid-cols-8 gap-2">
-									{response[listName].map((key: string) => {
-										const matches = key.split(':');
-										if (matches.length === 3) {
-											const mediaType = key.split(':')[0];
-											const imdbid = key.split(':')[1];
-											const title = key.split(':')[2];
+			{!search ? (
+				<div className="flex w-full flex-col items-center">
+					<div className="grid w-full grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+						{genres.map((genre) => (
+							<Link
+								key={genre.slug}
+								href={`/browse/genre/${genre.slug}`}
+								className="haptic-sm flex h-12 items-center justify-center rounded border-2 border-gray-500 bg-gray-800/30 px-4 py-2 text-sm font-medium text-gray-100 transition-colors hover:bg-gray-700/50"
+							>
+								{genre.name}
+							</Link>
+						))}
+					</div>
+				</div>
+			) : (
+				data &&
+				Object.keys(data).length > 0 && (
+					<>
+						{Object.keys(data).map((listName: string) => {
+							return (
+								<div key={listName}>
+									<h2 className="mt-3 mb-1 text-base font-bold">{listName}</h2>
+									<div className="grid grid-cols-3 gap-2 sm:grid-cols-4 md:grid-cols-6 lg:grid-cols-8 xl:grid-cols-10">
+										{data[listName].map((key: string) => {
+											const item = parseBrowseKey(key);
+											if (!item) return null;
+											const { mediaType, imdbid, title } = item;
 
 											return (
-												<Link
-													key={key}
-													href={`/${mediaType}/${imdbid}`}
-													className=""
-												>
-													<Poster imdbId={imdbid} title={title} />
-												</Link>
+												<div key={key} className="min-w-0">
+													<Link
+														href={`/${mediaType}/${imdbid}`}
+														className=""
+													>
+														<Poster imdbId={imdbid} title={title} />
+													</Link>
+													<AnimeEntryLinks
+														entries={animeEntries[imdbid] ?? []}
+														compact
+													/>
+												</div>
 											);
-										}
-									})}
+										})}
+									</div>
 								</div>
-							</>
-						);
-					})}
-				</>
+							);
+						})}
+					</>
+				)
 			)}
 		</div>
 	);
-};
-
-type BrowseResponse = Record<string, string[]>;
-type BrowseResponseCache = {
-	lastUpdated: number;
-	response: BrowseResponse;
-};
-const responses: Record<string, BrowseResponseCache> = {};
-
-export const getServerSideProps: GetServerSideProps = async (context) => {
-	const { params } = context;
-	let key = 'index';
-	if (params?.search) {
-		key = decodeURIComponent(params.search as string).toLowerCase();
-		key = key.replace(/[^a-z\s]/gi, ' ');
-	}
-
-	if (responses[key] && responses[key].lastUpdated > new Date().getTime() - 1000 * 60 * 10) {
-		return {
-			props: {
-				response: responses[key].response,
-			},
-		};
-	}
-
-	const mdblist = new MdbList();
-	let topLists;
-	if (key === 'index') {
-		topLists = await mdblist.topLists();
-	} else {
-		topLists = await mdblist.searchLists(key);
-	}
-
-	let rng = lcg(new Date().getTime() / 1000 / 60 / 10);
-	topLists = shuffle(topLists, rng).slice(0, 4);
-
-	const response: BrowseResponse = {};
-	for (const list of topLists) {
-		const itemsResponse = await mdblist.listItems(list.id);
-		response[list.name] = itemsResponse
-			.filter((item) => item.imdb_id)
-			.slice(0, 24)
-			.map((item) => `${list.mediatype}:${item.imdb_id}:${item.title}`);
-		response[list.name] = shuffle(response[list.name], rng);
-	}
-
-	responses[key] = {
-		lastUpdated: new Date().getTime(),
-		response,
-	};
-
-	return {
-		props: {
-			response,
-		},
-	};
 };
 
 export default withAuth(Browse);

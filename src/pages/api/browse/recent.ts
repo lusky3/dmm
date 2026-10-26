@@ -1,7 +1,5 @@
-import { PlanetScaleCache } from '@/services/planetscale';
+import { repository as db } from '@/services/repository';
 import { NextApiHandler } from 'next';
-
-const db = new PlanetScaleCache();
 
 const handler: NextApiHandler = async (req, res) => {
 	const data = Array.from(new Set(await db.getRecentlyUpdatedContent()));

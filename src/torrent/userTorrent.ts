@@ -1,5 +1,5 @@
 import { MagnetStatus } from '@/services/allDebrid';
-import { TorrentInfoResponse } from '@/services/realDebrid';
+import { TorBoxTorrentInfo, TorrentInfoResponse } from '@/services/types';
 import { ParsedFilename } from '@ctrl/video-filename-parser';
 
 export enum UserTorrentStatus {
@@ -23,28 +23,15 @@ export interface UserTorrent {
 	mediaType: 'movie' | 'tv' | 'other';
 	info?: ParsedFilename;
 	links: string[];
-	selectedFiles: SelectedFile[];
+	selectedFiles: any[];
 	seeders: number;
 	speed: number;
 	rdData?: TorrentInfoResponse;
 	adData?: MagnetStatus;
+	tbData?: TorBoxTorrentInfo;
 }
 
 export interface CachedHash {
 	hash: string;
 	added: Date;
 }
-
-export interface SelectedFile {
-	fileId: number;
-	filename: string;
-	filesize: number;
-	link: string;
-}
-
-export const uniqId = (torrent: UserTorrent): string => `${torrent.hash}|${torrent.links.join()}`;
-
-export const keyByStatus = (status: string) => {
-	if (status === 'sametitleorhash') return (torrent: UserTorrent) => torrent.title;
-	return (torrent: UserTorrent) => torrent.hash;
-};
